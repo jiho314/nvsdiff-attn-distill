@@ -42,6 +42,7 @@ from src.modules.position_encoding import depth_freq_encoding, global_position_e
 from src.modules.schedulers import get_diffusion_scheduler
 from utils import get_lpips_score, _seq_name_to_seed
 
+from src.modules.timestep_sample import truncated_normal
 logger = get_logger(__name__, log_level="INFO")
 
 
@@ -990,10 +991,11 @@ def main():
                     new_noise = noise + config.input_perturbation * torch.randn_like(noise)
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
-                from src.modules.timestep_sample import truncated_normal
-                timesteps = truncated_normal((bsz,), mean =config.gaussian_timestep_mean, std=config.gaussian_timestep_std)
-                # timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
+                if config.gaussian_timestep_sampling:
+                    timesteps = truncated_normal((bsz,), mean=config.gaussian_timestep_mean, std=config.gaussian_timestep_std)
+                else:
+                    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                    timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
