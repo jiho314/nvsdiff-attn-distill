@@ -992,7 +992,7 @@ def main():
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
                 if config.gaussian_timestep_sampling:
-                    timesteps = truncated_normal((bsz,), mean=config.gaussian_timestep_mean, std=config.gaussian_timestep_std)
+                    timesteps = truncated_normal((bsz,), mean=config.gaussian_timestep_mean, std=config.gaussian_timestep_std).to(device=latents.device).long()
                 else:
                     timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                     timesteps = timesteps.long()
