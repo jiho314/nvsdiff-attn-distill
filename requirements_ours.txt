@@ -1,0 +1,37 @@
+accelerate
+diffusers
+# torch==2.5.1
+# torchvision>=0.19.0
+matplotlib
+tensorboard
+scikit-image
+timm
+transformers==4.30.2
+deepspeed
+open_clip_torch
+pandas
+opencv-python
+gpustat
+tqdm
+ipdb
+kornia
+einops
+trimesh
+omegaconf
+lpips
+easydict
+ninja
+scipy
+av
+scikit-learn
+pytorch-lightning
+roma
+imagesize
+moviepy
+plyfile
+carvekit
+pillow_heif
+wandb
+torchmetrics[image]
+
+# pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
