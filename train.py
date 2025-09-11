@@ -272,7 +272,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                     show_image[h:h * 2, cond_num * w:] = color_warps[0][:, cond_num * w:]
                 show_images.append(show_image)
 
-            gt_images = (image[cond_num:].permute(0, 2, 3, 1).cpu().numpy() + 1) / 2 # -1 1 → 0 1
+            gt_images = (image_normalized[cond_num:].permute(0, 2, 3, 1).cpu().numpy() + 1) / 2 # -1 1 → 0 1
             preds = preds[cond_num:]
 
             if compute_fid:
