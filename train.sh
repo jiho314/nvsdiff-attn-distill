@@ -13,8 +13,9 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --mixed_precision="fp16" \
                   --val_interval=200 \
                   --val_cfg=2.0 \
                   --min_decay=0.5 \
-                  --log_every 5 \
+                  --log_every 1 \
                   --seed 0 \
+                  --no_eval \
                 #   --use_ema \
                 #   --ema_decay_step=30 \
                 #   --ema_decay=0.9995 \

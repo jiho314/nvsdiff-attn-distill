@@ -1,6 +1,7 @@
 # just for coding
 import torch
 
+from my_diffusers.models.attention_processor import AttnProcessor2_0
 
 # unet layers: total 16
 # down_blocks(6): 0.0, 0.1, 1.0, 1.1, 2.0, 2.1

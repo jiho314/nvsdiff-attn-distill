@@ -16,9 +16,7 @@ use_vggt_camera : false
 
 # pretrained_model_name_or_path: "./check_points/models--stabilityai--stable-diffusion-2-1-base/snapshots/5ede9e4bf3e3fd1cb0ef2f7a3fff13ee514fdf06"
 pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1"
-# eval
-val_compute_fid: false
-val_viz_len: 30
+
 wds_dataset_config:
   url_paths: [ "/mnt/data1/minseop/realestate_wds"  ] # "/mnt/data2/minseop/realestate_train_wds"
   dataset_length: 20970
@@ -42,12 +40,15 @@ val_wds_dataset_config:
   process_kwargs:
     get_square_extrinsic: true
 
-dynamic_sampling: True
+# dynamic_sampling: True
 
+gaussian_timestep_sampling: True
+gaussian_timestep_mean: 1000
+gaussian_timestep_std: 200
 nframe: 4
-image_size: 512
-
 train_batch_size: 16 # Batch size (per device) for the training dataloader，必须是n_frames_per_seq的倍数
+
+image_size: 512
 gradient_accumulation_steps: 1 # Number of updates steps to accumulate before performing a backward/update pass.
 gradient_checkpointing: True
 allow_tf32: False # Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training.
@@ -67,6 +68,7 @@ noise_offset: 0.0 # The scale of noise offset.
 input_perturbation: 0.0 # The scale of input perturbation. Recommended 0.1.
 
 # scheduler params
+
 rescale_betas_zero_snr: True
 beta_schedule: "snr_rescale" # scaled_linear, linear, snr_rescale, snr_rescale2
 # 多数据集平均SNR^2: [3.76, 4.98, 6.41, 8.05]

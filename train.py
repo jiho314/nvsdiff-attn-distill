@@ -990,7 +990,9 @@ def main():
                     new_noise = noise + config.input_perturbation * torch.randn_like(noise)
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                from src.modules.timestep_sample import truncated_normal
+                timesteps = truncated_normal((bsz,), mean =config.gaussian_timestep_mean, std=config.gaussian_timestep_std)
+                # timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
@@ -1176,10 +1178,17 @@ def main():
                 # DEBUG for NaN loss
                 if torch.isnan(loss).item():
                     accelerator.log({"train/nan/diff_loss": train_loss}, step=global_step)
-                    accelerator.log({"train/nan/distill_loss": distill_loss}, step=global_step)
+                    if do_attn_distill:
+                        accelerator.log({"train/nan/distill_loss": distill_loss}, step=global_step)
+                    
+                    image = np.concatenate([np.array(ToPILImage()((image[i]+1)/2)) for i in range(image.shape[0])], axis=1)
+                    accelerator.log({"train/nan/image": wandb.Image(image)}, step=global_step)
                     import pickle
                     with open(f"{args.output_dir}/nan_batch_rank{accelerator.process_index}.pkl", "wb") as w:
-                        pickle.dump({"batch": batch, "timesteps": timesteps, "model_pred": model_pred, "target": target}, w)
+                        save = {"batch": batch, "timesteps": timesteps, "model_pred": model_pred, "target": target}
+                        if do_attn_distill:
+                            save.update({'pred_attn_logit': pred_attn_logit, "gt_attn_logit": gt_attn_logit})
+                        pickle.dump(save, w)
                     save_path = os.path.join(args.output_dir, "nan.ckpt")
                     torch.save(accelerator.unwrap_model(unet).state_dict(), save_path)
                     raise ValueError("NaN loss, stop training...")

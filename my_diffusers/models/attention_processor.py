@@ -1473,17 +1473,17 @@ class AttnProcessor2_0:
             hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0,
                                                        is_causal=False)
         else:
-            L, S = query.size(-2), key.size(-2)
-            attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
-            if attention_mask is not None:
-                if attention_mask.dtype == torch.bool:
-                    attn_bias.masked_fill_(attention_mask.logical_not(), float("-inf"))
-                else:
-                    attn_bias = attention_mask + attn_bias
-            assert attention_mask == None, "attention_mask is not supported with cache_attn"
+            # L, S = query.size(-2), key.size(-2)
+            # attn_bias = torch.zeros((L, S), dtype=query.dtype, device=query.device)
+            # if attention_mask is not None:
+            #     if attention_mask.dtype == torch.bool:
+            #         attn_bias.masked_fill_(attention_mask.logical_not(), float("-inf"))
+            #     else:
+            #         attn_bias = attention_mask + attn_bias
+            # assert attention_mask == None, "attention_mask is not supported with cache_attn"
             scale_factor = 1 / math.sqrt(query.size(-1))
             attn_logit = query @ key.transpose(-2, -1) * scale_factor
-            attn_logit = attn_logit + attn_bias
+            # attn_logit = attn_logit + attn_bias
             attn_prob = torch.softmax(attn_logit, dim=-1)
             hidden_states = attn_prob @ value
 

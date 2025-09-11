@@ -35,7 +35,7 @@ wds_dataset_config:
   process_kwargs:
     get_square_extrinsic: true
 
-# eval
+# eval: 20 -> 3 min
 val_compute_fid: false
 val_viz_len: 30
 val_wds_dataset_config:
@@ -50,10 +50,13 @@ val_wds_dataset_config:
 
 # dynamic_sampling: True
 
+gaussian_timestep_sampling: True
+gaussian_timestep_mean: 1000
+gaussian_timestep_std: 300  
 nframe: 4
-image_size: 512
+train_batch_size: 16 # Batch size (per device) for the training dataloader，必须是n_frames_per_seq的倍数
 
-train_batch_size: 8 # Batch size (per device) for the training dataloader，必须是n_frames_per_seq的倍数
+image_size: 512
 gradient_accumulation_steps: 1 # Number of updates steps to accumulate before performing a backward/update pass.
 gradient_checkpointing: True
 allow_tf32: False # Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training.
