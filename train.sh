@@ -10,7 +10,7 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --mixed_precision="fp16" \
                   --config_file="configs/cat3d_distill.yaml" \
                   --output_dir="check_points/cat3d_distill" \
                   --train_log_interval=500000000000 \
-                  --val_interval=50 \
+                  --val_interval=200 \
                   --val_cfg=2.0 \
                   --min_decay=0.5 \
                   --log_every 5 \

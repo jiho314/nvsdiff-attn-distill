@@ -263,9 +263,9 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                 # show_save_dict[batch['tag'][0]] += 1
             if val_iter < viz_len:
                 if depth is not None:
-                    show_image = get_show_images(image, preds, cond_num, batch["depth"])
+                    show_image = get_show_images(image_normalized, preds, cond_num, batch["depth"])
                 else:
-                    show_image = get_show_images(image, preds, cond_num)
+                    show_image = get_show_images(image_normalized, preds, cond_num)
 
                 if color_warps is not None:
                     h, w = image.shape[2], image.shape[3]
