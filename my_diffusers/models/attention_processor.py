@@ -1468,10 +1468,16 @@ class AttnProcessor2_0:
             hw = key.shape[2] // nframe
             key[:, :, :hw * cond_num] *= key_rescale
         
-        # jiho TODO: xformers
+        # jiho TODO 
         if not self.cache_attn:
-            hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0,
-                                                       is_causal=False)
+            if xformers is not None:  # format: B tok Head dim
+                assert attention_mask is None, "w/ xformers, attention_mask not supported yet "
+                hidden_states = xformers.ops.memory_efficient_attention(
+                    query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),  # Head dim at 2
+                ).transpose(1, 2).to(query.dtype)
+            else:
+                hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0,
+                                                        is_causal=False)
         else:
             # L, S = query.size(-2), key.size(-2)
             # attn_bias = torch.zeros((L, S), dtype=query.dtype, device=query.device)

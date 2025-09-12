@@ -46,7 +46,9 @@ def sample_rays(intrinsic, extrinsic, image_h=None, image_w=None,
 
 @torch.cuda.amp.autocast(enabled=False)
 def batch_sample_rays(intrinsic, extrinsic, image_h=None, image_w=None,
-                      normalize_extrinsic=False, normalize_t=False, nframe=1):
+                      normalize_extrinsic=False, normalize_t=False, nframe=1,
+                      normalize_extrinsic_tgt=-1
+                      ):
     ''' get rays
     Args:
         intrinsic: [BF, 3, 3],
@@ -60,7 +62,9 @@ def batch_sample_rays(intrinsic, extrinsic, image_h=None, image_w=None,
     device = intrinsic.device
     B = intrinsic.shape[0]
     if normalize_extrinsic:
-        c2w_view0 = extrinsic[::nframe].inverse().to(device)  # [B,4,4]
+        extrinsic = einops.rearrange(extrinsic, "(b f) r c -> b f r c", b=B, f=nframe)
+        c2w_view0 = extrinsic[:, normalize_extrinsic_tgt].inverse().to(device)  # [B,4,4]
+        # c2w_view0 = extrinsic[::nframe].inverse().to(device)  # [B,4,4]
         c2w_view0 = c2w_view0.repeat_interleave(nframe, dim=0)  # [BF,4,4]
         extrinsic = c2w_view0 @ extrinsic
 

@@ -46,7 +46,7 @@ gaussian_timestep_sampling: True
 gaussian_timestep_mean: 1000
 gaussian_timestep_std: 200
 nframe: 4
-train_batch_size: 16 # Batch size (per device) for the training dataloader，必须是n_frames_per_seq的倍数
+train_batch_size: 4 # Batch size (per device) for the training dataloader，必须是n_frames_per_seq的倍数
 
 image_size: 512
 gradient_accumulation_steps: 1 # Number of updates steps to accumulate before performing a backward/update pass.

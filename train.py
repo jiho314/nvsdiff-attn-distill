@@ -42,6 +42,8 @@ from src.modules.position_encoding import depth_freq_encoding, global_position_e
 from src.modules.schedulers import get_diffusion_scheduler
 from utils import get_lpips_score, _seq_name_to_seed
 
+from src.modules.geometry import cycle_consistency_checker
+from src.modules.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache
 from src.modules.timestep_sample import truncated_normal
 logger = get_logger(__name__, log_level="INFO")
 
@@ -111,35 +113,6 @@ def uniform_push_batch(batch, random_cond_num=0):
         if not "key" in k:
             batch[k] = batch[k][:, new_idx]
     return batch
-
-def cycle_consistency_checker(costmap, threshold, width=32,):
-    # Get dimensions from the input tensor
-    B, HW, _ = costmap.shape
-    device = costmap.device
-
-    # Step 2: Find the best initial matches (already vectorized)
-    max_idx = torch.argmax(costmap, dim=-1)  # (B, HW)
-    transpose_costmap = costmap.transpose(1, 2)  # (B, 2HW, HW)
-    b_idx = torch.arange(B, device=device)[:, None] # (B, 1)
-    reverse_map = transpose_costmap[b_idx, max_idx] # (B, HW, HW)
-    _, final_indices = torch.max(reverse_map, dim=-1) 
-    # Create a tensor representing the original indices (0, 1, 2, ..., HW-1) for each batch item
-    original_indices = torch.arange(HW, device=device).expand(B, -1) # (B, HW)
-
-    # Convert 1D indices to 2D coordinates for both original and matched points
-    x1 = original_indices // width
-    y1 = original_indices % width
-    x2 = final_indices // width
-    y2 = final_indices % width
-
-    # Calculate Euclidean distance and check if it's within the threshold
-    distance = torch.sqrt(((x1 - x2)**2 + (y1 - y2)**2).float())
-    is_close = (distance < threshold).float() # .float() converts boolean (True/False) to (1.0/0.0)
-
-    # Step 6: Reshape final output tensor
-    final_distance_tensor = is_close.view(B, HW, 1)
-
-    return final_distance_tensor
 
 def slice_vae_encode(vae, image, sub_size):  # vae fails to encode large tensor directly, we need to slice it
     with torch.no_grad(), torch.autocast("cuda", enabled=True):
@@ -314,17 +287,16 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
             torch.cuda.empty_cache()
             accelerator.log({"val/fid": fid_val, "val/fid_real_num": real_num, "val/fid_fake_num": fake_num}, step=step)
 
-    if accelerator.is_main_process:
-        accelerator.log({"val/psnr": psnr_score, "val/ssim": ssim_score, "val/lpips": lpips_score}, step=step)
-        # tracker = accelerator.get_tracker("tensorboard", unwrap=True)
-        # tracker.add_scalar("val/psnr", psnr_score, global_step=step)
-        # tracker.add_scalar("val/ssim", ssim_score, global_step=step)
-        # tracker.add_scalar("val/lpips", lpips_score, global_step=step)
 
+    accelerator.log({"val/psnr": psnr_score, "val/ssim": ssim_score, "val/lpips": lpips_score}, step=step)
+
+    
+    show_images_full = np.stack(show_images, axis=0)
+    show_images_full = accelerator.gather(torch.tensor(show_images_full)).cpu().numpy()
+    if accelerator.is_main_process:
         for j in range(len(show_images)):
             if config.image_size > 256:
                 show_images[j] = cv2.resize(show_images[j], None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-            # tracker.add_images(f"val/gt_masked_pred_images{j}", show_images[j], step, dataformats="HWC")
             accelerator.log({f"val/gt_masked_pred_images{j}": wandb.Image(show_images[j])}, step=step)
 
     del loss_fn_alex
@@ -452,6 +424,7 @@ def parse_args():
 
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--log_every", type=int, default=20)
+    parser.add_argument("--val_at_first", action="store_true")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -590,7 +563,6 @@ def main():
         vggt_logit_head = LOGIT_HEAD_CLS[distill_config.vggt_logit_head.lower()](**distill_config.vggt_logit_head_kwargs)
 
         # Set Attention Cache for distillation
-        from src.modules.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache
         distill_student_unet_attn_layers = [p[0] for p in distill_pairs]
         set_attn_cache(unet, distill_student_unet_attn_layers)
 
@@ -600,6 +572,7 @@ def main():
         del vggt_logit_head, unet_logit_head
     else:
         distill_pairs = []
+        distill_student_unet_attn_layers = []
         distill_loss_fn = None
         distill_loss_weight = 0.0
         
@@ -631,7 +604,7 @@ def main():
 
     if config.opt_cfg.scale_lr:
         config.learning_rate = (
-                config.learning_rate * config.gradient_accumulation_steps * config.train_batch_size * accelerator.num_processes
+                config.learning_rate * config.gradient_accumulation_steps * ( config.train_batch_size * config.nframe / config.scale_lr_base_batch )* accelerator.num_processes
         )
 
     # set trainable parameters
@@ -672,7 +645,6 @@ def main():
         num_viewpoints=config.nframe,
         **config.val_wds_dataset_config
     ) 
-    val_num_workers = 0
     # eval_dataloader = DataLoader(
     #     eval_dataset,
     #     batch_size=data_config.get("eval_batch_size", 1),
@@ -713,14 +685,16 @@ def main():
         shuffle=False, # jiho TODO
         sampler=sampler,
         batch_size=config.train_batch_size,
-        num_workers=config.dataloader_num_workers,
+        num_workers=accelerator.num_processes,
+        persistent_workers=True
     )
+
     val_dataloader = DataLoader(
         val_dataset,
         shuffle=False,
         sampler=val_sampler,
         batch_size=1,
-        num_workers=val_num_workers,
+        num_workers=accelerator.num_processes,
     )
 
     # Scheduler and math around the number of training steps.
@@ -781,7 +755,8 @@ def main():
 
     # Prepare 
     accelerator.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = config.train_batch_size
-    unet, optimizer, lr_scheduler = accelerator.prepare(unet, optimizer, lr_scheduler)  # train_dataloader
+    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(unet, optimizer, train_dataloader, lr_scheduler)  # train_dataloader
+    # unet, optimizer, lr_scheduler = accelerator.prepare(unet, optimizer, lr_scheduler)  # train_dataloader
     
 
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
@@ -915,7 +890,7 @@ def main():
                 if config.get("fix_cond_num", None) is not None:
                     random_cond_num = config.fix_cond_num
                 else:
-                    random_cond_num = random.randint(1, config.max_cond_num)
+                    random_cond_num = random.randint(config.min_cond_num, config.max_cond_num)
 
                 # 3) Shuffle or Push tgt Views to last 
                 if config.get("shuffle_train_rate", 0) > 0 and random.random() < config.get("shuffle_train_rate", 0):
@@ -991,12 +966,13 @@ def main():
                     new_noise = noise + config.input_perturbation * torch.randn_like(noise)
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
-                if config.gaussian_timestep_sampling:
+                if config.train_timestep_schedule == "uniform":
+                    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
+                elif config.train_timestep_schedule == "gaussian":
                     timesteps = truncated_normal((bsz,), mean=config.gaussian_timestep_mean, std=config.gaussian_timestep_std).to(device=latents.device).long()
                 else:
-                    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                    timesteps = timesteps.long()
-
+                    raise NotImplementedError
+                
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 if config.input_perturbation:
@@ -1103,76 +1079,80 @@ def main():
                 # Distill Loss
                 distill_loss_dict = {}
                 if do_attn_distill:
-                    B, F, _, H, W = image.shape
-                    # vggt_attn_cache = batch.get('attn_logit_gts_dict', None)
-                    unet_attn_cache = pop_cached_attn(unet)
-                    distill_pairs = config.distill_config.distill_pairs
-                    for unet_layer, vggt_layer in distill_pairs:
-                        '''
-                            gt(VGGT): query and key (B Head N(VHW) C) each
-                                - if using cost map feat, Head=1
-                            pred(UNet): attention map(logit, before softmax), B Head Q(FHW) K(FHW)
-                        '''
-                        gt_query, gt_key = batch['vggt_attn_cache'][str(vggt_layer)]['query'].detach(), batch['vggt_attn_cache'][str(vggt_layer)]['key'].detach() # B Head VHW C, B Head VHW C
-                        pred_attn_logit = unet_attn_cache[str(unet_layer)] # B Head Q(FHW) K(FHW)
-                        Q, K = pred_attn_logit.shape[-2], pred_attn_logit.shape[-1]
-                        assert Q==K, f"pred attn should have same Q,K dim, but {pred_attn_logit.shape}"
+                    with torch.autocast(device_type="cuda", dtype = torch.float32):
+                        B, F, _, H, W = image.shape
+                        # vggt_attn_cache = batch.get('attn_logit_gts_dict', None)
+                        unet_attn_cache = pop_cached_attn(unet)
+                        distill_pairs = config.distill_config.distill_pairs
+                        for unet_layer, vggt_layer in distill_pairs:
+                            '''
+                                gt(VGGT): query and key (B Head N(VHW) C) 
+                                    - if using cost map feat, Head=1
+                                pred(UNet): attention map(logit, before softmax) ( B Head Q(FHW) K(FHW) )
+                            '''
+                            gt_query, gt_key = batch['vggt_attn_cache'][str(vggt_layer)]['query'].detach(), batch['vggt_attn_cache'][str(vggt_layer)]['key'].detach() # B Head VHW C, B Head VHW C
+                            pred_attn_logit = unet_attn_cache[str(unet_layer)] # B Head Q(FHW) K(FHW)
+                            Q, K = pred_attn_logit.shape[-2], pred_attn_logit.shape[-1]
+                            assert Q==K, f"pred attn should have same Q,K dim, but {pred_attn_logit.shape}"
 
+                            # 1) Resize token: gt -> pred
+                            def resize_tok(tok, target_size):
+                                B, Head, FHW, C = tok.shape
+                                HW = FHW // F
+                                H = W = int(math.sqrt(HW))
+                                tok = einops.rearrange(tok, 'B Head (F H W) C -> (B Head F) C H W', B=B, Head=Head, F=F, H=H, W=W, C=C)
+                                tok = torch.nn.functional.interpolate(tok, size=(target_size, target_size), mode='bilinear')
+                                tok = einops.rearrange(tok, '(B Head F) C H W -> B Head (F H W) C',  B=B, Head=Head, F=F, H=target_size, W=target_size, C=C)
+                                return tok
+                            
+                            pred_query_size, pred_key_size = int(math.sqrt(Q // F)), int(math.sqrt(K // F))
+                            gt_query, gt_key = resize_tok(gt_query, target_size=pred_query_size), resize_tok(gt_key, target_size=pred_key_size)
 
-                        # 1) Resize token: gt -> pred
-                        def resize_tok(tok, target_size):
-                            B, Head, FHW, C = tok.shape
-                            HW = FHW // F
-                            H = W = int(math.sqrt(HW))
-                            tok = einops.rearrange(tok, 'B Head (F H W) C -> (B Head F) C H W', B=B, Head=Head, F=F, H=H, W=W, C=C)
-                            tok = torch.nn.functional.interpolate(tok, size=(target_size, target_size), mode='bilinear')
-                            tok = einops.rearrange(tok, '(B Head F) C H W -> B Head (F H W) C',  B=B, Head=Head, F=F, H=target_size, W=target_size, C=C)
-                            return tok
-                        
-                        pred_query_size, pred_key_size = int(math.sqrt(Q // F)), int(math.sqrt(K // F))
-                        gt_query, gt_key = resize_tok(gt_query, target_size=pred_query_size), resize_tok(gt_key, target_size=pred_key_size)
+                            # 2) Extract Distill Views
+                            # Distill Query to target/all 
+                            if config.distill_config.distill_query == "target":
+                                query_idx = list(range(random_cond_num, F))
+                            elif config.distill_config.distill_query == "all":
+                                query_idx = list(range(0, F))
+                            else:
+                                raise NotImplementedError(f"distill_query {config.distill_config.distill_query} not implemented")
+                            
+                            # Distill Key to reference/all
+                            if config.distill_config.distill_key == "reference":
+                                key_idx = list(range(0, random_cond_num))
+                            elif config.distill_config.distill_key == "all":
+                                key_idx = list(range(0, F))
+                            else:
+                                raise NotImplementedError(f"distill_key {config.distill_config.distill_key} not implemented")
+                            
+                            def slice_attnmap(attnmap, query_idx, key_idx):
+                                B, Head, Q, K = attnmap.shape
+                                HW = Q // F
+                                attnmap = einops.rearrange(attnmap, 'B Head (F1 HW1) (F2 HW2) -> B Head F1 HW1 F2 HW2', B=B, Head=Head, F1=F, HW1=HW, F2=F, HW2=HW)
+                                attnmap = attnmap[:, :, query_idx][:, :, :, :, key_idx]
+                                attnmap = einops.rearrange(attnmap, 'B Head f1 HW1 f2 HW2 -> B Head (f1 HW1) (f2 HW2)', B=B, Head=Head, f1=len(query_idx), f2=len(key_idx), HW1=HW, HW2=HW)
+                                return attnmap
+                            
+                            pred_attn_logit = slice_attnmap(pred_attn_logit, query_idx, key_idx)
+                            with torch.no_grad():
+                                gt_attn_logit = gt_query @ gt_key.transpose(-1, -2)
+                            gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx, key_idx)
 
-                        # 2) Extract Distill Views
-                        # Distill Query to target/all 
-                        if config.distill_config.distill_query == "target":
-                            query_idx = list(range(random_cond_num, F))
-                        elif config.distill_config.distill_query == "all":
-                            query_idx = list(range(0, F))
-                        else:
-                            raise NotImplementedError(f"distill_query {config.distill_config.distill_query} not implemented")
-                        
-                        # Distill Key to reference/all
-                        if config.distill_config.distill_key == "reference":
-                            key_idx = list(range(0, random_cond_num))
-                        elif config.distill_config.distill_key == "all":
-                            key_idx = list(range(0, F))
-                        else:
-                            raise NotImplementedError(f"distill_key {config.distill_config.distill_key} not implemented")
-                        
-                        def slice_attnmap(attnmap, query_idx, key_idx):
-                            B, Head, Q, K = attnmap.shape
-                            HW = Q // F
-                            attnmap = einops.rearrange(attnmap, 'B Head (F1 HW1) (F2 HW2) -> B Head F1 HW1 F2 HW2', B=B, Head=Head, F1=F, HW1=HW, F2=F, HW2=HW)
-                            attnmap = attnmap[:, :, query_idx][:, :, :, :, key_idx]
-                            attnmap = einops.rearrange(attnmap, 'B Head f1 HW1 f2 HW2 -> B Head (f1 HW1) (f2 HW2)', B=B, Head=Head, f1=len(query_idx), f2=len(key_idx), HW1=HW, HW2=HW)
-                            return attnmap
-                        # def slice_tok_by_view(tok, view_idx_list):
-                        #     B, Head, FHW, C = tok.shape
-                        #     HW = FHW // F
-                        #     tok = einops.rearrange(tok, 'B Head (F HW) C -> B Head F HW C', B=B, Head=Head, F=F, HW=HW, C=C)
-                        #     tok = tok[:, :, view_idx_list]
-                        #     tok = einops.rearrange(tok, 'B Head f HW C -> B Head (f HW) C', B=B, Head=Head, HW=HW, C=C)
-                        #     return tok
-                        # gt_query, gt_key = slice_tok_by_view(gt_query, query_idx), slice_tok_by_view(gt_key, key_idx)
-                        # gt_attn_logit = gt_query @ gt_key.transpose(-1, -2)
-                        
-                        pred_attn_logit = slice_attnmap(pred_attn_logit, query_idx, key_idx)
-                        gt_attn_logit = gt_query @ gt_key.transpose(-1, -2)
-                        gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx, key_idx)
+                            pred, gt = unet.unet_logit_head(pred_attn_logit), unet.vggt_logit_head(gt_attn_logit)
 
-                        pred, gt = unet.unet_logit_head(pred_attn_logit), unet.vggt_logit_head(gt_attn_logit)
-                        distill_loss_dict[f"train/distill/unet{unet_layer}_vggt{vggt_layer}"] = distill_loss_fn(pred, gt)
-                    distill_loss = sum(distill_loss_dict.values()) / len(distill_loss_dict.values()) if len(distill_loss_dict) > 0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
+                            # if config.distill_config.get("consistency_check", False):
+                            if vggt_layer == "track_head":
+                                B, Head, F1HW, F2HW = gt_attn_logit.shape  
+                                F1, F2, HW = len(query_idx), len(key_idx), F1HW // len(query_idx)
+                                gt_attn_logit_HW = einops.rearrange(gt_attn_logit, 'B Head (F1 HW) (F2 HW) -> (B Head F1) HW (F2 HW)', B=B,Head=Head, F1=F1, F2=F2, HW=HW)
+                                consistency_mask = cycle_consistency_checker(gt_attn_logit_HW)
+                                consistency_mask = einops.rearrange(consistency_mask, '(B Head F1) HW 1 -> B Head (F1 HW) 1', B=B, Head=Head, F1=F1, HW=HW)
+                                assert Head == 1, "Track Head costmap should have only one head"
+                                consistency_mask = consistency_mask.reshape(B*Head, F1HW)
+                                pred, gt = pred[consistency_mask], gt[consistency_mask]
+
+                            distill_loss_dict[f"train/distill/unet{unet_layer}_vggt{vggt_layer}"] = distill_loss_fn(pred.float(), gt.float())
+                        distill_loss = sum(distill_loss_dict.values()) / len(distill_loss_dict.values()) if len(distill_loss_dict) > 0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
                     loss = diff_loss + distill_loss * distill_loss_weight
                 else:
                     loss = diff_loss
@@ -1181,15 +1161,13 @@ def main():
                 if torch.isnan(loss).item():
                     accelerator.log({"train/nan/diff_loss": train_loss}, step=global_step)
                     if do_attn_distill:
-                        accelerator.log({"train/nan/distill_loss": distill_loss}, step=global_step)
-                    
-                    image = np.concatenate([np.array(ToPILImage()((image[i]+1)/2)) for i in range(image.shape[0])], axis=1)
-                    accelerator.log({"train/nan/image": wandb.Image(image)}, step=global_step)
+                        accelerator.log({"train/nan/distill_loss": distill_loss.item()}, step=global_step)
+                        accelerator.log({k.replace("train", "train/nan"):v.item() for k,v in distill_loss_dict.items() })
                     import pickle
                     with open(f"{args.output_dir}/nan_batch_rank{accelerator.process_index}.pkl", "wb") as w:
                         save = {"batch": batch, "timesteps": timesteps, "model_pred": model_pred, "target": target}
                         if do_attn_distill:
-                            save.update({'pred_attn_logit': pred_attn_logit, "gt_attn_logit": gt_attn_logit})
+                            save.update({'pred_attn_logit': pred_attn_logit.detach().cpu(), "gt_attn_logit": gt_attn_logit.detach().cpu()})
                         pickle.dump(save, w)
                     save_path = os.path.join(args.output_dir, "nan.ckpt")
                     torch.save(accelerator.unwrap_model(unet).state_dict(), save_path)
@@ -1227,7 +1205,7 @@ def main():
                         accelerator.log(distill_loss_dict, step=global_step)
                     # logger.info(f"Loss: {train_loss}")
 
-                if (global_step == 1 or global_step % args.train_log_interval == 0 or first_batch) and accelerator.is_main_process:
+                if (global_step % args.train_log_interval == 0 or first_batch) and accelerator.is_main_process:
                     
                     if args.use_ema:
                         # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
@@ -1271,11 +1249,10 @@ def main():
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     accelerator.save_state(save_path)
                     if args.use_ema and accelerator.is_main_process:
-                        ema_unet.save_pretrained(copy.deepcopy(accelerator.unwrap_model(unet)), f"{save_path}/ema_unet.pt")
+                        ema_unet.save_pretrained(accelerator.unwrap_model(unet), f"{save_path}/ema_unet.pt")
                     logger.info(f"Saved state to {save_path}")
 
-                if (global_step == 1 or global_step % args.val_interval == 0) and not args.no_val:
-                    
+                if ((global_step == 1 and args.val_at_first) or global_step % args.val_interval == 0) and not args.no_val:
                     if args.use_ema:
                         # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                         ema_unet.store(unet.parameters())
@@ -1298,7 +1275,7 @@ def main():
                         save_path = os.path.join(args.output_dir, "best")
                         accelerator.save_state(save_path)
                         if args.use_ema and accelerator.is_main_process:
-                            ema_unet.save_pretrained(copy.deepcopy(accelerator.unwrap_model(unet)), f"{save_path}/ema_unet.pt")
+                            ema_unet.save_pretrained(accelerator.unwrap_model(unet), f"{save_path}/ema_unet.pt")
                         logger.info(f"Saved best state to {save_path}")
                     
 

@@ -70,12 +70,15 @@ def transform_numpy(array):
     return array
 
 
-def postprocess_vggt_mvgen(sample, num_viewpoints=3, min_view_range=5, max_view_range=15, inference=False, get_square_extrinsic=False, **kwargs):
+def postprocess_vggt_mvgen(sample, num_viewpoints=3, min_view_range=5, max_view_range=15, 
+                           inference=False, inference_view_range=6,
+                           get_square_extrinsic=False, **kwargs):
     '''
         First, sample (view_range) from [min_view_range, max_view_range]
         Then, sample (num_viewpoints) frames among (view_range) frames
     '''
     assert num_viewpoints > 2, "num_viewpoints should be greater than 2"
+    
     try:
         image_list = [obj for obj in sample.keys() if "frame" in obj]
         image_list = sorted(image_list, key=lambda x : int(x.split("_")[-1][:-4]))
@@ -97,8 +100,8 @@ def postprocess_vggt_mvgen(sample, num_viewpoints=3, min_view_range=5, max_view_
             idxs = [start, end] + sampled_frames
             idxs = sorted(idxs)
         else:
-            # for inference, should be determined # TODO
-            idxs = range(num_viewpoints)
+            max_view_point = min(num_frames, inference_view_range)
+            idxs = np.linspace(0, max_view_point - 1, num_viewpoints, dtype=int).tolist()
 
             
         points = sample["pointmap.npy"]
@@ -138,11 +141,13 @@ def postprocess_vggt_mvgen(sample, num_viewpoints=3, min_view_range=5, max_view_
         pts = transform_numpy(points[idxs])        
         output = dict(image = images, points = pts, intrinsic = intri, extrinsic = extrinsic, )
                     #   idx = torch.tensor(idxs))
-                    #   intrinsic_original = intrinsic[idxs])
-
+                    #   intrinsic_original = intrinsic[
+        # print(f"wds Inference: nothing occured , {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}, min_view_range: {min_view_range}, max_view_range: {max_view_range}")
         return output
     
     except:
+        if inference:
+            print(f"wds Inference: exception occured , {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}")
         return None
 
 def build_re10k_wds(
@@ -155,6 +160,8 @@ def build_re10k_wds(
     num_viewpoints=3,
     min_view_range=5,
     max_view_range=15,
+    inference=False,
+    inference_view_range= None,
     process_kwargs = {},
     **kwargs,
     ):
@@ -174,7 +181,7 @@ def build_re10k_wds(
                     urls.append(os.path.join(root, file))
 
 
-    postprocess_fn = partial(postprocess_vggt_mvgen, num_viewpoints=num_viewpoints, min_view_range=min_view_range, max_view_range=max_view_range, inference=False, **process_kwargs)
+    postprocess_fn = partial(postprocess_vggt_mvgen, num_viewpoints=num_viewpoints, min_view_range=min_view_range, max_view_range=max_view_range, inference= inference, inference_view_range = inference_view_range, **process_kwargs)
     
     dataset = (wds.WebDataset(urls, 
                         resampled=resampled,

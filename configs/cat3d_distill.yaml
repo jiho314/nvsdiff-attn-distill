@@ -26,7 +26,7 @@ use_vggt_camera : false
 pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1"
 
 wds_dataset_config:
-  url_paths: [ "/mnt/data1/minseop/realestate_wds"  ] # "/mnt/data2/minseop/realestate_train_wds"
+  url_paths: [ "/mnt/data1/minseop/realestate_wds"  ] # "/mnt/data2/minseop/realestate_train_wds" 
   dataset_length: 20970
   resampled: True
   shardshuffle: True
@@ -53,8 +53,9 @@ val_wds_dataset_config:
 gaussian_timestep_sampling: True
 gaussian_timestep_mean: 1000
 gaussian_timestep_std: 300  
+
 nframe: 4
-train_batch_size: 16 # Batch size (per device) for the training dataloader，必须是n_frames_per_seq的倍数
+train_batch_size: 4 # Batch size (per device) for the training dataloader，必须是n_frames_per_seq的倍数
 
 image_size: 512
 gradient_accumulation_steps: 1 # Number of updates steps to accumulate before performing a backward/update pass.
