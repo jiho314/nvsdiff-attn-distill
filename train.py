@@ -178,13 +178,14 @@ def get_pipeline(accelerator, config, vae, unet, weight_dtype):
 def get_show_images(input_images, pred_images, cond_num, depth=None):
     assert depth == None
     F, _, H, W = input_images.shape
+    ground_truths = input_images.permute(1,2,0,3).reshape(3, H, F*W).clone()
     input_images[cond_num:] = 0
-    ground_truths = input_images.permute(1,2,0,3).reshape(3, H, F*W)
+    input_images = input_images.permute(1,2,0,3).reshape(3, H, F*W)
     pred_images = pred_images.permute(1,2,0,3).reshape(3, H, F*W)
 
     show_image = torch.cat([input_images, ground_truths, pred_images], dim=1)
 
-    return show_image
+    return show_image   
 
 @torch.no_grad()
 def log_validation(accelerator, config, args, pipeline, val_dataloader, step, device, **kwargs):
