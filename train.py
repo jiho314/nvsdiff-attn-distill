@@ -290,7 +290,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
 
     
     show_images_full = np.stack(show_images, axis=0)
-    show_images_full = accelerator.gather(torch.tensor(show_images_full)).cpu().numpy()
+    show_images_full = accelerator.gather(torch.tensor(show_images_full).to(device)).cpu().numpy()
     if accelerator.is_main_process:
         for j in range(len(show_images)):
             if config.image_size > 256:
