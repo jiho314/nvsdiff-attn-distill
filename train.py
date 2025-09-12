@@ -156,22 +156,33 @@ def get_pipeline(accelerator, config, vae, unet, weight_dtype):
     return pipeline
 
 
+# def get_show_images(input_images, pred_images, cond_num, depth=None):
+#     pred_images = [pred_images[i] for i in range(pred_images.shape[0])]
+#     pred_images = np.clip(np.concatenate(pred_images, axis=1) * 255, 0, 255).astype(np.uint8)  # [H,W*F,c]
+#     input_images = (input_images + 1) / 2
+#     ground_truths = np.concatenate([np.array(ToPILImage()(input_images[i])) for i in range(input_images.shape[0])], axis=1)
+#     input_images[cond_num:] = 0
+#     inputs = np.concatenate([np.array(ToPILImage()(input_images[i])) for i in range(input_images.shape[0])], axis=1)
+#     if depth is not None:
+#         min_vals = depth.amin(dim=[2, 3], keepdim=True)
+#         max_vals = depth.amax(dim=[2, 3], keepdim=True)
+#         depth = (depth - min_vals) / (max_vals - min_vals)
+#         depth[cond_num:] = 0
+#         depth = np.concatenate([np.array(ToPILImage()(depth[i]).convert("RGB")) for i in range(depth.shape[0])], axis=1)
+#         show_image = np.concatenate([inputs, depth, ground_truths, pred_images], axis=0)
+#     else:
+#         show_image = np.concatenate([inputs, ground_truths, pred_images], axis=0)
+
+#     return show_image
+
 def get_show_images(input_images, pred_images, cond_num, depth=None):
-    pred_images = [pred_images[i] for i in range(pred_images.shape[0])]
-    pred_images = np.clip(np.concatenate(pred_images, axis=1) * 255, 0, 255).astype(np.uint8)  # [H,W*F,c]
-    input_images = (input_images + 1) / 2
-    ground_truths = np.concatenate([np.array(ToPILImage()(input_images[i])) for i in range(input_images.shape[0])], axis=1)
+    assert depth == None
+    F, _, H, W = input_images.shape
     input_images[cond_num:] = 0
-    inputs = np.concatenate([np.array(ToPILImage()(input_images[i])) for i in range(input_images.shape[0])], axis=1)
-    if depth is not None:
-        min_vals = depth.amin(dim=[2, 3], keepdim=True)
-        max_vals = depth.amax(dim=[2, 3], keepdim=True)
-        depth = (depth - min_vals) / (max_vals - min_vals)
-        depth[cond_num:] = 0
-        depth = np.concatenate([np.array(ToPILImage()(depth[i]).convert("RGB")) for i in range(depth.shape[0])], axis=1)
-        show_image = np.concatenate([inputs, depth, ground_truths, pred_images], axis=0)
-    else:
-        show_image = np.concatenate([inputs, ground_truths, pred_images], axis=0)
+    ground_truths = input_images.permute(1,2,0,3).reshape(3, H, F*W)
+    pred_images = pred_images.permute(1,2,0,3).reshape(3, H, F*W)
+
+    show_image = torch.cat([input_images, ground_truths, pred_images], dim=1)
 
     return show_image
 
@@ -289,13 +300,14 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
     accelerator.log({"val/psnr": psnr_score, "val/ssim": ssim_score, "val/lpips": lpips_score}, step=step)
 
     
-    show_images_full = np.stack(show_images, axis=0)
-    show_images_full = accelerator.gather(torch.tensor(show_images_full).to(device)).cpu().numpy()
+    show_images_full = torch.cat(show_images, dim=1)
+    show_images_full = accelerator.gather(show_images_full)
     if accelerator.is_main_process:
-        for j in range(len(show_images)):
-            if config.image_size > 256:
-                show_images[j] = cv2.resize(show_images[j], None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-            accelerator.log({f"val/gt_masked_pred_images{j}": wandb.Image(show_images[j])}, step=step)
+        # for j in range(len(show_images)):
+        #     if config.image_size > 256:
+        #         show_images[j] = cv2.resize(show_images[j], None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+            # accelerator.log({f"val/gt_masked_pred_images{j}": wandb.Image(show_images[j])}, step=step)
+        accelerator.log({"val/show_images": wandb.Image(show_images_full)}, step=step)
 
     del loss_fn_alex
     torch.cuda.empty_cache()
