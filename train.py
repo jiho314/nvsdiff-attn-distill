@@ -246,9 +246,9 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                 # show_save_dict[batch['tag'][0]] += 1
             if val_iter < viz_len:
                 if depth is not None:
-                    show_image = get_show_images(image_normalized, preds, cond_num, batch["depth"])
+                    show_image = get_show_images(image, torch.tensor(preds), cond_num, batch["depth"])
                 else:
-                    show_image = get_show_images(image_normalized, preds, cond_num)
+                    show_image = get_show_images(image, torch.tensor(preds), cond_num)
 
                 if color_warps is not None:
                     h, w = image.shape[2], image.shape[3]
@@ -365,9 +365,9 @@ def log_train(accelerator, config, args, pipeline, weight_dtype, batch, step, **
             color_warps = None
 
     if depth is not None:
-        show_image = get_show_images(image_normalized, preds, kwargs.get("random_cond_num", 1), batch["depth"][:nframe])
+        show_image = get_show_images(image, torch.tensor(preds), kwargs.get("random_cond_num", 1), batch["depth"][:nframe])
     else:
-        show_image = get_show_images(image_normalized, preds, kwargs.get("random_cond_num", 1))
+        show_image = get_show_images(image, torch.tensor(preds), kwargs.get("random_cond_num", 1))
 
     if color_warps is not None:
         h, w = image.shape[2], image.shape[3]
