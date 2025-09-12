@@ -176,8 +176,7 @@ def get_show_images(input_images, pred_images, cond_num, depth=None):
     return show_image
 
 @torch.no_grad()
-def log_validation(accelerator, config, args, pipeline, val_dataloader, step, device, cond_num = None,
-                    **kwargs):
+def log_validation(accelerator, config, args, pipeline, val_dataloader, step, device, **kwargs):
     ''' Caution, batch=1 !
     '''
     if accelerator.is_main_process:
@@ -205,8 +204,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
     # show_save_dict = collections.defaultdict(int)
     val_iter = 0
 
-    if cond_num is None:
-        cond_num = config.fix_cond_num
+    cond_num = config.val_cond_num
     with torch.no_grad(), torch.autocast("cuda"):
         for batch in tqdm(val_dataloader, desc=f"Validation rank{accelerator.process_index}..."):
             batch = uniform_push_batch(batch, cond_num)
@@ -216,7 +214,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
 
             extrinsic, intrinsic = extri_, intri_
             tag, sequence_name, depth = None, None , None
-            preds = pipeline(images=image_normalized, nframe=config.nframe, cond_num=cond_num,
+            preds = pipeline(images=image_normalized, nframe=config.val_nframe, cond_num=cond_num,
                              height=image_normalized.shape[2], width=image_normalized.shape[3],
                              intrinsics=intrinsic, extrinsics=extrinsic,
                              num_inference_steps=50, guidance_scale=args.val_cfg,
@@ -226,7 +224,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
             if config.model_cfg.get("enable_depth", False) and config.model_cfg.get("priors3d", False):
                 color_warps = global_position_encoding_3d(config, depth, batch['intrinsic'],
                                                           batch['extrinsic'], 1,
-                                                          nframe=config.nframe, device=accelerator.device,
+                                                          nframe=config.val_nframe, device=accelerator.device,
                                                           pe_scale=1 / 8,
                                                           embed_dim=config.model_cfg.get("coord_dim", 192),
                                                           colors=image)
@@ -603,8 +601,8 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
 
     if config.opt_cfg.scale_lr:
-        config.learning_rate = (
-                config.learning_rate * config.gradient_accumulation_steps * ( config.train_batch_size * config.nframe / config.scale_lr_base_batch )* accelerator.num_processes
+        config.opt_cfg.learning_rate = (
+                config.opt_cfg.learning_rate * config.gradient_accumulation_steps * ( config.train_batch_size * config.nframe / config.opt_cfg.scale_lr_base_batch_size )* accelerator.num_processes
         )
 
     # set trainable parameters
@@ -642,7 +640,7 @@ def main():
         **config.wds_dataset_config
     )
     val_dataset = build_re10k_wds(
-        num_viewpoints=config.nframe,
+        num_viewpoints=config.val_nframe,
         **config.val_wds_dataset_config
     ) 
     # eval_dataloader = DataLoader(
@@ -755,8 +753,8 @@ def main():
 
     # Prepare 
     accelerator.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] = config.train_batch_size
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(unet, optimizer, train_dataloader, lr_scheduler)  # train_dataloader
-    # unet, optimizer, lr_scheduler = accelerator.prepare(unet, optimizer, lr_scheduler)  # train_dataloader
+    # unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(unet, optimizer, train_dataloader, lr_scheduler)  # train_dataloader
+    unet, optimizer, lr_scheduler = accelerator.prepare(unet, optimizer, lr_scheduler)  # train_dataloader
     
 
     # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
