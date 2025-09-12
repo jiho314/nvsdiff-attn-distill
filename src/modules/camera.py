@@ -62,7 +62,8 @@ def batch_sample_rays(intrinsic, extrinsic, image_h=None, image_w=None,
     device = intrinsic.device
     B = intrinsic.shape[0]
     if normalize_extrinsic:
-        c2w_view0 = einops.rearrange(extrinsic, "(b f) r c -> b f r c", f=nframe)[:, normalize_extrinsic_tgt].inverse().to(device)  # [B,4,4]
+        extri_ = einops.rearrange(extrinsic, "(b f) r c -> b f r c", f=nframe)
+        c2w_view0 = extri_[:, normalize_extrinsic_tgt].inverse().to(device)  # [B,4,4]
         # c2w_view0 = extrinsic[::nframe].inverse().to(device)  # [B,4,4]
         c2w_view0 = c2w_view0.repeat_interleave(nframe, dim=0)  # [BF,4,4]
         extrinsic = c2w_view0 @ extrinsic

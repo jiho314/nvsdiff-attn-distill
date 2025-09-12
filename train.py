@@ -1142,7 +1142,7 @@ def main():
                             if vggt_layer == "track_head":
                                 B, Head, F1HW, F2HW = gt_attn_logit.shape  
                                 F1, F2, HW = len(query_idx), len(key_idx), F1HW // len(query_idx)
-                                gt_attn_logit_HW = einops.rearrange(gt_attn_logit, 'B Head (F1 HW) (F2 HW) -> (B Head F1) HW (F2 HW)', B=B,Head=Head, F1=F1, F2=F2, HW=HW)
+                                gt_attn_logit_HW = einops.rearrange(gt_attn_logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1) HW1 (F2 HW2)', B=B,Head=Head, F1=F1, F2=F2, HW1=HW, HW2=HW)
                                 consistency_mask = cycle_consistency_checker(gt_attn_logit_HW)
                                 consistency_mask = einops.rearrange(consistency_mask, '(B Head F1) HW 1 -> B Head (F1 HW) 1', B=B, Head=Head, F1=F1, HW=HW)
                                 assert Head == 1, "Track Head costmap should have only one head"
