@@ -42,9 +42,14 @@ from src.modules.position_encoding import depth_freq_encoding, global_position_e
 from src.modules.schedulers import get_diffusion_scheduler
 from utils import get_lpips_score, _seq_name_to_seed
 
-from src.modules.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache
+from src.distill_utils.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache
+from src.modules.attention_visualization_callback import AttentionVisualizationCallback
 from src.modules.timestep_sample import truncated_normal
 logger = get_logger(__name__, log_level="INFO")
+
+
+
+
 
 
 # def resort_batch(batch, nframe, bsz):
@@ -171,36 +176,70 @@ def slice_vae_encode(vae, image, sub_size):  # vae fails to encode large tensor 
 
 def get_pipeline(accelerator, config, vae, unet, weight_dtype):
     scheduler = get_diffusion_scheduler(config, name="DDIM")
+    
+    # Handle VAE - it may not be wrapped by accelerator if not prepared
+    try:
+        unwrapped_vae = accelerator.unwrap_model(vae)
+    except:
+        unwrapped_vae = vae  # VAE is not prepared by accelerator
+    
     pipeline = StableDiffusionMultiViewPipeline.from_pretrained(
         config.pretrained_model_name_or_path,
-        vae=accelerator.unwrap_model(vae),
+        vae=unwrapped_vae,
         unet=accelerator.unwrap_model(unet).eval(),
         scheduler=scheduler,
         safety_checker=None,
         torch_dtype=weight_dtype
     )
-    pipeline = pipeline.to(accelerator.device)
+    pipeline = pipeline.to(accelerator.device, dtype=weight_dtype)
     pipeline.set_progress_bar_config(disable=True)
 
     return pipeline
 
 
 def get_show_images(input_images, pred_images, cond_num, depth=None):
-    pred_images = [pred_images[i] for i in range(pred_images.shape[0])]
-    pred_images = np.clip(np.concatenate(pred_images, axis=1) * 255, 0, 255).astype(np.uint8)  # [H,W*F,c]
-    input_images = (input_images + 1) / 2
-    ground_truths = np.concatenate([np.array(ToPILImage()(input_images[i])) for i in range(input_images.shape[0])], axis=1)
-    input_images[cond_num:] = 0
-    inputs = np.concatenate([np.array(ToPILImage()(input_images[i])) for i in range(input_images.shape[0])], axis=1)
+    # pred_images는 target frames만 포함 (cond_num 이후)
+    pred_images_list = [pred_images[i] for i in range(pred_images.shape[0])]
+    pred_images_concat = np.clip(np.concatenate(pred_images_list, axis=1) * 255, 0, 255).astype(np.uint8)  # [H,W*target_frames,c]
+    
+    # 원본 이미지를 normalize
+    input_images_orig = (input_images + 1) / 2
+    
+    # reference frames (condition frames)
+    ref_frames = [np.array(ToPILImage()(input_images_orig[i])) for i in range(cond_num)]
+    ref_concat = np.concatenate(ref_frames, axis=1)
+    
+    # target frames의 ground truth
+    target_frames_count = input_images_orig.shape[0] - cond_num
+    gt_target_frames = [np.array(ToPILImage()(input_images_orig[i])) for i in range(cond_num, input_images_orig.shape[0])]
+    gt_target_concat = np.concatenate(gt_target_frames, axis=1)
+    
+    # pred_images와 gt_target의 크기를 맞춤
+    pred_width = pred_images_concat.shape[1]
+    gt_width = gt_target_concat.shape[1]
+    
+    if pred_width != gt_width:
+        # 더 작은 크기로 맞춤
+        min_width = min(pred_width, gt_width)
+        pred_images_concat = pred_images_concat[:, :min_width]
+        gt_target_concat = gt_target_concat[:, :min_width]
+    
+    # 첫 번째 행: 모델의 input 전체 + 생성 (ref1 ref2 pred)
+    model_output_row = np.concatenate([ref_concat, pred_images_concat], axis=1)
+    
+    # 두 번째 행: GT (ref1 ref2 gt)
+    ground_truth_row = np.concatenate([ref_concat, gt_target_concat], axis=1)
+    
     if depth is not None:
+        # depth 정보가 있으면 세 번째 행으로 추가
         min_vals = depth.amin(dim=[2, 3], keepdim=True)
         max_vals = depth.amax(dim=[2, 3], keepdim=True)
         depth = (depth - min_vals) / (max_vals - min_vals)
-        depth[cond_num:] = 0
-        depth = np.concatenate([np.array(ToPILImage()(depth[i]).convert("RGB")) for i in range(depth.shape[0])], axis=1)
-        show_image = np.concatenate([inputs, depth, ground_truths, pred_images], axis=0)
+        depth_frames = [np.array(ToPILImage()(depth[i]).convert("RGB")) for i in range(depth.shape[0])]
+        depth_row = np.concatenate(depth_frames, axis=1)
+        show_image = np.concatenate([model_output_row, ground_truth_row, depth_row], axis=0)
     else:
-        show_image = np.concatenate([inputs, ground_truths, pred_images], axis=0)
+        show_image = np.concatenate([model_output_row, ground_truth_row], axis=0)
 
     return show_image
 
@@ -215,18 +254,15 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
 
     loss_fn_alex = lpips.LPIPS(net='alex').to(device).eval()
 
-    manual_val_len = config.get("val_manual_len", None)
     compute_fid = config.get("val_compute_fid", False) 
-    viz_len = config.get("val_viz_len", 30)
+    viz_len = config.get("val_viz_len", 52)
+    
     if compute_fid:
         if accelerator.is_main_process:
             from torchmetrics.image.fid import FrechetInceptionDistance
             fid_calculator = FrechetInceptionDistance(normalize=True).to(device)
             fid_calculator.reset()
 
-    if manual_val_len is not None:
-        assert manual_val_len % (accelerator.num_processes * 1) == 0
-        manual_val_step = manual_val_len // (accelerator.num_processes * 1)
 
     psnr_scores = []
     ssim_scores = []
@@ -237,6 +273,26 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
 
     if cond_num is None:
         cond_num = config.fix_cond_num
+
+    # visualize_loss_fn 초기화 (validation loop 전에 정의)
+    visualize_loss_fn = None
+    if do_attn_visualize:
+        # loss function
+        def cross_entropy(prob, prob_gt):
+            """Cross entropy loss for attention probabilities."""
+            eps = 1e-8
+            return - (prob_gt * (prob + eps).log()).sum(dim=-1).mean()
+
+        def kl_divergence(prob, prob_gt):
+            """Kullback-Leibler divergence loss for attention probabilities."""
+            return (prob_gt * (prob_gt.log() - prob.log())).sum(dim=-1).mean()
+
+        ATTN_LOSS_FN = {
+            "l1": torch.nn.functional.l1_loss,
+            "cross_entropy": cross_entropy,
+            "kl_divergence": kl_divergence,
+        }
+        visualize_loss_fn = ATTN_LOSS_FN[visualize_config['loss_fn'].lower()]
 
     # Match train.py: use torch.autocast with explicit dtype
     with torch.no_grad(), torch.autocast("cuda", dtype=weight_dtype):
@@ -262,12 +318,49 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
 
             extrinsic, intrinsic = extri_, intri_
             tag, sequence_name, depth = None, None , None
+            # attention visualization callback 설정
+            attention_callback = None
+            if do_attn_visualize and visualize_loss_fn is not None:
+                # visualize_config 간소화
+                visualize_config_with_fn = visualize_config.copy()
+                visualize_config_with_fn['loss_fn'] = visualize_loss_fn
+                visualize_config_with_fn['viz_log_wandb'] = True
+                
+                # 시퀀스 이름 설정
+                seq_name = f"sample_{val_iter:03d}"
+                if 'sequence_name' in batch:
+                    seq_batch = batch['sequence_name']
+                    if isinstance(seq_batch, (list, tuple)) and len(seq_batch) > 0:
+                        seq_name = str(seq_batch[0])
+                    elif seq_batch is not None:
+                        seq_name = str(seq_batch)
+                visualize_config_with_fn['viz_seq_name'] = seq_name
+                
+                # attention visualization도 샘플별 step 사용
+                visualize_config_with_fn['viz_wandb_step_base'] = val_iter
+                
+                attention_callback = AttentionVisualizationCallback(
+                    vggt_model=vggt_model,
+                    visualize_config=visualize_config_with_fn,
+                    batch=batch,
+                    cond_num=cond_num,
+                    device=accelerator.device,
+                    do_attn_visualize=do_attn_visualize,
+                    accelerator=accelerator
+                )
+            
             preds = pipeline(images=image_normalized, nframe=config.nframe, cond_num=cond_num,
                              height=image_normalized.shape[2], width=image_normalized.shape[3],
                              intrinsics=intrinsic, extrinsics=extrinsic,
                              num_inference_steps=50, guidance_scale=args.val_cfg,
                              output_type="np", config=config, tag=tag,
-                             sequence_name=sequence_name, depth=depth, vae=kwargs['vae']).images  # [f,h,w,c]
+                             sequence_name=sequence_name, depth=depth, vae=kwargs['vae'],
+                             callback_on_step_end=attention_callback,
+                             callback_on_step_end_tensor_inputs=["latents"]).images  # [f,h,w,c]
+            
+            # Pipeline 완료 후 VGGT cache 정리
+            if do_attn_visualize and attention_callback is not None:
+                attention_callback.clear_vggt_cache()
 
             # Strict validation: if pipeline returned invalid predictions or targets are empty,
             # raise immediately with detailed debug info so user can inspect dataset.
@@ -299,96 +392,27 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                 logger.error(f"Predicted frames ({pred_f}) <= cond_num ({cond_num}); no preds for target frames. sequence_name={seq_name}")
                 raise RuntimeError("Pipeline produced fewer predicted frames than expected (<= cond_num).")
 
-            if config.model_cfg.get("enable_depth", False) and config.model_cfg.get("priors3d", False):
-                color_warps = global_position_encoding_3d(config, depth, batch['intrinsic'],
-                                                          batch['extrinsic'], 1,
-                                                          nframe=config.nframe, device=accelerator.device,
-                                                          pe_scale=1 / 8,
-                                                          embed_dim=config.model_cfg.get("coord_dim", 192),
-                                                          colors=image)
-            else:
-                color_warps = None
-        
-            ## Seonghu TODO: visualize and compute loss
-            visualize_loss_dict = dict()
-            visualize_loss = 0.0
-            
-            if do_attn_visualize:
-                ### VGGT Process
-                if vggt_model is not None:
-                    with torch.no_grad():
-                        image = batch['image'].to(device)  #  0 1 tensor [B,F,3,H,W]
-                        vggt_pred = vggt_model(image)
-                        batch['vggt_attn_cache'] = vggt_pred['attn_cache'] # for distill
-                else:
-                    assert False, "vggt_model is not provided"
-                    
-                # get geometry data (overwrite input)
-                unet_attn_cache = pop_cached_attn(pipeline.unet)
-                visualize_pairs = visualize_config['pairs']
-                for unet_layer, vggt_layer in visualize_pairs:
-                    B, F, _, H, W = image.shape
-                    # vggt_attn_cache = batch.get('attn_logit_gts_dict', None)
-                    unet_attn_cache = pop_cached_attn(pipeline.unet)
-                    visualize_pairs = visualize_config['pairs']
-                    for unet_layer, vggt_layer in visualize_pairs:
-                        '''
-                            gt(VGGT): query and key (B Head N(VHW) C) each
-                                - if using cost map feat, Head=1
-                            pred(UNet): attention map(logit, before softmax), B Head Q(FHW) K(FHW)
-                        '''
-                        gt_query, gt_key = batch['vggt_attn_cache'][str(vggt_layer)]['query'].detach(), batch['vggt_attn_cache'][str(vggt_layer)]['key'].detach() # B Head VHW C, B Head VHW C
-                        pred_attn_logit = unet_attn_cache[str(unet_layer)] # B Head Q(FHW) K(FHW)
-                        Q, K = pred_attn_logit.shape[-2], pred_attn_logit.shape[-1]
-                        assert Q==K, f"pred attn should have same Q,K dim, but {pred_attn_logit.shape}"
-
-                        # 1) Resize token: gt -> pred
-                        def resize_tok(tok, target_size):
-                            B, Head, FHW, C = tok.shape
-                            HW = FHW // F
-                            H = W = int(math.sqrt(HW))
-                            tok = einops.rearrange(tok, 'B Head (F H W) C -> (B Head F) C H W', B=B, Head=Head, F=F, H=H, W=W, C=C)
-                            tok = torch.nn.functional.interpolate(tok, size=(target_size, target_size), mode='bilinear')
-                            tok = einops.rearrange(tok, '(B Head F) C H W -> B Head (F H W) C',  B=B, Head=Head, F=F, H=target_size, W=target_size, C=C)
-                            return tok
-                        
-                        pred_query_size, pred_key_size = int(math.sqrt(Q // F)), int(math.sqrt(K // F))
-                        gt_query, gt_key = resize_tok(gt_query, target_size=pred_query_size), resize_tok(gt_key, target_size=pred_key_size)
-
-                        # 2) Extract Distill Views
-                        # Distill Query to target/all 
-                        if visualize_config['query'] == "target":
-                            query_idx = list(range(cond_num, F))
-                        elif visualize_config['query'] == "all":
-                            query_idx = list(range(0, F))
-                        else:
-                            raise NotImplementedError(f"visualize_config['query'] {visualize_config['query']} not implemented")
-                        
-                        # Distill Key to reference/all
-                        if visualize_config['key'] == "reference":
-                            key_idx = list(range(0, cond_num))
-                        elif visualize_config['key'] == "all":
-                            key_idx = list(range(0, F))
-                        else:
-                            raise NotImplementedError(f"visualize_config['key'] {visualize_config['key']} not implemented")
-                        
-                        def slice_attnmap(attnmap, query_idx, key_idx):
-                            B, Head, Q, K = attnmap.shape
-                            HW = Q // F
-                            attnmap = einops.rearrange(attnmap, 'B Head (F1 HW1) (F2 HW2) -> B Head F1 HW1 F2 HW2', B=B, Head=Head, F1=F, HW1=HW, F2=F, HW2=HW)
-                            attnmap = attnmap[:, :, query_idx][:, :, :, :, key_idx]
-                            attnmap = einops.rearrange(attnmap, 'B Head f1 HW1 f2 HW2 -> B Head (f1 HW1) (f2 HW2)', B=B, Head=Head, f1=len(query_idx), f2=len(key_idx), HW1=HW, HW2=HW)
-                            return attnmap
-                        
-                        pred_attn_logit = slice_attnmap(pred_attn_logit, query_idx, key_idx) # B Head Q(FHW) K(FHW)
-                        gt_attn_logit = gt_query @ gt_key.transpose(-1, -2) # B Head Q(FHW) K(FHW)
-                        gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx, key_idx) # B Head Q(FHW) K(FHW)
-
-                        pred, gt = pipeline.unet.unet_logit_head(pred_attn_logit), pipeline.unet.vggt_logit_head(gt_attn_logit)
-                        visualize_loss_dict[f"train/visualize/unet{unet_layer}_vggt{vggt_layer}"] = torch.clamp(visualize_config['loss_fn'](pred, gt), max=10.0)
-                    visualize_loss = sum(visualize_loss_dict.values()) / len(visualize_loss_dict.values()) if len(visualize_loss_dict) > 0 else torch.tensor(0.0).to(device, dtype=torch.float32)
-                    
-                    import pdb; pdb.set_trace()
+            # attention visualization 데이터 가져오기 (로깅은 나중에)
+            attention_loss_data = {}
+            attention_images_data = {}
+            if do_attn_visualize and attention_callback is not None:
+                structured_losses = attention_callback.get_structured_losses()
+                attention_images = attention_callback.get_attention_images()
+                
+                # attention loss 데이터 준비
+                overall_summary = structured_losses.get('overall_summary', {})
+                if overall_summary:
+                    attention_loss_data = {
+                        f"val/attention_loss/mean": overall_summary.get('mean', 0.0),
+                        f"val/sample_name": seq_name if seq_name is not None else f"sample_{val_iter}",
+                        "val_sample_idx": val_iter
+                    }
+                
+                # attention 이미지 데이터 준비
+                attention_images_data = attention_images
+                
+                # callback 상태 초기화 (다음 배치를 위해)
+                attention_callback.reset()
                     
             # if batch['tag'][0] not in show_save_dict or show_save_dict[batch['tag'][0]] < 10:  # 每个dataset显示10个
                 # show_save_dict[batch['tag'][0]] += 1
@@ -397,11 +421,6 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                     show_image = get_show_images(image_normalized, preds, cond_num, batch["depth"])
                 else:
                     show_image = get_show_images(image_normalized, preds, cond_num)
-
-                if color_warps is not None:
-                    h, w = image.shape[2], image.shape[3]
-                    show_image[h:h * 2, cond_num * w:] = color_warps[0][:, cond_num * w:]
-                show_images.append(show_image)
 
             gt_images = (image_normalized[cond_num:].permute(0, 2, 3, 1).cpu().numpy() + 1) / 2 # -1 1 → 0 1
             preds = preds[cond_num:]
@@ -413,33 +432,91 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                     fid_calculator.update(einops.rearrange(gt_imgs_fid,'... c h w -> (...) c h w'), real=True)
                     fid_calculator.update(einops.rearrange(preds_fid,'... c h w -> (...) c h w'), real=False)
 
-            for i in range(preds.shape[0]):
+            # compute per-frame metrics for this sample
+            sample_frame_psnr = []
+            sample_frame_ssim = []
+            sample_frame_lpips = []
+            
+            for i in range(preds.shape[0]):  # 이 샘플의 target frames에 대해
                 psnr_ = peak_signal_noise_ratio(gt_images[i], preds[i], data_range=1.0)
-                psnr_scores.append(psnr_)
                 ssim_ = structural_similarity(cv2.cvtColor(gt_images[i], cv2.COLOR_RGB2GRAY),
                                               cv2.cvtColor(preds[i], cv2.COLOR_RGB2GRAY), data_range=1.0)
-                ssim_scores.append(ssim_)
                 lpips_ = get_lpips_score(loss_fn_alex, gt_images[i], preds[i], device)
+                
+                # 전역 리스트에 추가 (전체 평균 계산용)
+                psnr_scores.append(psnr_)
+                ssim_scores.append(ssim_)
                 lpips_scores.append(lpips_)
+                
+                # 샘플별 리스트에 추가 (이 샘플의 평균 계산용)
+                sample_frame_psnr.append(psnr_)
+                sample_frame_ssim.append(ssim_)
+                sample_frame_lpips.append(lpips_)
+
+            # 이 샘플의 평균 메트릭 계산 (여러 target frames의 평균)
+            sample_psnr_mean = float(np.mean(sample_frame_psnr)) if len(sample_frame_psnr) > 0 else 0.0
+            sample_ssim_mean = float(np.mean(sample_frame_ssim)) if len(sample_frame_ssim) > 0 else 0.0
+            sample_lpips_mean = float(np.mean(sample_frame_lpips)) if len(sample_frame_lpips) > 0 else 0.0
+
+            # wandb 로깅 (메인 프로세스에서만) - 각 샘플별로 개별 global step 사용
+            if accelerator.is_main_process:
+                import wandb
+                
+                # 시퀀스 이름 결정
+                seq_name_log = f"sample_{val_iter:03d}"
+                if 'sequence_name' in batch:
+                    seq_batch = batch['sequence_name']
+                    if isinstance(seq_batch, (list, tuple)) and len(seq_batch) > 0:
+                        seq_name_log = str(seq_batch[0])
+                    elif seq_batch is not None:
+                        seq_name_log = str(seq_batch)
+
+                # 이미지 생성
+                if depth is not None:
+                    show_image_local = get_show_images(image_normalized, preds, cond_num, batch["depth"])
+                else:
+                    show_image_local = get_show_images(image_normalized, preds, cond_num)
+
+                # wandb 로깅 - 모든 데이터를 한 번에
+                log_data = {
+                    f"val/generated": wandb.Image(show_image_local),
+                    f"val/sample_name": seq_name_log,  # 샘플 이름 추가
+                    f"val/psnr": sample_psnr_mean,
+                    f"val/ssim": sample_ssim_mean,
+                    f"val/lpips": sample_lpips_mean,
+                }
+                
+                # attention loss 데이터가 있으면 추가
+                if attention_loss_data:
+                    log_data.update(attention_loss_data)
+                
+                # attention 이미지들이 있으면 추가
+                if attention_images_data:
+                    for key, img_data in attention_images_data.items():
+                        log_data[key] = wandb.Image(img_data['image'], caption=img_data['caption'])
+                
+                # 모든 데이터를 한 번에 로깅
+                accelerator.log(log_data, step=val_iter)
             
             val_iter += 1 
-            if manual_val_len is not None:
-                if val_iter >= manual_val_step:
-                    break
     
     # unify all results
     # If no metrics were computed, raise an error so the root cause can be investigated
     if len(psnr_scores) == 0 or len(ssim_scores) == 0 or len(lpips_scores) == 0:
         logger.error("No valid metric samples collected during validation. This likely indicates every sample had empty targets or failed processing.")
         raise RuntimeError("Validation produced no metric samples (empty psnr/ssim/lpips lists). Check cond_num, data frames and pipeline outputs.")
+    
+    # Attention loss 전체 통계 로깅 (모든 샘플 종합)
 
-    psnr_score = torch.tensor(np.mean(psnr_scores), device=device, dtype=torch.float32)
-    ssim_score = torch.tensor(np.mean(ssim_scores), device=device, dtype=torch.float32)
-    lpips_score = torch.tensor(np.mean(lpips_scores), device=device, dtype=torch.float32)
+    # 전체 validation에 대한 평균 메트릭 계산 (모든 frames의 평균)
+    overall_psnr = torch.tensor(np.mean(psnr_scores), device=device, dtype=torch.float32)
+    overall_ssim = torch.tensor(np.mean(ssim_scores), device=device, dtype=torch.float32)
+    overall_lpips = torch.tensor(np.mean(lpips_scores), device=device, dtype=torch.float32)
 
-    psnr_score = accelerator.gather(psnr_score).mean().item()
-    ssim_score = accelerator.gather(ssim_score).mean().item()
-    lpips_score = accelerator.gather(lpips_score).mean().item()
+    # Multi-GPU 환경에서 평균 계산
+    overall_psnr = accelerator.gather(overall_psnr).mean().item()
+    overall_ssim = accelerator.gather(overall_ssim).mean().item()
+    overall_lpips = accelerator.gather(overall_lpips).mean().item()
     if compute_fid:
         if accelerator.is_main_process:
             fid_val = fid_calculator.compute()
@@ -450,19 +527,36 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
             accelerator.log({"val/fid": fid_val, "val/fid_real_num": real_num, "val/fid_fake_num": fake_num}, step=step)
 
     if accelerator.is_main_process:
-        accelerator.log({"val/psnr": psnr_score, "val/ssim": ssim_score, "val/lpips": lpips_score}, step=step)
-        # tracker = accelerator.get_tracker("tensorboard", unwrap=True)
-        # tracker.add_scalar("val/psnr", psnr_score, global_step=step)
-        # tracker.add_scalar("val/ssim", ssim_score, global_step=step)
-        # tracker.add_scalar("val/lpips", lpips_score, global_step=step)
+        # 전체 validation 요약 메트릭 로깅 (별도의 높은 step 사용)
+        summary_step = 99999  # 요약 데이터는 별도 step에 저장
+        total_samples = val_iter  # 실제 처리된 샘플 수
+        total_frames = len(psnr_scores)  # 실제 처리된 프레임 수
+        
+        accelerator.log({
+            "val/summary/psnr_avg": overall_psnr,  # 모든 프레임의 평균
+            "val/summary/ssim_avg": overall_ssim, 
+            "val/summary/lpips_avg": overall_lpips,
+            "val/summary/total_samples": total_samples,  # 샘플 수
+            "val/summary/total_frames": total_frames,    # 프레임 수
+            "val/summary/frames_per_sample": total_frames / max(1, total_samples)  # 샘플당 평균 프레임 수
+        }, step=summary_step)
 
-        for j in range(len(show_images)):
+        # 샘플 이미지들 로깅 (요약용)
+        for j in range(min(len(show_images), 5)):
+            img = show_images[j]
             if config.image_size > 256:
-                show_images[j] = cv2.resize(show_images[j], None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-            # tracker.add_images(f"val/gt_masked_pred_images{j}", show_images[j], step, dataformats="HWC")
-            accelerator.log({f"val/gt_masked_pred_images{j}": wandb.Image(show_images[j])}, step=step)
+                img = cv2.resize(img, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+            accelerator.log({f"val/summary/sample_image_{j}": wandb.Image(img)}, step=summary_step)
 
     del loss_fn_alex
+    
+    # Validation 완료 후 모든 attention cache 정리
+    if do_attn_visualize:
+        from src.distill_utils.attn_processor_cache import unset_attn_cache
+        # UNet attention cache 설정 해제
+        unset_attn_cache(pipeline.unet)
+        logger.info("Unset UNet attention cache after validation")
+    
     torch.cuda.empty_cache()
 
     return lpips_score
@@ -614,45 +708,32 @@ def main():
         assert not config.get("use_vggt_camera", False), "use_vggt_camera is only available when vggt_on_fly is set"
 
     ## Seonghu TODO: 임시 visualize config
-    visualize_config = dict()
-    visualize_config['timestep_interval'] = 1
-    visualize_config['layer_interval'] = 5
-    visualize_config['loss_fn'] = "cross_entropy"
-    visualize_config['loss_weight'] = 1.0
-    visualize_config['vggt_logit_head'] = "softmax_headmean"
-    visualize_config['vggt_logit_head_kwargs'] = {"softmax_temp": 8.0}
-    visualize_config['unet_logit_head'] = "softmax_headmean"
-    visualize_config['unet_logit_head_kwargs'] = {"softmax_temp": 1.0}
-    visualize_config['query'] = "target"
-    visualize_config['key'] = "reference"
-    visualize_config['student_unet_attn_layers'] = list(range(0, 32, visualize_config['layer_interval']))
+    visualize_config = {
+        'timestep_interval': 1,
+        'loss_fn': "cross_entropy",
+        'loss_weight': 1.0,
+        'vggt_logit_head': "softmax_headmean",
+        'vggt_logit_head_kwargs': {"softmax_temp": 8.0},
+        'unet_logit_head': "softmax_headmean",
+        'unet_logit_head_kwargs': {"softmax_temp": 1.0},
+        'query': "target",
+        'key': "reference",
+        'student_unet_attn_layers': list(range(2,3)),
+        # 시각화 설정 추가
+        'viz_steps': [],  # 빈 리스트 = 모든 스텝에서 시각화
+        'viz_layers': [],  # 빈 리스트 = 모든 레이어에서 시각화
+        'viz_log_wandb': True,
+        'viz_alpha': 0.6,
+        'viz_query_xy': None,  # None이면 랜덤 선택
+        'viz_query_index': None,  # None이면 랜덤 선택
+    }
     visualize_config['pairs'] = [(unet_layer, "track_head") for unet_layer in visualize_config['student_unet_attn_layers']]
     
     ## =====================================
     
     if do_attn_visualize:
-        # distill_config = config.distill_config
-        # distill_pairs = config.distill_config.distill_pairs
-        # loss function
-        def cross_entropy(prob, prob_gt):
-            """Cross entropy loss for attention probabilities."""
-            eps = 1e-8
-            return - (prob_gt * (prob + eps).log()).sum(dim=-1).mean()
-
-        def kl_divergence(prob, prob_gt):
-            """Kullback-Leibler divergence loss for attention probabilities."""
-            return (prob_gt * (prob_gt.log() - prob.log())).sum(dim=-1).mean()
-
-        ATTN_LOSS_FN = {
-            "l1": torch.nn.functional.l1_loss,
-            "cross_entropy": cross_entropy,
-            "kl_divergence": kl_divergence,
-        }
-        visualize_loss_fn = ATTN_LOSS_FN[visualize_config['loss_fn'].lower()]
-        visualize_loss_weight = visualize_config['loss_weight']
-
         # logit heads: input: [B, Head, Q, K]
-        from src.modules.attn_logit_head import LOGIT_HEAD_CLS # JIHO TODO: save/load params
+        from src.distill_utils.attn_logit_head import LOGIT_HEAD_CLS # JIHO TODO: save/load params
         unet_logit_head = LOGIT_HEAD_CLS[visualize_config['unet_logit_head'].lower()](**visualize_config['unet_logit_head_kwargs'])
         vggt_logit_head = LOGIT_HEAD_CLS[visualize_config['vggt_logit_head'].lower()](**visualize_config['vggt_logit_head_kwargs'])
 
@@ -668,7 +749,6 @@ def main():
     else:
         visualize_pairs = visualize_config['pairs']
         visualize_student_unet_attn_layers = []
-        visualize_loss_fn = None
         
     # set feat cache for repa distill # JIHO TODO: repa 
     # from src.modules.attn_processor_cache import set_feat_cache, unset_feat_cache, pop_cached_feat, clear_feat_cache
@@ -884,18 +964,7 @@ def main():
         else:
             ds_cfg["zero_optimization"] = {"stage": 0}
 
-    # Pass validation dataloader into prepare so DeepSpeed/Accelerate can infer batch size when needed
-    unet, val_dataloader = accelerator.prepare(unet, val_dataloader)  # train_dataloader, val_dataloader
-
-    # Ensure UNet parameters are cast to the same weight dtype as other models (match train.py behavior).
-    # This avoids mixed-weight dtypes where some model parts are fp32 and others fp16, which breaks xformers.
-    try:
-        unet.to(accelerator.device, dtype=weight_dtype)
-    except Exception:
-        logger.warning("Failed to cast unet to weight_dtype after prepare; continuing with existing dtype.")
-    
-
-    # For mixed precision training match training behavior: set weight dtype according to accelerator
+    # Set weight dtype according to accelerator BEFORE prepare and model operations
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -904,10 +973,34 @@ def main():
         weight_dtype = torch.bfloat16
         args.mixed_precision = accelerator.mixed_precision
 
-    # Move models to device and cast non-trainable model weights to weight_dtype (same as train.py)
-    vae.to(accelerator.device, dtype=weight_dtype)
-    if config.vggt_on_fly:
-        vggt_model.to(accelerator.device, dtype=weight_dtype)
+    logger.info(f"Using weight_dtype: {weight_dtype} based on accelerator.mixed_precision: {accelerator.mixed_precision}")
+
+    # Cast all models to correct dtype BEFORE prepare
+    unet.to(dtype=weight_dtype)
+    vae.to(dtype=weight_dtype)
+    if do_attn_visualize and vggt_model is not None:
+        vggt_model.to(dtype=weight_dtype)
+        logger.info(f"VGGT model cast to {weight_dtype}")
+
+    # Pass validation dataloader into prepare so DeepSpeed/Accelerate can infer batch size when needed
+    unet, val_dataloader = accelerator.prepare(unet, val_dataloader)
+
+    # Move non-prepared models to device (they already have correct dtype from above)
+    vae.to(accelerator.device)
+    if do_attn_visualize and vggt_model is not None:
+        vggt_model.to(accelerator.device)
+        logger.info(f"VGGT model moved to device: {accelerator.device}")
+        
+        # Verify all VGGT model buffers are on correct device
+        for name, buffer in vggt_model.named_buffers():
+            if buffer.device != accelerator.device:
+                logger.warning(f"VGGT buffer {name} is on {buffer.device}, moving to {accelerator.device}")
+                buffer.data = buffer.data.to(accelerator.device)
+        
+        # Double-check the problematic buffers specifically
+        if hasattr(vggt_model, 'aggregator') and hasattr(vggt_model.aggregator, '_resnet_mean'):
+            logger.info(f"VGGT _resnet_mean device: {vggt_model.aggregator._resnet_mean.device}")
+            logger.info(f"VGGT _resnet_std device: {vggt_model.aggregator._resnet_std.device}")
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -916,6 +1009,16 @@ def main():
             project_name=args.tracker_project_name,
             init_kwargs={"wandb": {"name": args.run_name}} if args.run_name is not None else {},
         )
+        
+        # wandb 초기화 확인 및 메트릭 정의
+        print("Wandb initialized for validation")
+        
+        # attention loss 메트릭을 validation step 기준으로 정의
+        import wandb
+        wandb.define_metric("val/attention_loss/*")
+        wandb.define_metric("val/psnr", ) 
+        wandb.define_metric("val/ssim", )
+        wandb.define_metric("val/lpips",)
 
     # Validate!
     total_batch_size = 1 * accelerator.num_processes
@@ -932,6 +1035,7 @@ def main():
 
     # Build pipeline with the same weight dtype as training so autocast behaves consistently
     pipeline = get_pipeline(accelerator, config, vae, unet, weight_dtype)
+    
     _ = log_validation(accelerator=accelerator, config=config, args=args,
                             pipeline=pipeline, val_dataloader=val_dataloader,
                             step=global_step, device=device, weight_dtype=weight_dtype, vae=vae, 

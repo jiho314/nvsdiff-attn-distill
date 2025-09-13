@@ -198,7 +198,10 @@ class Aggregator(nn.Module):
             raise ValueError(f"Expected 3 input channels, got {C_in}")
 
         # Normalize images and reshape for patch embed
-        images = (images - self._resnet_mean) / self._resnet_std
+        # Ensure normalization constants are on the same device as input images
+        resnet_mean = self._resnet_mean.to(images.device, dtype=images.dtype)
+        resnet_std = self._resnet_std.to(images.device, dtype=images.dtype)
+        images = (images - resnet_mean) / resnet_std
 
         # Reshape to [B*S, C, H, W] for patch embedding
         images = images.view(B * S, C_in, H, W)

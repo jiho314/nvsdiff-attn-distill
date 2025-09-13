@@ -213,6 +213,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         predictions['extrinsics'], predictions['intrinsics'] = extrinsics, intrinsics
         
         # # 2) pointmap w/ depth head & Camera
+        # depth head가 비활성화되어 있으므로 depth 처리도 주석 처리
         # depth = predictions["depth"]
         # depth, extrinsics, intrinsics = depth.reshape(B*S, *depth.shape[2:]).to(torch.float32), extrinsics.reshape(B*S, *extrinsics.shape[2:]).to(torch.float32), intrinsics.reshape(B*S, *intrinsics.shape[2:]).to(torch.float32)
         # world_points_from_depth = unproject_depth_map_to_point_map(depth, extrinsics, intrinsics) # S H W 3
@@ -264,6 +265,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         elif "point_head" in self.cache_costmap_types: 
             # TODO:
             raise NotImplementedError("Point head costmap caching is not implemented yet.")
+        elif "point_map" in self.cache_costmap_types:
+            pass # already saved in batch
+
         predictions['attn_cache'] = attn_cache
 
         return predictions

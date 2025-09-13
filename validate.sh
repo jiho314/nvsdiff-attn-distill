@@ -4,7 +4,7 @@ export WANDB_API_KEY='5e4d6a67a9287ff9ad9b05ccc97582fcb1d48dfe' # seonghu, for d
 
 # Temporary visualize config for attention map visualization
 
-CUDA_VISIBLE_DEVICES=2 accelerate launch --mixed_precision="fp16" \
+CUDA_VISIBLE_DEVICES=3 accelerate launch --mixed_precision="fp16" \
                   --num_processes=1 \
                   --num_machines 1 \
                   --main_process_port 29443 \

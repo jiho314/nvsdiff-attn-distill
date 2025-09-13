@@ -29,6 +29,7 @@ dl = DataLoader(
 os.makedirs('batch_viz', exist_ok=True)
 
 for batch_idx, batch in enumerate(dl):
+    import pdb ; pdb.set_trace()
     image = batch['image'].cuda()  # B V C H W
     B, V, C, H, W = image.shape
     

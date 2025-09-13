@@ -42,9 +42,9 @@ from src.modules.position_encoding import depth_freq_encoding, global_position_e
 from src.modules.schedulers import get_diffusion_scheduler
 from utils import get_lpips_score, _seq_name_to_seed
 
-from src.modules.geometry import cycle_consistency_checker
-from src.modules.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache
-from src.modules.timestep_sample import truncated_normal
+from src.distill_utils.geometry import cycle_consistency_checker
+from src.distill_utils.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache
+from src.distill_utils.timestep_sample import truncated_normal
 logger = get_logger(__name__, log_level="INFO")
 
 
@@ -160,7 +160,7 @@ def get_pipeline(accelerator, config, vae, unet, weight_dtype):
 #     pred_images = [pred_images[i] for i in range(pred_images.shape[0])]
 #     pred_images = np.clip(np.concatenate(pred_images, axis=1) * 255, 0, 255).astype(np.uint8)  # [H,W*F,c]
 #     input_images = (input_images + 1) / 2
-#     ground_truths = np.concatenate([np.array(ToPILImage()(input_images[i])) for i in range(input_images.shape[0])], axis=1)
+    # ground_truths = np.concatenate([np.array(ToPILImage()(input_images[i])) for i in range(input_images.shape[0])], axis=1)
 #     input_images[cond_num:] = 0
 #     inputs = np.concatenate([np.array(ToPILImage()(input_images[i])) for i in range(input_images.shape[0])], axis=1)
 #     if depth is not None:
@@ -247,9 +247,9 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                 # show_save_dict[batch['tag'][0]] += 1
             if val_iter < viz_len:
                 if depth is not None:
-                    show_image = get_show_images(image, torch.tensor(preds), cond_num, batch["depth"])
+                    show_image = get_show_images(image, torch.tensor(preds).permute(0,3,1,2), cond_num, batch["depth"])
                 else:
-                    show_image = get_show_images(image, torch.tensor(preds), cond_num)
+                    show_image = get_show_images(image, torch.tensor(preds).permute(0,3,1,2), cond_num)
 
                 if color_warps is not None:
                     h, w = image.shape[2], image.shape[3]
@@ -260,7 +260,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
             preds = preds[cond_num:]
 
             if compute_fid:
-                gt_imgs_fid, preds_fid = torch.tensor(gt_images).permute(0, 3, 1, 2),  torch.tensor(preds).permute(0, 3, 1, 2)
+                gt_imgs_fid, preds_fid = torch.tensor(gt_images).permute(0, 3, 1, 2).to(device),  torch.tensor(preds).permute(0, 3, 1, 2).to(device)
                 gt_imgs_fid, preds_fid = accelerator.gather(gt_imgs_fid), accelerator.gather(preds_fid)
                 if accelerator.is_main_process:
                     fid_calculator.update(einops.rearrange(gt_imgs_fid,'... c h w -> (...) c h w'), real=True)
@@ -289,22 +289,25 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
     ssim_score = accelerator.gather(ssim_score).mean().item()
     lpips_score = accelerator.gather(lpips_score).mean().item()
     if compute_fid:
+
         if accelerator.is_main_process:
+            print("fid compute start")
             fid_val = fid_calculator.compute()
             real_num, fake_num = fid_calculator.real_features_num_samples, fid_calculator.fake_features_num_samples
             fid_calculator.reset()
             del fid_calculator
             torch.cuda.empty_cache()
+            print("fid compute end")
             accelerator.log({"val/fid": fid_val, "val/fid_real_num": real_num, "val/fid_fake_num": fake_num}, step=step)
 
 
     accelerator.log({"val/psnr": psnr_score, "val/ssim": ssim_score, "val/lpips": lpips_score}, step=step)
 
     
-    show_images_full = torch.cat(show_images, dim=1)
-    show_images_full = accelerator.gather(show_images_full)
+    show_images_full = torch.cat(show_images, dim=1).to(device)
+    show_images_full = accelerator.gather(show_images_full).reshape(-1,*show_images_full.shape).permute(1,0,2,3).flatten(1,2)
     if accelerator.is_main_process:
-        # for j in range(len(show_images)):
+        # for j in range(len(show_image)):
         #     if config.image_size > 256:
         #         show_images[j] = cv2.resize(show_images[j], None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
             # accelerator.log({f"val/gt_masked_pred_images{j}": wandb.Image(show_images[j])}, step=step)
@@ -366,9 +369,9 @@ def log_train(accelerator, config, args, pipeline, weight_dtype, batch, step, **
             color_warps = None
 
     if depth is not None:
-        show_image = get_show_images(image, torch.tensor(preds), kwargs.get("random_cond_num", 1), batch["depth"][:nframe])
+        show_image = get_show_images(image, torch.tensor(preds).permute(0,3,1,2), kwargs.get("random_cond_num", 1), batch["depth"][:nframe])
     else:
-        show_image = get_show_images(image, torch.tensor(preds), kwargs.get("random_cond_num", 1))
+        show_image = get_show_images(image, torch.tensor(preds).permute(0,3,1,2), kwargs.get("random_cond_num", 1))
 
     if color_warps is not None:
         h, w = image.shape[2], image.shape[3]
@@ -550,6 +553,11 @@ def main():
     if do_attn_distill:
         distill_config = config.distill_config
         distill_pairs = config.distill_config.distill_pairs
+
+        # Cost Metric
+        from src.distill_utils.cost_metric import COST_METRIC_FN
+        distill_cost_fn = COST_METRIC_FN[distill_config.cost_metric.lower()]
+
         # loss function
         def cross_entropy(prob, prob_gt):
             """Cross entropy loss for attention probabilities."""
@@ -569,7 +577,7 @@ def main():
         distill_loss_weight = config.distill_config.distill_loss_weight
 
         # logit heads: input: [B, Head, Q, K]
-        from src.modules.attn_logit_head import LOGIT_HEAD_CLS # JIHO TODO: save/load params
+        from src.distill_utils.attn_logit_head import LOGIT_HEAD_CLS # JIHO TODO: save/load params
         unet_logit_head = LOGIT_HEAD_CLS[distill_config.unet_logit_head.lower()](**distill_config.unet_logit_head_kwargs)
         vggt_logit_head = LOGIT_HEAD_CLS[distill_config.vggt_logit_head.lower()](**distill_config.vggt_logit_head_kwargs)
 
@@ -584,6 +592,7 @@ def main():
     else:
         distill_pairs = []
         distill_student_unet_attn_layers = []
+        distill_cost_fn = None
         distill_loss_fn = None
         distill_loss_weight = 0.0
         
@@ -703,9 +712,10 @@ def main():
     val_dataloader = DataLoader(
         val_dataset,
         shuffle=False,
-        sampler=val_sampler,
+        sampler=None,
         batch_size=1,
-        num_workers=accelerator.num_processes,
+        num_workers=0
+        # num_workers=accelerator.num_processes,
     )
 
     # Scheduler and math around the number of training steps.
@@ -909,19 +919,7 @@ def main():
                 else:
                     batch = uniform_push_batch(batch, random_cond_num)
 
-                # VGGT Process
-                if config.vggt_on_fly:
-                    with torch.no_grad():
-                        image = batch["image"].to(device)  #  0 1 tensor [B,F,3,H,W]
-                        vggt_pred = vggt_model(image) # jiho TODO make image [0,1]
-                        # get distill
-                        # batch['attn_gts_dict'] = {**vggt_pred['attn_cache'], **vggt_pred['feat_cache']}
-                        batch['vggt_attn_cache'] = vggt_pred['attn_cache'] # for distill
-                    # get geometry data (overwrite input)
-                    if config.use_vggt_camera:
-                        batch['extrinsic'], batch['intrinsic'], batch['point_map'] = vggt_pred['extrinsic'], vggt_pred['intrinsic'], vggt_pred['world_points_from_depth']  # currently using pointcloud from camera & depth ('world_points' to use pointmap pred)
-
-                # image = einops.rearrange(image, "(b f) c h w -> b f c h w", f=config.nframe)
+                
                 # ---------------------------------------
                 image = batch["image"].to(device)  #  0 1 tensor [B,F,3,H,W]
                 b, f, _, h, w = image.shape
@@ -1090,9 +1088,27 @@ def main():
                 # Distill Loss
                 distill_loss_dict = {}
                 if do_attn_distill:
+                    # VGGT Process (+ if needed, use vggt Camera)
+                    if config.vggt_on_fly:
+                        with torch.no_grad():
+                            image = batch["image"].to(device)  #  0 1 tensor [B,F,3,H,W]
+                            vggt_pred = vggt_model(image) # jiho TODO make image [0,1]
+
+                        distill_attn_dict = vggt_pred['attn_cache'] # for distill
+                        assert config.get('use_vggt_camera', False) != True, "use_vggt_camera while training not supproted! should be False"
+                        # if config.use_vggt_camera:
+                        #     batch['extrinsic'], batch['intrinsic'] = vggt_pred['extrinsic'], vggt_pred['intrinsic']  # currently using pointcloud from camera & depth ('world_points' to use pointmap pred)
+                        if config.get('use_vggt_point_map', False ):
+                            batch['point_map'] = vggt_pred.get('world_points_from_depth', None)
+
+                    distill_vggt_gt = [p[1] for p in config.distill_config.distill_pairs]
+                    if "point_map" in distill_vggt_gt:
+                        point_map = batch["point_map"].to(device)  # b,f,3,h,w
+                        point_map = einops.rearrange(point_map, "b f c h w -> b (f h w) c").unsqueeze(1)# B,1,FHW,3
+                        distill_attn_dict["point_map"] = dict(query=point_map, key=point_map)
+
                     with torch.autocast(device_type="cuda", dtype = torch.float32):
                         B, F, _, H, W = image.shape
-                        # vggt_attn_cache = batch.get('attn_logit_gts_dict', None)
                         unet_attn_cache = pop_cached_attn(unet)
                         distill_pairs = config.distill_config.distill_pairs
                         for unet_layer, vggt_layer in distill_pairs:
@@ -1101,7 +1117,7 @@ def main():
                                     - if using cost map feat, Head=1
                                 pred(UNet): attention map(logit, before softmax) ( B Head Q(FHW) K(FHW) )
                             '''
-                            gt_query, gt_key = batch['vggt_attn_cache'][str(vggt_layer)]['query'].detach(), batch['vggt_attn_cache'][str(vggt_layer)]['key'].detach() # B Head VHW C, B Head VHW C
+                            gt_query, gt_key = distill_attn_dict[str(vggt_layer)]['query'].detach(), distill_attn_dict[str(vggt_layer)]['key'].detach() # B Head VHW C, B Head VHW C
                             pred_attn_logit = unet_attn_cache[str(unet_layer)] # B Head Q(FHW) K(FHW)
                             Q, K = pred_attn_logit.shape[-2], pred_attn_logit.shape[-1]
                             assert Q==K, f"pred attn should have same Q,K dim, but {pred_attn_logit.shape}"
@@ -1146,7 +1162,7 @@ def main():
                             
                             pred_attn_logit = slice_attnmap(pred_attn_logit, query_idx, key_idx)
                             with torch.no_grad():
-                                gt_attn_logit = gt_query @ gt_key.transpose(-1, -2)
+                                gt_attn_logit = distill_cost_fn(gt_query, gt_key)
                             gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx, key_idx)
 
                             pred, gt = unet.unet_logit_head(pred_attn_logit), unet.vggt_logit_head(gt_attn_logit)
@@ -1303,3 +1319,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

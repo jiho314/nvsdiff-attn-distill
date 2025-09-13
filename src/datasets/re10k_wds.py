@@ -138,16 +138,16 @@ def postprocess_vggt_mvgen(sample, num_viewpoints=3, min_view_range=5, max_view_
         intri = intri_new
         
         images = torch.stack(images)
-        pts = transform_numpy(points[idxs])        
-        output = dict(image = images, points = pts, intrinsic = intri, extrinsic = extrinsic, )
-                    #   idx = torch.tensor(idxs))
-                    #   intrinsic_original = intrinsic[
+        pts = transform_numpy(points[idxs])
+        output = dict(image=images, point_map=pts, intrinsic=intri, extrinsic=extrinsic, idx=torch.tensor(idxs))
+        #   intrinsic_original = intrinsic[
         # print(f"wds Inference: nothing occured , {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}, min_view_range: {min_view_range}, max_view_range: {max_view_range}")
         return output
     
     except:
         if inference:
             print(f"wds Inference: exception occured , {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}")
+            raise ValueError("Inference error, please check")
         return None
 
 def build_re10k_wds(
@@ -175,6 +175,7 @@ def build_re10k_wds(
     '''
     urls = []
     for path in url_paths:
+        urls = sorted(urls)
         for root, _, files in os.walk(path):
             for file in files:
                 if file.endswith(".tar"):
