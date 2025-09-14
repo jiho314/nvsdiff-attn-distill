@@ -1474,11 +1474,11 @@ class AttnProcessor2_0:
         if not self.cache_attn:
             if xformers is not None:  # format: B tok Head dim
                 assert attention_mask is None, "w/ xformers, attention_mask not supported yet "
-                # Ensure all tensors have the same dtype before xformers attention
-                target_dtype = query.dtype
-                query = query.to(dtype=target_dtype)
-                key = key.to(dtype=target_dtype)
-                value = value.to(dtype=target_dtype)
+                # # Ensure all tensors have the same dtype before xformers attention
+                # target_dtype = query.dtype
+                # query = query.to(dtype=target_dtype)
+                # key = key.to(dtype=target_dtype)
+                # value = value.to(dtype=target_dtype)
                 hidden_states = xformers.ops.memory_efficient_attention(
                     query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),  # Head dim at 2
                 ).transpose(1, 2).to(query.dtype)

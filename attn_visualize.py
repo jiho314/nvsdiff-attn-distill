@@ -2,7 +2,27 @@ from train import *
 
 
 from src.distill_utils.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache
-
+import torch
+import numpy as np
+import random
+from PIL import Image
+import matplotlib.cm as cm
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import os
+import cv2
+import torchvision
+from typing import List
+from vggt.models.vggt import VGGT
+import math
+import einops
+from src.datasets.re10k_wds import build_re10k_wds
+from torch.utils.data import DataLoader
+import argparse
+from omegaconf import OmegaConf
+from torchvision.utils import save_image
+from datetime import datetime
+import json
 
 
 # dataloader_workers: 16
@@ -27,7 +47,7 @@ from src.distill_utils.attn_processor_cache import set_attn_cache, unset_attn_ca
 
 def main(nframe, cond_num, inference_view_range, 
          caching_unet_attn_layers, noise_timestep, 
-         resume_checkpoint, config, rank = 0):
+         resume_checkpoint, config, rank = 0, cfg):
     # args, _, cfg = parse_args()
 
     set_seed(0)
@@ -104,6 +124,78 @@ def main(nframe, cond_num, inference_view_range,
         num_workers=0,
         drop_last=True,
     )
+    
+    
+    def slice_attnmap(attnmap, query_idx, key_idx):
+        B, Head, Q, K = attnmap.shape
+        F = 4 # warn: hardcoding
+        HW = Q // F
+        attnmap = einops.rearrange(attnmap, 'B Head (F1 HW1) (F2 HW2) -> B Head F1 HW1 F2 HW2', B=B, Head=Head, F1=F, HW1=HW, F2=F, HW2=HW)
+        attnmap = attnmap[:, :, query_idx][:, :, :, :, key_idx]
+        attnmap = einops.rearrange(attnmap, 'B Head f1 HW1 f2 HW2 -> B Head (f1 HW1) (f2 HW2)', B=B, Head=Head, f1=len(query_idx), f2=len(key_idx), HW1=HW, HW2=HW)
+        return attnmap
+    
+    def overlay_grid_and_save(img_tensor: torch.Tensor, spacing=64, out_path="grid_overlay.png"):
+        """
+        Overlays a grid every `spacing` pixels, but only labels the
+        x-axis at the top edge and the y-axis at the left edge,
+        with labels in black. The image is shown without flipping.
+        
+        img_tensor: [H, W] or [C, H, W]
+        """
+        # 1. Convert to H×W or H×W×C numpy
+        if img_tensor.ndim == 3:
+            img = img_tensor.permute(1, 2, 0).cpu().numpy()
+        elif img_tensor.ndim == 2:
+            img = img_tensor.cpu().numpy()
+        else:
+            raise ValueError(f"Unsupported shape {img_tensor.shape}")
+
+        H, W = img.shape[:2]
+        xs = np.arange(0, W, spacing)
+        ys = np.arange(0, H, spacing)
+
+        # 2. Plot
+        fig, ax = plt.subplots()
+        ax.imshow(img, cmap=None if img.ndim == 3 else "gray", origin="upper")
+        # — no ax.invert_xaxis(), so image is not flipped
+
+        # 3. Draw grid lines
+        for y in ys:
+            ax.axhline(y, color="white", linewidth=0.8)
+        for x in xs:
+            ax.axvline(x, color="white", linewidth=0.8)
+
+        # 4. Set ticks at grid lines
+        ax.set_xticks(xs)
+        ax.set_yticks(ys)
+
+        # 5. Label ticks in black
+        ax.set_xticklabels([str(x) for x in xs], color="black", fontsize=8)
+        ax.set_yticklabels([str(y) for y in ys], color="black", fontsize=8)
+
+        # 6. Show x labels on top only, y labels on left only
+        ax.tick_params(
+            axis='x', which='both',
+            labelbottom=False,
+            labeltop=True,
+            bottom=False, top=False
+        )
+        ax.tick_params(
+            axis='y', which='both',
+            labelleft=True,
+            labelright=False,
+            left=False, right=False
+        )
+
+        # 7. Remove frame lines
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=300)
+        plt.close(fig)
+
     # 3) Model Inference
     def unet_inference(batch):
         # batch: always order by seq idx
@@ -169,9 +261,61 @@ def main(nframe, cond_num, inference_view_range,
         return model_pred
 
     set_attn_cache(unet, caching_unet_attn_layers)
+    
+    
+    ## visualization 
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     # minkyung TODO: 여러 idx에 대해서 viz
     for idx, batch in enumerate(val_dataloader):
+        outdir = os.path.join("outputs", timestamp, f"sample{idx}")
+        os.makedirs(outdir, exist_ok=True)
+        
+        images = batch['image'].to(device)  # B V C H W
+        tgt_image = images.squeeze()[0]      # [C, H, W]
+
+        # --- visualize with grid before input ---
+        
+        if cfg.view_select:
+            overlay_grid_and_save(tgt_image, spacing=64, out_path="VIS_OVERLAY.png")
+            save_image(images.squeeze()[1:], "VIS_REFERENCE.png")
+            while True:
+                answer = input("Do you want to visualize? (yes/no): ").strip().lower()
+                if answer == "yes":
+                    # run visualization code
+                    counter_out = False
+                    break
+                elif answer == "no":
+                    # skip this batch
+                    counter_out = True
+                    break  # goes back to your for-loop
+                else:
+                    print("Invalid input. Please type 'yes' or 'no'.")
+                    
+            if counter_out:
+                continue
+        
+        if cfg.coord_select:
+            if cfg.view_select is False:
+                overlay_grid_and_save(tgt_image, spacing=64, out_path="VIS_OVERLAY.png")
+                save_image(images.squeeze()[1:], "VIS_REFERENCE.png")
+            # Ask user for coordinates
+            while True: 
+                x_coord = int(input("Enter x coordinate (0–512): "))
+                y_coord = int(input("Enter y coordinate (0–512): "))
+                if 0 < x_coord < 512 and 0 < y_coord < 512: 
+                    break
+                else: 
+                    print("Invalid input. Please type valid values. ")
+        else:
+            # Random selection
+            x_coord = random.randint(0, 511)
+            y_coord = random.randint(0, 511)
+        coords = {"x": x_coord, "y": y_coord}
+        json_path = os.path.join(outdir, "coords.json")
+        with open(json_path, "w") as f:
+            json.dump(coords, f, indent=4) 
+
         # batch: always order by seq idx
         # uniform_push_batch: set condition (uniform sampling, no randomness) to front, tgt to last
         _ = unet_inference(batch)
@@ -180,7 +324,16 @@ def main(nframe, cond_num, inference_view_range,
         '''
         for unet_layer in caching_unet_attn_layers:
             unet_attn_logit = unet_attn_cache[str(unet_layer)] # B Head VHW VHW
-            # minkyung TODO: visualize attention maps (with image)
+            unet_attn_logit = slice_attnmap(unet_attn_logit, query_idx=[0], key_idx=[1,2,3])
+            pred_query_size, pred_key_size = 32, 32
+            import pdb; pdb.set_trace()
+            # Convert pixel coords -> feature map index
+            y_feat_cost = int((y_coord / 512) * pred_query_size)
+            x_feat_cost = int((x_coord / 512) * pred_query_size)
+            query_token_idx_cost = y_feat_cost * pred_query_size + x_feat_cost
+            attn_maps = unet_attn_logit.mean(dim=1) # average over head
+            attn_maps = attn_maps.squeeze()
+            all_scores = torch.softmax(attn_maps[query_token_idx_cost] / 8, dim=-1)
             import pdb ; pdb.set_trace()
         
 
@@ -202,4 +355,11 @@ if __name__ == "__main__":
     config = EasyDict(OmegaConf.load(config_file_path))
 
     rank = 0
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/attnmap_visualization.yaml")
+    args = parser.parse_args()
+    if args.config[-5:] == ".yaml":
+        config = OmegaConf.load(args.config)
+    else:
+        raise ValueError("Do not support this format config file")
     main(nframe, cond_num, inference_view_range, caching_unet_attn_layers, noise_timestep=noise_timestep, resume_checkpoint=resume_checkpoint, config=config, rank = 0)

@@ -296,7 +296,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
 
     # visualize_loss_fn 초기화 (validation loop 전에 정의)
     visualize_loss_fn = None
-    if do_attn_visualize:        
+    if do_attn_visualize and visualize_config is not None:        
         visualize_loss_fn = ATTN_LOSS_FN[visualize_config['loss_fn'].lower()]
 
     # Match train.py: use torch.autocast with explicit dtype
@@ -408,9 +408,13 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
             # attention visualization 데이터 가져오기
             attention_loss_data = {}
             attention_images_data = {}
-            if do_attn_visualize:
+            if do_attn_visualize and attention_callback is not None:
                 structured_losses = attention_callback.get_structured_losses()
                 attention_images = attention_callback.get_attention_images()
+                print(f"[DEBUG] structured_losses keys: {list(structured_losses.keys()) if structured_losses else 'None'}")
+                print(f"[DEBUG] attention_images keys: {list(attention_images.keys()) if attention_images else 'None'}")
+                print(f"[DEBUG] step_losses length: {len(attention_callback.step_losses)}")
+                print(f"[DEBUG] layer_losses keys: {list(attention_callback.layer_losses.keys())}")
                 
                 # attention loss 데이터 준비 (레이어별)
                 layer_summary = structured_losses.get('layer_summary', {})
@@ -441,9 +445,6 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                 
                 # attention 이미지 데이터 준비
                 attention_images_data = attention_images
-                
-                # callback 상태 초기화 (다음 배치를 위해)
-                attention_callback.reset()
                     
             # if batch['tag'][0] not in show_save_dict or show_save_dict[batch['tag'][0]] < 10:  # 每个dataset显示10个
                 # show_save_dict[batch['tag'][0]] += 1
@@ -529,6 +530,10 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                 print(f"[DEBUG] log_data keys: {list(log_data.keys())}")
                 # 모든 데이터를 한 번에 로깅
                 accelerator.log(log_data, step=val_iter)
+                
+                # 로깅 완료 후 callback 상태 초기화 (다음 배치를 위해)
+                if do_attn_visualize and attention_callback is not None:
+                    attention_callback.reset()
             
             val_iter += 1 
     

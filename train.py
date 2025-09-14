@@ -1076,13 +1076,14 @@ def main():
                 # Distill Loss
                 distill_loss_dict = {}
                 if do_attn_distill:
+                    distill_gt_dict = {}
                     # VGGT Process (+ if needed, use vggt Camera)
                     if config.vggt_on_fly:
                         with torch.no_grad():
                             image = batch["image"].to(device)  #  0 1 tensor [B,F,3,H,W]
                             vggt_pred = vggt_model(image) # jiho TODO make image [0,1]
 
-                        distill_attn_dict = vggt_pred['attn_cache'] # for distill
+                        distill_gt_dict.update( vggt_pred['attn_cache'] ) 
                         assert config.get('use_vggt_camera', False) != True, "use_vggt_camera while training not supproted! should be False"
                         # if config.use_vggt_camera:
                         #     batch['extrinsic'], batch['intrinsic'] = vggt_pred['extrinsic'], vggt_pred['intrinsic']  # currently using pointcloud from camera & depth ('world_points' to use pointmap pred)
@@ -1093,7 +1094,7 @@ def main():
                     if "point_map" in distill_vggt_gt:
                         point_map = batch["point_map"].to(device)  # b,f,3,h,w
                         point_map = einops.rearrange(point_map, "b f c h w -> b (f h w) c").unsqueeze(1)# B,1,FHW,3
-                        distill_attn_dict["point_map"] = dict(query=point_map, key=point_map)
+                        distill_gt_dict["point_map"] = dict(query=point_map, key=point_map)
 
                     with torch.autocast(device_type="cuda", dtype = torch.float32):
                         B, F, _, H, W = image.shape
@@ -1105,7 +1106,7 @@ def main():
                                     - if using cost map feat, Head=1
                                 pred(UNet): attention map(logit, before softmax) ( B Head Q(FHW) K(FHW) )
                             '''
-                            gt_query, gt_key = distill_attn_dict[str(vggt_layer)]['query'].detach(), distill_attn_dict[str(vggt_layer)]['key'].detach() # B Head VHW C, B Head VHW C
+                            gt_query, gt_key = distill_gt_dict[str(vggt_layer)]['query'].detach(), distill_gt_dict[str(vggt_layer)]['key'].detach() # B Head VHW C, B Head VHW C
                             pred_attn_logit = unet_attn_cache[str(unet_layer)] # B Head Q(FHW) K(FHW)
                             Q, K = pred_attn_logit.shape[-2], pred_attn_logit.shape[-1]
                             assert Q==K, f"pred attn should have same Q,K dim, but {pred_attn_logit.shape}"
