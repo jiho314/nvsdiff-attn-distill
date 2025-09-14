@@ -1,2 +1,4 @@
-mode: ["attention"] # "attention", "tracking", "pointmap"
+mode: ["pointmap", "track_head", "attention"] # "attention", "track_head", "pointmap"
 attn_idx: [4,11,17,23]
+view_select: false # select scene
+coord_select: false # select coordinate

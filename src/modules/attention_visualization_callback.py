@@ -199,9 +199,10 @@ class AttentionVisualizationCallback(PipelineCallback):
         # 점 크기 계산
         r_in = max(3, min(w, h) // 80)
         
-        # 파란 점 그리기 (흰색 테두리 + 파란색 내부)
-        d.ellipse((cx - r_in*2, cy - r_in*2, cx + r_in*2, cy + r_in*2), fill=(255, 255, 255))
-        d.ellipse((cx - r_in, cy - r_in, cx + r_in, cy + r_in), fill=(0, 100, 255))
+        # 빨간 점 그리기 (흰색 테두리 + 빨간색 내부, 크기 줄임)
+        r_small = max(2, r_in // 2)  # 크기를 절반으로 줄임
+        d.ellipse((cx - r_small*2, cy - r_small*2, cx + r_small*2, cy + r_small*2), fill=(255, 255, 255))
+        d.ellipse((cx - r_small, cy - r_small, cx + r_small, cy + r_small), fill=(255, 0, 0))
         
         return img
 
@@ -225,20 +226,7 @@ class AttentionVisualizationCallback(PipelineCallback):
           target view is sampled each time this function is called.
         """
         save_dir = self.visualize_config.get('viz_save_dir', None)
-        viz_steps = self.visualize_config.get('viz_steps', [])
-        viz_layers = self.visualize_config.get('viz_layers', [])
-        
-        # 빈 리스트면 모든 스텝/레이어에서 시각화 (기본값)
-        should_visualize_step = not viz_steps or step_index in viz_steps
-        should_visualize_layer = not viz_layers or layer_key in viz_layers
-        
-        print(f"Visualization check: step_index={step_index}, layer_key={layer_key}")
-        print(f"viz_steps={viz_steps}, viz_layers={viz_layers}")
-        print(f"should_visualize_step={should_visualize_step}, should_visualize_layer={should_visualize_layer}")
-        
-        if not (should_visualize_step and should_visualize_layer):
-            print(f"Skipping visualization for step {step_index}, layer {layer_key}")
-            return
+       
 
         if save_dir is not None:
             os.makedirs(save_dir, exist_ok=True)
@@ -418,7 +406,9 @@ class AttentionVisualizationCallback(PipelineCallback):
         UNet attention을 캐시에서 가져와 VGGT attention과 비교하여 loss 계산
         """
         
-        if step_index != 40:
+        viz_steps = self.visualize_config.get('viz_steps', [])
+        
+        if step_index not in viz_steps:
             print(f"Skipping attention visualization callback for step {step_index}")
             clear_attn_cache(pipeline.unet)
             return callback_kwargs
@@ -475,6 +465,14 @@ class AttentionVisualizationCallback(PipelineCallback):
                     print(f"Warning: pred attn should have same Q,K dim, but got {pred_attn_logit.shape}")
                     continue
                 
+                # F truncate 로직: Q가 F로 나누어떨어지지 않으면 자르기; Up block concat issue 
+                if Q % F != 0 or K % F != 0:
+                    Q_truncated = (Q // (F+1)) * F
+                    K_truncated = (K // (F+1)) * F
+                    pred_attn_logit = pred_attn_logit[:, :, :Q_truncated, :K_truncated]
+                    Q, K = Q_truncated, K_truncated
+                    print(f"Truncated attention logit: Q {Q_truncated}, K {K_truncated} (F={F})")
+                
                 # 1) 토큰 크기 맞추기: gt -> pred
                 pred_query_size = int(math.sqrt(Q // F))
                 pred_key_size = int(math.sqrt(K // F))
@@ -495,12 +493,8 @@ class AttentionVisualizationCallback(PipelineCallback):
                 pred_processed = pipeline.unet.unet_logit_head(pred_attn_logit_sliced)
                 gt_processed = pipeline.unet.vggt_logit_head(gt_attn_logit_sliced)
                 
-                # Loss 계산 (clamp로 안정성 확보)
-                loss_value = torch.clamp(
-                    self.loss_fn(pred_processed, gt_processed), 
-                    max=10.0
-                )
-                
+                loss_value = self.loss_fn(pred_processed, gt_processed)
+
                 layer_key = f"unet{unet_layer}_vggt{vggt_layer}"
                 step_loss_dict[f"step{step_index}/{layer_key}"] = loss_value
                 

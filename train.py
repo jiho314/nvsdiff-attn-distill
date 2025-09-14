@@ -44,7 +44,7 @@ from utils import get_lpips_score, _seq_name_to_seed
 
 from src.distill_utils.geometry import cycle_consistency_checker
 from src.distill_utils.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache
-from src.distill_utils.timestep_sample import truncated_normal
+from src.modules.timestep_sample import truncated_normal
 logger = get_logger(__name__, log_level="INFO")
 
 
@@ -665,6 +665,7 @@ def main():
         num_viewpoints=config.val_nframe,
         **config.val_wds_dataset_config
     ) 
+    
     # eval_dataloader = DataLoader(
     #     eval_dataset,
     #     batch_size=data_config.get("eval_batch_size", 1),
@@ -714,7 +715,8 @@ def main():
         shuffle=False,
         sampler=None,
         batch_size=1,
-        num_workers=0
+        num_workers=0,
+        drop_last=True,
         # num_workers=accelerator.num_processes,
     )
 
@@ -1167,8 +1169,7 @@ def main():
 
                             pred, gt = unet.unet_logit_head(pred_attn_logit), unet.vggt_logit_head(gt_attn_logit)
 
-                            # if config.distill_config.get("consistency_check", False):
-                            if vggt_layer == "track_head":
+                            if config.distill_config.get("consistency_check", False):
                                 B, Head, F1HW, F2HW = gt_attn_logit.shape  
                                 F1, F2, HW = len(query_idx), len(key_idx), F1HW // len(query_idx)
                                 gt_attn_logit_HW = einops.rearrange(gt_attn_logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1) HW1 (F2 HW2)', B=B,Head=Head, F1=F1, F2=F2, HW1=HW, HW2=HW)

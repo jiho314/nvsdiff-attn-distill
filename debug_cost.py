@@ -27,6 +27,9 @@ from src.datasets.re10k_wds import build_re10k_wds
 from torch.utils.data import DataLoader
 import argparse
 from omegaconf import OmegaConf
+from torchvision.utils import save_image
+from datetime import datetime
+import json
 
 def set_seed(seed=42):
     torch.manual_seed(seed)
@@ -37,58 +40,59 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-set_seed(42)
 
-def get_attn_map_whole(attn_layer, background):
+
+import torch
+import numpy as np
+import cv2
+import matplotlib as mpl
+import matplotlib.cm as cm
+import torchvision.transforms as T
+
+def get_attn_map_whole(attn_layer: torch.Tensor, background: np.ndarray) -> np.ndarray:
     """
-    Generates an attention map visualization by overlaying a heatmap on a
-    background image and marking the single point of highest attention.
+    Overlay an attention heatmap on a background image and mark the highest attention point.
 
     Args:
-        attn_layer (torch.Tensor): The 2D attention map, e.g., shape (37, 111).
-        background (np.ndarray): The background image, e.g., shape (512, 1536, 3).
+        attn_layer (torch.Tensor): 2D attention map, shape (H_small, W_small).
+        background (np.ndarray): Background image, shape (H_large, W_large, 3).
 
     Returns:
-        np.ndarray: The final visualized image with the heatmap and marked point.
+        np.ndarray: Visualization with heatmap and marked point.
     """
-    #[32, 64], [512, 1024, 3]
-    # 1. Get the shapes of the small attention map and large background image
-    H_small, W_small = attn_layer.shape[:2] # 32, 64
-    H_large, W_large = background.shape[:2] # 512, 1024
+    H_small, W_small = attn_layer.shape
+    H_large, W_large = background.shape[:2]
 
-    # 2. Resize the attention map to match the background image size for the heatmap
-    resize_transform = torchvision.transforms.Resize(
-        (H_large, W_large), # 512, 1024
-        interpolation=torchvision.transforms.InterpolationMode.BILINEAR
+    # 1. Resize attn_layer to background size
+    resize_transform = T.Resize(
+        (H_large, W_large),
+        interpolation=T.InterpolationMode.BILINEAR,
+        antialias=True
     )
-    # Add temporary batch/channel dims for the transform, then remove them
-    attn_layer_resized = resize_transform(attn_layer.unsqueeze(0).unsqueeze(0)).squeeze(0) # 512, 1024
+    attn_layer_resized = resize_transform(attn_layer.unsqueeze(0).unsqueeze(0))  # [1,1,H,W]
+    attn_layer_resized = attn_layer_resized.squeeze().cpu().detach().numpy()     # [H, W]
 
-    # 3. Create the colormapped heatmap from the resized attention map
-    attn_np_resized = attn_layer_resized.permute(1, 2, 0).cpu().detach().numpy()
-    normalizer = mpl.colors.Normalize(vmin=attn_np_resized.min(), vmax=attn_np_resized.max())
-    mapper = cm.ScalarMappable(norm=normalizer, cmap='viridis')
-    heatmap = (mapper.to_rgba(attn_np_resized[:, :, 0])[:, :, :3] * 255).astype(np.uint8)
+    # 2. Create heatmap
+    normalizer = mpl.colors.Normalize(vmin=attn_layer_resized.min(), vmax=attn_layer_resized.max())
+    mapper = cm.ScalarMappable(norm=normalizer, cmap="viridis")
+    heatmap = (mapper.to_rgba(attn_layer_resized)[:, :, :3] * 255).astype(np.uint8)
 
-    # 4. Blend the heatmap with the background image
-    background_uint8 = background.copy().astype(np.uint8)
+    # 3. Blend with background
+    background_uint8 = background.astype(np.uint8).copy()
     blended_map = cv2.addWeighted(background_uint8, 0.3, heatmap, 0.7, 0)
 
-    # 5. Find the location of the single max attention point in the ORIGINAL small map
+    # 4. Find the max attention location in the small map
     attn_layer_small_np = attn_layer.cpu().detach().numpy()
-    max_idx_yx = np.unravel_index(np.argmax(attn_layer_small_np), (H_small, W_small))
+    max_idx_y, max_idx_x = np.unravel_index(np.argmax(attn_layer_small_np), attn_layer_small_np.shape)
 
-    # 6. Scale this location to the large image dimensions
-    # We add 0.5 to map the center of the source pixel for better accuracy
-    max_x = int((max_idx_yx[1] + 0.5) * (W_large / W_small))
-    max_y = int((max_idx_yx[0] + 0.5) * (H_large / H_small))
+    # 5. Scale to large dimensions
+    max_x = int((max_idx_x + 0.5) * (W_large / W_small))
+    max_y = int((max_idx_y + 0.5) * (H_large / H_small))
 
-    # 7. Draw a prominent dot on the max attention point
-    # A white circle provides an outline for better visibility on all colors
+    # 6. Draw a circle at the max point
     final_map = cv2.circle(blended_map, (max_x, max_y), 10, (255, 255, 255), -1)
-    # The center red dot
     final_map = cv2.circle(final_map, (max_x, max_y), 6, (255, 0, 0), -1)
-    
+
     return final_map
 
 def stitch_side_by_side_whole(images: List[Image.Image], padding: int = 0, bg_color: tuple = (0, 0, 0)):
@@ -146,6 +150,7 @@ def mark_point_on_img(tgt_img, x, y, radius=6):
 # 2) Slice attnmap: 
 def slice_attnmap(attnmap, query_idx, key_idx):
     B, Head, Q, K = attnmap.shape
+    F = 4 # warn: hardcoding
     HW = Q // F
     attnmap = einops.rearrange(attnmap, 'B Head (F1 HW1) (F2 HW2) -> B Head F1 HW1 F2 HW2', B=B, Head=Head, F1=F, HW1=HW, F2=F, HW2=HW)
     attnmap = attnmap[:, :, query_idx][:, :, :, :, key_idx]
@@ -224,35 +229,71 @@ def overlay_grid_and_save(img_tensor: torch.Tensor, spacing=64, out_path="grid_o
     plt.savefig(out_path, dpi=300)
     plt.close(fig)
 
-def get_tracking_costmap(gt_query, gt_key, x_coord, y_coord, V):
+def get_costmap(gt_query, gt_key, x_coord, y_coord, mode):
     pred_query_size, pred_key_size = 32, 32
-    gt_query, gt_key = resize_tok(gt_query, target_size=pred_query_size), resize_tok(gt_key, target_size=pred_key_size),
-    gt_attn_logit = gt_query @ gt_key.transpose(-1, -2)
-
-    gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx=[0], key_idx=[1,2,3])
-    attn_maps = gt_attn_logit.squeeze()
-
     # Convert pixel coords -> feature map index
     y_feat_cost = int((y_coord / 512) * pred_query_size)
     x_feat_cost = int((x_coord / 512) * pred_query_size)
     query_token_idx_cost = y_feat_cost * pred_query_size + x_feat_cost
 
-    all_scores = torch.softmax(attn_maps[query_token_idx_cost] / 8, dim=-1)
-    score1 = all_scores[:1024].reshape(32,32)
-    score2 = all_scores[1024:2048].reshape(32,32)
-    score3 = all_scores[2048:].reshape(32,32)
+    if mode == "tracking":
+        query, key = resize_tok(gt_query, target_size=pred_query_size), resize_tok(gt_key, target_size=pred_key_size),
+        gt_attn_logit = query @ key.transpose(-1, -2)
+        gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx=[0], key_idx=[1,2,3])
+        attn_maps = gt_attn_logit.squeeze()
+        all_scores = torch.softmax(attn_maps[query_token_idx_cost] / 8, dim=-1)
+    elif mode == "attention":
+        query, key = resize_tok(gt_query, target_size=pred_query_size), resize_tok(gt_key, target_size=pred_key_size),
+        gt_attn_logit = query @ key.transpose(-1, -2)
+        gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx=[0], key_idx=[1,2,3])
+        attn_maps = gt_attn_logit.mean(dim=1) # average over head
+        attn_maps = attn_maps.squeeze()
+        all_scores = torch.softmax(attn_maps[query_token_idx_cost] / 8, dim=-1)
+    elif mode == "pointmap":
+        def distance_softmax(query_points, ref_points, temperature=1.0, cross_only=True):
+            """
+            query_points: (B, 3, H, W)
+            ref_points:   (B, V, 3, H, W)
+            returns:      (B, HW, VHW) probability maps
+            """
+            # Compute pairwise differences: (B, N, N, 3)
+            B, _, H, W = query_points.shape
+            V = ref_points.shape[1]
+            query_points = query_points.reshape(B, 3, -1).permute(0, 2, 1) # (B, HW, 3)
+            ref_points = ref_points.reshape(B, V, 3, -1).permute(0, 1, 3, 2).reshape(B, -1, 3) # (B, VHW, 3)
+            if not cross_only:
+                ref_points = torch.cat((query_points, ref_points), dim=1) # (B, (V+1)HW, 3)
+            diff = query_points.unsqueeze(2) - ref_points.unsqueeze(1)
+            # Euclidean distance
+            dist = torch.norm(diff, dim=-1) # (B, HW, VHW)
+            # Convert to probabilities: smaller distance → higher prob
+            logits = - dist / temperature
+            probs = torch.softmax(logits, dim=-1)
+            return probs.squeeze()
+        gt_query = gt_query.reshape(-1, 3, 512, 512)
+        gt_key = gt_key.reshape(-1, 3, 512, 512)
+        gt_query = torch.nn.functional.interpolate(gt_query, size=(pred_query_size, pred_key_size), mode='bilinear')
+        gt_key = torch.nn.functional.interpolate(gt_key, size=(pred_query_size, pred_key_size), mode='bilinear')
+        gt_query = gt_query.reshape(1, 3, pred_query_size, pred_key_size)
+        gt_key = gt_key.reshape(1, 3, 3, pred_query_size, pred_key_size)
+        attn_maps = distance_softmax(gt_query, gt_key, temperature=0.1)
+        all_scores = attn_maps[query_token_idx_cost]
+    score1 = all_scores[:1024].reshape(pred_query_size,pred_key_size)
+    score2 = all_scores[1024:2048].reshape(pred_query_size,pred_key_size)
+    score3 = all_scores[2048:].reshape(pred_query_size,pred_key_size)
     score = torch.cat([score1, score2, score3], dim=-1)
     return score
     
-def save_image(images, x_coord, y_coord, score):
+def save_image_total(images, x_coord, y_coord, score):
     # Visualization
     images = images.squeeze()
     vis_list = []
 
     # Target image with marked point
-    tgt_image = images[0]
-    tgt_image = mark_point_on_img(tgt_image, x_coord, y_coord)
-    vis_list.append(Image.fromarray(tgt_image))
+    # warn
+    # tgt_image = images[0]
+    # tgt_image = mark_point_on_img(tgt_image, x_coord, y_coord)
+    # vis_list.append(Image.fromarray(tgt_image))
 
     # Background from reference images
     ref_image = images[1:]
@@ -268,17 +309,12 @@ def save_image(images, x_coord, y_coord, score):
 
     combined_img = stitch_side_by_side_whole(vis_list)
     return combined_img
-
-def get_attention(gt_query, gt_key, x_coord, y_coord):
-    pred_query_size, pred_key_size = 32, 32
-    gt_query, gt_key = resize_tok(gt_query, target_size=pred_query_size), resize_tok(gt_key, target_size=pred_key_size)
-    import pdb; pdb.set_trace()
         
 
 def main(cfg):
     val_wds_dataset_config = {
         'url_paths': [ "/mnt/data2/minseop/realestate_train_wds", ],
-        'dataset_length': 100,
+        'dataset_length': 200,
         'resampled': False,
         'shardshuffle': False,
         'min_view_range': 6,
@@ -300,7 +336,7 @@ def main(cfg):
     )
 
     vggt_distill_config = {
-        "cache_attn_layer_ids": cfg.attn_idx,
+        "cache_attn_layer_ids": cfg.attn_idx if "attention" in cfg.mode else [],
         "cache_costmap_types": cfg.mode
     }
 
@@ -311,8 +347,10 @@ def main(cfg):
 
     device = 'cuda:0'
     vggt_model = vggt_model.to(device)
-
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     for i, batch in enumerate(loader):
+        outdir = os.path.join("outputs", timestamp, f"sample{i}")
+        os.makedirs(outdir, exist_ok=True)
         
         images = batch['image'].to(device)  # B V C H W
         vggt_pred = vggt_model(images)
@@ -321,58 +359,82 @@ def main(cfg):
         tgt_image = images.squeeze()[0]      # [C, H, W]
 
         # --- visualize with grid before input ---
-        overlay_grid_and_save(tgt_image, spacing=64, out_path="outputs/grid_overlay.png")
-        while True:
-            answer = input("Do you want to visualize? (yes/no): ").strip().lower()
-            if answer == "yes":
-                # run visualization code
-                counter_out = False
-                break
-            elif answer == "no":
-                # skip this batch
-                counter_out = True
-                break  # goes back to your for-loop
-            else:
-                print("Invalid input. Please type 'yes' or 'no'.")
-                
-        if counter_out:
-            continue
         
-        # Ask user for coordinates
-        while True: 
-            x_coord = int(input("Enter x coordinate (0–512): "))
-            y_coord = int(input("Enter y coordinate (0–512): "))
-            if 0 < x_coord < 512 and 0 < y_coord < 512: 
-                break
-            else: 
-                print("Invalid input. Please type valid values. ")
-                
-                
-        if "tracking" in cfg.mode:
-            gt_query, gt_key = vggt_pred['attn_cache']['track_head']['query'], vggt_pred['attn_cache']['track_head']['key']
-            score = get_tracking_costmap(gt_query, gt_key, x_coord, y_coord) # 32, 3*32
-            combined_img = save_image(images, x_coord, y_coord, score)
-            combined_img.save(f"outputs/sample{i}/tracking.png")
-        elif "attention" in cfg.mode:
+        if cfg.view_select:
+            overlay_grid_and_save(tgt_image, spacing=64, out_path="VIS_OVERLAY.png")
+            save_image(images.squeeze()[1:], "VIS_REFERENCE.png")
+            while True:
+                answer = input("Do you want to visualize? (yes/no): ").strip().lower()
+                if answer == "yes":
+                    # run visualization code
+                    counter_out = False
+                    break
+                elif answer == "no":
+                    # skip this batch
+                    counter_out = True
+                    break  # goes back to your for-loop
+                else:
+                    print("Invalid input. Please type 'yes' or 'no'.")
+                    
+            if counter_out:
+                continue
+        
+        if cfg.coord_select:
+            if cfg.view_select is False:
+                overlay_grid_and_save(tgt_image, spacing=64, out_path="VIS_OVERLAY.png")
+                save_image(images.squeeze()[1:], "VIS_REFERENCE.png")
+            # Ask user for coordinates
+            while True: 
+                x_coord = int(input("Enter x coordinate (0–512): "))
+                y_coord = int(input("Enter y coordinate (0–512): "))
+                if 0 < x_coord < 512 and 0 < y_coord < 512: 
+                    break
+                else: 
+                    print("Invalid input. Please type valid values. ")
+        else:
+            # Random selection
+            x_coord = random.randint(0, 511)
+            y_coord = random.randint(0, 511)
+        coords = {"x": x_coord, "y": y_coord}
+        json_path = os.path.join(outdir, "coords.json")
+        with open(json_path, "w") as f:
+            json.dump(coords, f, indent=4)      
+    
+        if "track_head" in cfg.mode:
+            gt_query, gt_key = vggt_pred['attn_cache']['track_head']['query'], vggt_pred['attn_cache']['track_head']['key'] # torch.Size([1, 1, 2668324, 128])
+            score = get_costmap(gt_query, gt_key, x_coord, y_coord, "tracking") # 32, 3*32
+            combined_img = save_image_total(images, x_coord, y_coord, score)
+            combined_img.save(f"{outdir}/tracking.png")
+        if "attention" in cfg.mode:
             for layer in cfg.attn_idx:
-                gt_query, gt_key = vggt_pred['attn_cache'][f'{layer}']['query'], vggt_pred['attn_cache'][f'{layer}']['key']
-                # torch.Size([1, 16, 5476, 64])
-                score = get_attention(gt_query, gt_key, x_coord, y_coord)
-                combined_img = save_image(images, x_coord, y_coord, score)
-                combined_img.save(f"outputs/sample{i}/attn{layer}.png")
-        elif "pointmap" in cfg.mode:
-            gt_query, gt_key = batch['pointmap'], batch['pointmap']
-            score = get_pointmap()
-            combined_img = save_image(images, x_coord, y_coord, score)
-            combined_img.save(f"outputs/sample{i}/pointmap.png")
+                gt_query, gt_key = vggt_pred['attn_cache'][f'{layer}']['query'], vggt_pred['attn_cache'][f'{layer}']['key'] # torch.Size([1, 16, 5476, 64])
+                score = get_costmap(gt_query, gt_key, x_coord, y_coord, "attention") # 32, 3*32
+                combined_img = save_image_total(images, x_coord, y_coord, score)
+                combined_img.save(f"{outdir}/attn{layer}.png")
+        if "pointmap" in cfg.mode:
+            # pointmap = batch['point_map'].permute(0,1,3,4,2) # [1, 4, 512, 512, 3]
+            # gt_query, gt_key = pointmap[:, :1, ...], pointmap[:, 1:, ...] 
+            # gt_query = gt_query.reshape(1, 1, -1, 3) # torch.Size([1, 1, 512, 3])
+            # gt_key = gt_key.reshape(1, 1, -1, 3) # torch.Size([1, 1, 786432, 3])
+            pointmap = batch['point_map']
+            gt_query = pointmap[:, :1, ...]
+            gt_key = pointmap[:, 1:, ...]
+            score = get_costmap(gt_query, gt_key, x_coord, y_coord, "pointmap")
+            combined_img = save_image_total(images, x_coord, y_coord, score)
+            combined_img.save(f"{outdir}/pointmap.png")
         
+        save_image(tgt_image, f"{outdir}/TARGET.png")
+        tgt_image_marked = mark_point_on_img(tgt_image, x_coord, y_coord)
+        target_marked = torch.from_numpy(tgt_image_marked).permute(2, 0, 1).float() / 255.0
+        save_image(target_marked, f"{outdir}/TARGET_MARKED.png")
+
+        ref_imgs = images.squeeze()[1:]
+        ref_concat = torch.cat([img for img in ref_imgs], dim=-1)  # shape [C, H, W*3] # save as one single image save_image(ref_concat, f"{outdir}/REFERENCE.png")
+        save_image(ref_concat, f"{outdir}/REFERENCE.png")
+        print(f"Saved visualization to outputs.png")
         
- 
-        combined_img.save(f"outputs/stitched.png")
-        print(f"Saved visualization to outputs/stitched.png")
-
-        import pdb; pdb.set_trace()  # keep if you want debugging
-
+        if i == 200: break
+        
     
     
     
@@ -380,14 +442,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="/mnt/data1/jiho/vggt-nvs/MVGenMaster/costmap_visualization.yaml")
     args = parser.parse_args()
-    
+    set_seed(42)
     if args.config[-5:] == ".yaml":
         config = OmegaConf.load(args.config)
     else:
         raise ValueError("Do not support this format config file")
     main(config)
-    
-    main()
     
     
     

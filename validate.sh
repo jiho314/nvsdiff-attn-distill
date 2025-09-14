@@ -12,6 +12,6 @@ CUDA_VISIBLE_DEVICES=3 accelerate launch --mixed_precision="fp16" \
                   --tracker_project_name "nvs-vggt-distill" \
                   --seed 0 \
                   --val_path="check_points/cat3d" \
-                  --validation_checkpoint="latest" \
-                  --val_cfg=1.0 \
+                  --validation_checkpoint="checkpoint-4000" \
+                  --val_cfg=2.0 \
                   --visualize_attention_maps \

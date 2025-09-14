@@ -45,6 +45,11 @@ from utils import get_lpips_score, _seq_name_to_seed
 from src.distill_utils.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache
 from src.modules.attention_visualization_callback import AttentionVisualizationCallback
 from src.modules.timestep_sample import truncated_normal
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import pearsonr
+import pandas as pd
 logger = get_logger(__name__, log_level="INFO")
 
 
@@ -267,12 +272,12 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
     psnr_scores = []
     ssim_scores = []
     lpips_scores = []
+    attention_loss_scores = {}  # 레이어별 attention loss 수집용 {layer_key: [scores]}
     show_images = []
     # show_save_dict = collections.defaultdict(int)
     val_iter = 0
 
-    if cond_num is None:
-        cond_num = config.fix_cond_num
+    cond_num = config.fix_cond_num
 
     # visualize_loss_fn 초기화 (validation loop 전에 정의)
     visualize_loss_fn = None
@@ -297,6 +302,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
     # Match train.py: use torch.autocast with explicit dtype
     with torch.no_grad(), torch.autocast("cuda", dtype=weight_dtype):
         for batch in tqdm(val_dataloader, desc=f"Validation rank{accelerator.process_index}..."):
+
             # Defensive: if a sample is malformed, log error and raise so user can fix data.
             if batch is None:
                 logger.error("Encountered None batch from dataloader during validation. Raising error to surface data issue.")
@@ -349,6 +355,13 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                     accelerator=accelerator
                 )
             
+            # 디버그: 첫 번째 샘플만 입력 차원 확인 (로그 정리)
+            if val_iter == 0:
+                print(f"DEBUG - Pipeline input shapes:")
+                print(f"  image_normalized.shape: {image_normalized.shape}")
+                print(f"  config.nframe: {config.nframe}")
+                print(f"  cond_num: {cond_num}")
+            
             preds = pipeline(images=image_normalized, nframe=config.nframe, cond_num=cond_num,
                              height=image_normalized.shape[2], width=image_normalized.shape[3],
                              intrinsics=intrinsic, extrinsics=extrinsic,
@@ -399,14 +412,32 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                 structured_losses = attention_callback.get_structured_losses()
                 attention_images = attention_callback.get_attention_images()
                 
-                # attention loss 데이터 준비
+                # attention loss 데이터 준비 (레이어별)
+                layer_summary = structured_losses.get('layer_summary', {})
                 overall_summary = structured_losses.get('overall_summary', {})
+                
+                attention_loss_data = {}
+                
+                # 전체 평균 추가
                 if overall_summary:
-                    attention_loss_data = {
-                        f"val/attention_loss/mean": overall_summary.get('mean', 0.0),
+                    attention_loss_data[f"val/attention_loss/overall_mean"] = overall_summary.get('mean', 0.0)
+                
+                # 레이어별 loss 추가
+                for layer_key, layer_stats in layer_summary.items():
+                    layer_mean = layer_stats.get('mean', 0.0)
+                    attention_loss_data[f"val/attention_loss/{layer_key}"] = layer_mean
+                    
+                    # correlation 분석을 위해 레이어별로 수집
+                    if layer_key not in attention_loss_scores:
+                        attention_loss_scores[layer_key] = []
+                    attention_loss_scores[layer_key].append(layer_mean)
+                
+                # 공통 메타데이터 추가
+                if attention_loss_data:
+                    attention_loss_data.update({
                         f"val/sample_name": seq_name if seq_name is not None else f"sample_{val_iter}",
                         "val_sample_idx": val_iter
-                    }
+                    })
                 
                 # attention 이미지 데이터 준비
                 attention_images_data = attention_images
@@ -508,6 +539,90 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
     
     # Attention loss 전체 통계 로깅 (모든 샘플 종합)
 
+    # 메트릭 간 correlation 계산 및 시각화
+    if len(psnr_scores) > 1:
+        # 필요한 라이브러리를 직접 import (의존성 없으면 예외 발생)
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        import pandas as pd
+
+        # 모든 메트릭을 같은 방향으로 통일
+        psnr_inverted = [-x for x in psnr_scores]
+        ssim_inverted = [-x for x in ssim_scores]
+
+        metrics_data = {
+            'LPIPS': lpips_scores,
+            'PSNR_inv': psnr_inverted,
+            'SSIM_inv': ssim_inverted,
+        }
+
+        # 레이어별 attention loss가 있으면 추가
+        for layer_key, layer_scores in attention_loss_scores.items():
+            if len(layer_scores) == len(psnr_scores):
+                import re
+                unet_match = re.search(r'unet(\d+)', layer_key)
+                layer_match = re.search(r'_(\d+)$', layer_key)
+
+                if unet_match and layer_match:
+                    unet_num = unet_match.group(1)
+                    layer_num = layer_match.group(1)
+                    clean_layer_name = f'UNet{unet_num}_L{layer_num}'
+                else:
+                    clean_layer_name = layer_key.replace('_', '')[:10]
+
+                metrics_data[f'Attn_{clean_layer_name}'] = layer_scores
+
+        metrics_df = pd.DataFrame(metrics_data)
+
+        # 컬럼 정렬(알파벳 순)하여 heatmap에서 이름이 규칙적으로 보이게 함
+        metrics_df = metrics_df.reindex(sorted(metrics_df.columns), axis=1)
+
+        # Correlation matrix 계산
+        corr_matrix = metrics_df.corr()
+
+        # 시각화
+        n_metrics = len(metrics_df.columns)
+        fig_size = max(8, n_metrics * 1.5)
+        plt.figure(figsize=(fig_size, fig_size))
+
+        sns.heatmap(corr_matrix, annot=True, cmap='RdBu_r', center=0,
+                    square=True, fmt='.3f', cbar_kws={'shrink': 0.8},
+                    linewidths=0.5, annot_kws={'size': 10})
+
+        title_parts = ['Metric Correlations (3 decimal places)']
+        title_parts.append('LPIPS = LPIPS')
+        attn_columns = [col for col in corr_matrix.columns if col.startswith('Attn_')]
+        if attn_columns:
+            title_parts.append('Attn_* = Attention_Loss')
+
+        plt.title('\n'.join(title_parts), fontsize=14, pad=20)
+        plt.xlabel('Metrics', fontsize=12)
+        plt.ylabel('Metrics', fontsize=12)
+
+        # X축 라벨을 세로로 돌려서 이름이 잘 보이게 함
+        plt.xticks(rotation=90, ha='center', fontsize=8)
+        plt.yticks(fontsize=8)
+
+        plt.tight_layout()
+
+        correlation_save_path = f"validation_metrics_correlation.png"
+        plt.savefig(correlation_save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        print(f"Metrics correlation plot saved to: {correlation_save_path}")
+
+        # Wandb 로깅
+        if accelerator.is_main_process:
+            import wandb
+            log_data = {"val/metrics_correlation": wandb.Image(correlation_save_path)}
+            metric_names = list(corr_matrix.columns)
+            for i, metric1 in enumerate(metric_names):
+                for j, metric2 in enumerate(metric_names):
+                    if i < j:
+                        corr_key = f"val/correlation_{metric1.lower()}_{metric2.lower()}"
+                        log_data[corr_key] = corr_matrix.iloc[i, j]
+            wandb.log(log_data, step=99999)
+    
     # 전체 validation에 대한 평균 메트릭 계산 (모든 frames의 평균)
     overall_psnr = torch.tensor(np.mean(psnr_scores), device=device, dtype=torch.float32)
     overall_ssim = torch.tensor(np.mean(ssim_scores), device=device, dtype=torch.float32)
@@ -532,14 +647,36 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
         total_samples = val_iter  # 실제 처리된 샘플 수
         total_frames = len(psnr_scores)  # 실제 처리된 프레임 수
         
-        accelerator.log({
+        summary_log_data = {
             "val/summary/psnr_avg": overall_psnr,  # 모든 프레임의 평균
             "val/summary/ssim_avg": overall_ssim, 
             "val/summary/lpips_avg": overall_lpips,
             "val/summary/total_samples": total_samples,  # 샘플 수
             "val/summary/total_frames": total_frames,    # 프레임 수
             "val/summary/frames_per_sample": total_frames / max(1, total_samples)  # 샘플당 평균 프레임 수
-        }, step=summary_step)
+        }
+        
+        # 레이어별 attention loss 통계 추가
+        for layer_key, layer_scores in attention_loss_scores.items():
+            if layer_scores:
+                # unet 숫자만 추출 (correlation과 동일한 로직)
+                import re
+                unet_match = re.search(r'unet(\d+)', layer_key)
+                layer_match = re.search(r'_(\d+)$', layer_key)
+                
+                if unet_match and layer_match:
+                    unet_num = unet_match.group(1)
+                    layer_num = layer_match.group(1)
+                    clean_layer_name = f'UNet{unet_num}_L{layer_num}'
+                else:
+                    clean_layer_name = layer_key.replace('_', '')[:10]  # fallback
+                
+                summary_log_data[f"val/summary/attention_loss/{clean_layer_name}_mean"] = np.mean(layer_scores)
+                summary_log_data[f"val/summary/attention_loss/{clean_layer_name}_std"] = np.std(layer_scores)
+                summary_log_data[f"val/summary/attention_loss/{clean_layer_name}_min"] = np.min(layer_scores)
+                summary_log_data[f"val/summary/attention_loss/{clean_layer_name}_max"] = np.max(layer_scores)
+        
+        accelerator.log(summary_log_data, step=summary_step)
 
         # 샘플 이미지들 로깅 (요약용)
         for j in range(min(len(show_images), 5)):
@@ -559,7 +696,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
     
     torch.cuda.empty_cache()
 
-    return lpips_score
+    return overall_lpips
 
 
 
@@ -718,14 +855,13 @@ def main():
         'unet_logit_head_kwargs': {"softmax_temp": 1.0},
         'query': "target",
         'key': "reference",
-        'student_unet_attn_layers': list(range(2,3)),
+        'student_unet_attn_layers': list((2,4,6,8,10,12,14)),
         # 시각화 설정 추가
-        'viz_steps': [],  # 빈 리스트 = 모든 스텝에서 시각화
-        'viz_layers': [],  # 빈 리스트 = 모든 레이어에서 시각화
+        'viz_steps': [40],  # 빈 리스트 = 모든 스텝에서 시각화, step idx (1-50) 기준
         'viz_log_wandb': True,
         'viz_alpha': 0.6,
         'viz_query_xy': None,  # None이면 랜덤 선택
-        'viz_query_index': None,  # None이면 랜덤 선택
+        'viz_query_index': 150,  # None이면 랜덤 선택
     }
     visualize_config['pairs'] = [(unet_layer, "track_head") for unet_layer in visualize_config['student_unet_attn_layers']]
     
@@ -740,6 +876,7 @@ def main():
         # Set Attention Cache for distillation
         ## TODO Seonghu : check max layer number
         visualize_student_unet_attn_layers = visualize_config['student_unet_attn_layers']
+        print(f"Number of unet attention layers: {len(list(unet.attn_processors.keys()))}")
         set_attn_cache(unet, visualize_student_unet_attn_layers)
 
         # add to unet (only single module supported in deepspeed... fuk )
@@ -800,17 +937,25 @@ def main():
         'dataset_length': 53,
         'resampled': False,
         'shardshuffle': False,
-        'min_view_range': 6,
-        'max_view_range': 10,
+        'num_viewpoints': 3,
+        # min_view_range=6,
+        # max_view_range=6,
+        'inference': True,
+        'inference_view_range': 8,
         'process_kwargs': {
             'get_square_extrinsic': True
         }
     }
     
+    ## TODO: for validation, set nframe to 3
+    config.nframe = 3
+    config.fix_cond_num = 2
+    
     val_dataset = build_re10k_wds(
-        num_viewpoints=config.nframe,
         **val_wds_dataset_config
     ) 
+    
+    
     val_num_workers = 0
     # eval_dataloader = DataLoader(
     #     eval_dataset,
@@ -1016,9 +1161,9 @@ def main():
         # attention loss 메트릭을 validation step 기준으로 정의
         import wandb
         wandb.define_metric("val/attention_loss/*")
-        wandb.define_metric("val/psnr", ) 
-        wandb.define_metric("val/ssim", )
-        wandb.define_metric("val/lpips",)
+        wandb.define_metric("val/psnr") 
+        wandb.define_metric("val/ssim")
+        wandb.define_metric("val/lpips")
 
     # Validate!
     total_batch_size = 1 * accelerator.num_processes
