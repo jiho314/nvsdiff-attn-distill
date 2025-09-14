@@ -42,7 +42,7 @@ from src.modules.position_encoding import depth_freq_encoding, global_position_e
 from src.modules.schedulers import get_diffusion_scheduler
 from utils import get_lpips_score, _seq_name_to_seed
 
-from src.distill_utils.geometry import cycle_consistency_checker
+from src.distill_utils.attn_logit_head import cycle_consistency_checker
 from src.distill_utils.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache
 from src.modules.timestep_sample import truncated_normal
 logger = get_logger(__name__, log_level="INFO")
@@ -555,24 +555,10 @@ def main():
         distill_pairs = config.distill_config.distill_pairs
 
         # Cost Metric
-        from src.distill_utils.cost_metric import COST_METRIC_FN
+        from src.distill_utils.query_key_cost_metric import COST_METRIC_FN
         distill_cost_fn = COST_METRIC_FN[distill_config.cost_metric.lower()]
-
-        # loss function
-        def cross_entropy(prob, prob_gt):
-            """Cross entropy loss for attention probabilities."""
-            eps = 1e-8
-            return - (prob_gt * (prob + eps).log()).sum(dim=-1).mean()
-
-        def kl_divergence(prob, prob_gt):
-            """Kullback-Leibler divergence loss for attention probabilities."""
-            return (prob_gt * (prob_gt.log() - prob.log())).sum(dim=-1).mean()
-
-        ATTN_LOSS_FN = {
-            "l1": torch.nn.functional.l1_loss,
-            "cross_entropy": cross_entropy,
-            "kl_divergence": kl_divergence,
-        }
+        
+        from src.distill_utils.attn_distill_loss import ATTN_LOSS_FN
         distill_loss_fn = ATTN_LOSS_FN[distill_config.distill_loss_fn.lower()]
         distill_loss_weight = config.distill_config.distill_loss_weight
 
@@ -1173,7 +1159,7 @@ def main():
                                 B, Head, F1HW, F2HW = gt_attn_logit.shape  
                                 F1, F2, HW = len(query_idx), len(key_idx), F1HW // len(query_idx)
                                 gt_attn_logit_HW = einops.rearrange(gt_attn_logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1) HW1 (F2 HW2)', B=B,Head=Head, F1=F1, F2=F2, HW1=HW, HW2=HW)
-                                consistency_mask = cycle_consistency_checker(gt_attn_logit_HW)
+                                consistency_mask = cycle_consistency_checker(gt_attn_logit_HW, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1) HW1 (F2 HW2)
                                 consistency_mask = einops.rearrange(consistency_mask, '(B Head F1) HW 1 -> B Head (F1 HW) 1', B=B, Head=Head, F1=F1, HW=HW)
                                 assert Head == 1, "Track Head costmap should have only one head"
                                 consistency_mask = consistency_mask.reshape(B*Head, F1HW)

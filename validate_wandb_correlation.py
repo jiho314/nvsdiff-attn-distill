@@ -1,13 +1,3 @@
-"""
-Post-process script: 다운로드한 wandb run의 validation logs에서 메트릭을 모아 correlation을 계산하고
-heatmap PNG를 생성하여 wandb에 다시 업로드합니다.
-
-사용법 예시:
-python validate_wandb_correlation.py --run_id jsh0423_/nvs-vggt-distill/96m4i9kp --api_key <WANDB_API_KEY>
-
-이 스크립트는 wandb API를 사용하여 지정한 run의 로그(요약 로그 포함)를 가져와
-PSNR/SSIM/LPIPS 및 attention loss 메트릭을 모아서 correlation을 계산합니다.
-"""
 import argparse
 import os
 import tempfile

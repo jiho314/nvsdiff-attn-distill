@@ -118,23 +118,43 @@ class AttentionVisualizationCallback(PipelineCallback):
                                   B=B, Head=Head, f1=len(query_idx), f2=len(key_idx), HW1=HW, HW2=HW)
         return attnmap
     
-    def _extract_view_indices(self, F: int) -> Tuple[List[int], List[int]]:
-        """query와 key의 view index 추출"""
-        # Query index 추출
-        if self.visualize_config['query'] == "target":
+    def _extract_loss_view_indices(self, F: int) -> Tuple[List[int], List[int]]:
+        """Loss 계산용 query와 key의 view index 추출"""
+        # Loss Query index 추출
+        if self.visualize_config['loss_query'] == "target":
             query_idx = list(range(self.cond_num, F))
-        elif self.visualize_config['query'] == "all":
+        elif self.visualize_config['loss_query'] == "all":
             query_idx = list(range(0, F))
         else:
-            raise NotImplementedError(f"visualize_config['query'] {self.visualize_config['query']} not implemented")
+            raise NotImplementedError(f"visualize_config['loss_query'] {self.visualize_config['loss_query']} not implemented")
         
-        # Key index 추출
-        if self.visualize_config['key'] == "reference":
+        # Loss Key index 추출
+        if self.visualize_config['loss_key'] == "reference":
             key_idx = list(range(0, self.cond_num))
-        elif self.visualize_config['key'] == "all":
+        elif self.visualize_config['loss_key'] == "all":
             key_idx = list(range(0, F))
         else:
-            raise NotImplementedError(f"visualize_config['key'] {self.visualize_config['key']} not implemented")
+            raise NotImplementedError(f"visualize_config['loss_key'] {self.visualize_config['loss_key']} not implemented")
+        
+        return query_idx, key_idx
+
+    def _extract_viz_view_indices(self, F: int) -> Tuple[List[int], List[int]]:
+        """Visualization용 query와 key의 view index 추출"""
+        # Viz Query index 추출
+        if self.visualize_config['viz_query'] == "target":
+            query_idx = list(range(self.cond_num, F))
+        elif self.visualize_config['viz_query'] == "all":
+            query_idx = list(range(0, F))
+        else:
+            raise NotImplementedError(f"visualize_config['viz_query'] {self.visualize_config['viz_query']} not implemented")
+        
+        # Viz Key index 추출
+        if self.visualize_config['viz_key'] == "reference":
+            key_idx = list(range(0, self.cond_num))
+        elif self.visualize_config['viz_key'] == "all":
+            key_idx = list(range(0, F))
+        else:
+            raise NotImplementedError(f"visualize_config['viz_key'] {self.visualize_config['viz_key']} not implemented")
         
         return query_idx, key_idx
     
@@ -322,8 +342,19 @@ class AttentionVisualizationCallback(PipelineCallback):
                 # 각 view별로 가장 확률이 높은 부분에 파란 점 추가
                 blended_pil = _PILImage.fromarray(blended)
                 blended_pil = self._draw_max_attention_point(blended_pil, tile, k_side)
-                blended = np.array(blended_pil)
                 
+                # self attention 영역 (target view)에 특별한 경계선 추가
+                current_key_view_idx = key_idx_list[view_idx]
+                if current_key_view_idx == F - 1:  # target view (self attention)
+                    # 노란색 경계선으로 self attention 영역 표시
+                    draw = _PILDraw.Draw(blended_pil)
+                    border_width = 3
+                    w, h = blended_pil.size
+                    # 노란색 경계선 그리기
+                    for i in range(border_width):
+                        draw.rectangle([i, i, w-1-i, h-1-i], outline=(255, 255, 0), width=1)
+                
+                blended = np.array(blended_pil)
                 outs.append(blended)
             row = np.concatenate(outs, axis=1)
             return _PILImage.fromarray(row)
@@ -467,27 +498,25 @@ class AttentionVisualizationCallback(PipelineCallback):
                 
                 # F truncate 로직: Q가 F로 나누어떨어지지 않으면 자르기; Up block concat issue 
                 if Q % F != 0 or K % F != 0:
-                    Q_truncated = (Q // (F+1)) * F
-                    K_truncated = (K // (F+1)) * F
-                    pred_attn_logit = pred_attn_logit[:, :, :Q_truncated, :K_truncated]
-                    Q, K = Q_truncated, K_truncated
-                    print(f"Truncated attention logit: Q {Q_truncated}, K {K_truncated} (F={F})")
+                    print(f"Warning: pred attnmap should be divisible by F, but got {pred_attn_logit.shape} and F={F}")
+                    continue
                 
-                # 1) 토큰 크기 맞추기: gt -> pred
+                # 1) 토큰 크기 맞추기: gt(VGGT)를 pred(UNet)의 토큰 크기로 리사이즈
                 pred_query_size = int(math.sqrt(Q // F))
                 pred_key_size = int(math.sqrt(K // F))
                 gt_query_resized = self._resize_token(gt_query, pred_query_size, F)
                 gt_key_resized = self._resize_token(gt_key, pred_key_size, F)
                 
-                # 2) View index 추출
-                query_idx, key_idx = self._extract_view_indices(F)
+                ## ========= LOSS CALCULATION =========
+                # 2) Loss 계산용 View index 추출
+                loss_query_idx, loss_key_idx = self._extract_loss_view_indices(F)
                 
-                # 3) Attention map 슬라이싱
-                pred_attn_logit_sliced = self._slice_attention_map(pred_attn_logit, query_idx, key_idx, F)
+                # 3) Loss 계산용 Attention map 슬라이싱
+                pred_attn_logit_sliced = self._slice_attention_map(pred_attn_logit, loss_query_idx, loss_key_idx, F)
                 
                 # GT attention logit 계산
                 gt_attn_logit = gt_query_resized @ gt_key_resized.transpose(-1, -2)
-                gt_attn_logit_sliced = self._slice_attention_map(gt_attn_logit, query_idx, key_idx, F)
+                gt_attn_logit_sliced = self._slice_attention_map(gt_attn_logit, loss_query_idx, loss_key_idx, F)
                 
                 # 4) Logit head 통과시켜 최종 loss 계산
                 pred_processed = pipeline.unet.unet_logit_head(pred_attn_logit_sliced)
@@ -505,16 +534,24 @@ class AttentionVisualizationCallback(PipelineCallback):
                     self.layer_losses[layer_key] = []
                 self.layer_losses[layer_key].append(loss_value.item())
 
+                ## ========= VISUALIZATION =========
+                # 5) Visualization용 View index 추출 (별도)
+                viz_query_idx, viz_key_idx = self._extract_viz_view_indices(F)
+                
+                # Visualization용 Attention map 슬라이싱
+                pred_attn_logit_viz = self._slice_attention_map(pred_attn_logit, viz_query_idx, viz_key_idx, F)
+                gt_attn_logit_viz = self._slice_attention_map(gt_attn_logit, viz_query_idx, viz_key_idx, F)
+
                 # Optional visualization save
                 print(f"Calling _maybe_save_attn_overlay for step {step_index}, layer {layer_key}")
                 self._maybe_save_attn_overlay(
                     step_index=step_index,
                     layer_key=layer_key,
-                    pred_logits=pred_attn_logit_sliced,
-                    gt_logits=gt_attn_logit_sliced,
+                    pred_logits=pred_attn_logit_viz,
+                    gt_logits=gt_attn_logit_viz,
                     F=F,
-                    query_idx_list=query_idx,
-                    key_idx_list=key_idx,
+                    query_idx_list=viz_query_idx,
+                    key_idx_list=viz_key_idx,
                 )
             
             # Step별 데이터 저장
