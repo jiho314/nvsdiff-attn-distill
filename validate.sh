@@ -11,7 +11,7 @@ CUDA_VISIBLE_DEVICES=3 accelerate launch --mixed_precision="fp16" \
                   --config_file configs/deepspeed/acc_val.yaml validate.py \
                   --tracker_project_name "nvs-vggt-distill" \
                   --seed 0 \
-                  --val_path="check_points/cat3d" \
-                  --validation_checkpoint="checkpoint-4000" \
+                  --val_path="check_points/lr1_cosine_noema" \
+                  --validation_checkpoint="checkpoint-30000" \
                   --val_cfg=2.0 \
                   --visualize_attention_maps \

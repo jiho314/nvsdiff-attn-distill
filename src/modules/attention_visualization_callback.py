@@ -416,7 +416,7 @@ class AttentionVisualizationCallback(PipelineCallback):
                 seq = 'sample'
 
             # attention 이미지를 callback 내부에 저장 (wandb 로깅은 메인에서)
-            key = f"attn/{seq}/{layer_key}"
+            key = f"val/attn/{seq}/{layer_key}"
             if not hasattr(self, 'attention_images'):
                 self.attention_images = {}
             
@@ -525,7 +525,7 @@ class AttentionVisualizationCallback(PipelineCallback):
                 loss_value = self.loss_fn(pred_processed, gt_processed)
 
                 layer_key = f"unet{unet_layer}_vggt{vggt_layer}"
-                step_loss_dict[f"step{step_index}/{layer_key}"] = loss_value
+                step_loss_dict[f"val/step{step_index}/{layer_key}"] = loss_value
                 
                 print(f"Calculated loss for {layer_key}: {loss_value.item()}")
                 
@@ -557,14 +557,14 @@ class AttentionVisualizationCallback(PipelineCallback):
             # Step별 데이터 저장
             if step_loss_dict:
                 step_avg_loss = sum(step_loss_dict.values()) / len(step_loss_dict)
-                step_loss_dict[f"step{step_index}/avg_loss"] = step_avg_loss
+                step_loss_dict[f"val/step{step_index}/avg_loss"] = step_avg_loss
                 
                 # step별 layer별 loss 저장
                 self.step_layer_losses[step_index] = {}
                 for key, loss_value in step_loss_dict.items():
-                    if key.startswith(f"step{step_index}/") and key != f"step{step_index}/avg_loss":
+                    if key.startswith(f"val/step{step_index}/") and key != f"val/step{step_index}/avg_loss":
                         # key에서 step 부분을 제거하여 layer_key만 추출
-                        layer_key = key.replace(f"step{step_index}/", "")
+                        layer_key = key.replace(f"val/step{step_index}/", "")
                         self.step_layer_losses[step_index][layer_key] = loss_value.item()
                 
                 self.step_losses.append(step_avg_loss.item())
@@ -598,7 +598,7 @@ class AttentionVisualizationCallback(PipelineCallback):
         """전체 loss dictionary 반환"""
         # 최종 평균 loss도 포함
         final_dict = self.visualize_loss_dict.copy()
-        final_dict["train/visualize/final_avg_loss"] = self.get_final_loss()
+        final_dict["val/visualize/final_avg_loss"] = self.get_final_loss()
         return final_dict
     
     def get_structured_losses(self) -> Dict[str, Any]:

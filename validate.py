@@ -47,7 +47,7 @@ from src.modules.attention_visualization_callback import AttentionVisualizationC
 from src.modules.timestep_sample import truncated_normal
 
 from src.distill_utils.attn_logit_head import LOGIT_HEAD_CLS # JIHO TODO: save/load params
-from src.distill_utils.cost_metric import COST_METRIC_FN
+from src.distill_utils.query_key_cost_metric import COST_METRIC_FN
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -408,7 +408,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
             # attention visualization 데이터 가져오기
             attention_loss_data = {}
             attention_images_data = {}
-            if do_attn_visualize and attention_callback is not None:
+            if do_attn_visualize:
                 structured_losses = attention_callback.get_structured_losses()
                 attention_images = attention_callback.get_attention_images()
                 
@@ -526,6 +526,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                     for key, img_data in attention_images_data.items():
                         log_data[key] = wandb.Image(img_data['image'], caption=img_data['caption'])
                 
+                print(f"[DEBUG] log_data keys: {list(log_data.keys())}")
                 # 모든 데이터를 한 번에 로깅
                 accelerator.log(log_data, step=val_iter)
             
@@ -655,14 +656,20 @@ def parse_args():
     parser.add_argument("--val_path", type=str, default=None)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--log_every", type=int, default=20)
+    parser.add_argument("--config_file", type=str, default="configs/cat3d.yaml")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    
-    config = EasyDict(OmegaConf.load(os.path.join(args.val_path, "config.yaml")))
+    try: 
+        config = EasyDict(OmegaConf.load(os.path.join(args.val_path, "config.yaml")))
+    except:
+        if args.config_file is None:
+            raise FileNotFoundError(f"No config file found in {args.val_path} and {args.config_file}")
+        print(f"Warning: No config file found in {args.val_path}, using {args.config_file}")
+        config = EasyDict(OmegaConf.load(args.config_file))
 
     # Sanity checks
     # assert config.dataset_names is not None and len(config.dataset_names) > 0

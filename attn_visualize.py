@@ -197,7 +197,7 @@ if __name__ == "__main__":
     cond_num = 2 # Condition among nframe
     inference_view_range = 6 # change if you want 
     # checkpoint
-    resume_checkpoint = 'check_points/lr1_cosine_noema'
+    resume_checkpoint = 'check_points/lr1_cosine_noema/checkpoint-30000'
     config_file_path = 'configs/viz.yaml'
     config = EasyDict(OmegaConf.load(config_file_path))
 
