@@ -1074,8 +1074,8 @@ def main():
 
                 # JIHO TODO
                 # Distill Loss
-                distill_loss_dict = {}
                 if do_attn_distill:
+                    distill_loss_dict = {}
                     distill_gt_dict = {}
                     # VGGT Process (+ if needed, use vggt Camera)
                     if config.vggt_on_fly:
@@ -1215,7 +1215,7 @@ def main():
                     accelerator.log({"train/batch_time": batch_time}, step=global_step)
                     if args.use_ema and ema_unet.cur_decay_value is not None:
                         accelerator.log({"train/ema_decay": ema_unet.cur_decay_value}, step=global_step)
-                    if len(distill_loss_dict) > 0:  
+                    if do_attn_distill:  
                         accelerator.log({"train/distill_loss": distill_loss.item()}, step=global_step)
                         accelerator.log(distill_loss_dict, step=global_step)
                     # logger.info(f"Loss: {train_loss}")

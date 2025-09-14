@@ -47,7 +47,7 @@ import json
 
 def main(nframe, cond_num, inference_view_range, 
          caching_unet_attn_layers, noise_timestep, 
-         resume_checkpoint, config, rank = 0, cfg):
+         resume_checkpoint, config, rank = 0):
     # args, _, cfg = parse_args()
 
     set_seed(0)
@@ -342,7 +342,7 @@ if __name__ == "__main__":
     # minkyung TODO
     # unet: (down_blocks(6), mid_block(1), up_blocks(9))
     #  size: [64,64,32,32,16,16] [8] [16,16,16,32,32,32,64,64,64]
-    caching_unet_attn_layers = [6, 12] # [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+    
     # noise
     noise_timestep = 100
     # data
@@ -353,13 +353,5 @@ if __name__ == "__main__":
     resume_checkpoint = 'check_points/lr1_cosine_noema/checkpoint-30000'
     config_file_path = 'configs/viz.yaml'
     config = EasyDict(OmegaConf.load(config_file_path))
-
-    rank = 0
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/attnmap_visualization.yaml")
-    args = parser.parse_args()
-    if args.config[-5:] == ".yaml":
-        config = OmegaConf.load(args.config)
-    else:
-        raise ValueError("Do not support this format config file")
+    caching_unet_attn_layers = config.unet_visulaize.caching_unet_attn_layers # [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
     main(nframe, cond_num, inference_view_range, caching_unet_attn_layers, noise_timestep=noise_timestep, resume_checkpoint=resume_checkpoint, config=config, rank = 0)
