@@ -9,6 +9,10 @@ from my_diffusers.models.attention_processor import AttnProcessor2_0
 # up_blocks(9): 1.0, 1.1, 1.2, 2.0, 2.1, 2.2, 3.0, 3.1, 3.2
 
 # sorted attn processor  = ['down_blocks.0.attentions.0.transformer_blocks.0.attn1.processor', 'down_blocks.0.attentions.1.transformer_blocks.0.attn1.processor', 'down_blocks.1.attentions.0.transformer_blocks.0.attn1.processor', 'down_blocks.1.attentions.1.transformer_blocks.0.attn1.processor', 'down_blocks.2.attentions.0.transformer_blocks.0.attn1.processor', 'down_blocks.2.attentions.1.transformer_blocks.0.attn1.processor', 'mid_block.attentions.0.transformer_blocks.0.attn1.processor', 'up_blocks.1.attentions.0.transformer_blocks.0.attn1.processor', 'up_blocks.1.attentions.1.transformer_blocks.0.attn1.processor', 'up_blocks.1.attentions.2.transformer_blocks.0.attn1.processor', 'up_blocks.2.attentions.0.transformer_blocks.0.attn1.processor', 'up_blocks.2.attentions.1.transformer_blocks.0.attn1.processor', 'up_blocks.2.attentions.2.transformer_blocks.0.attn1.processor', 'up_blocks.3.attentions.0.transformer_blocks.0.attn1.processor', 'up_blocks.3.attentions.1.transformer_blocks.0.attn1.processor', 'up_blocks.3.attentions.2.transformer_blocks.0.attn1.processor']
+# Attn Head Num: [5,5,10,10,20,20] [20] [20,20,20, 10,10,10, 5,5,5]
+
+SDXL_ATTN_DIM = [320, 320, 640, 640, 1280, 1280, 1280, 1280, 1280, 1280, 640, 640, 640, 320, 320, 320]
+SDXL_ATTN_HEAD_NUM = [5,5,10,10,20,20, 20, 20,20,20,10,10,10,5,5,5]
 
 def print_attn_cache_setting(unet):
     attn_proc_names = sorted(list(unet.attn_processors.keys()))

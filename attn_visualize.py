@@ -141,7 +141,7 @@ def main(nframe, cond_num, inference_view_range,
     def unet_inference(batch):
         # batch: always order by seq idx
         # uniform_push_batch: set condition (uniform sampling, no randomness) to front, tgt to last
-        batch = uniform_push_batch(batch, cond_num)
+        # batch = uniform_push_batch(batch, cond_num)
         image = batch["image"].to(device)  #  0 1 tensor [B,F,3,H,W]
         extri_, intri_ = batch["extrinsic"], batch["intrinsic"]
 
@@ -265,6 +265,7 @@ def main(nframe, cond_num, inference_view_range,
         ''' unet_attn_cache(dict): {layer_id(str): attnmap tensor(B, head, Q(VHW), K(VHW)}
         '''
         for unet_layer in caching_unet_attn_layers:
+            print(f"layer: {unet_layer} shape : {unet_attn_cache[str(unet_layer)].shape}")
             unet_attn_logit = unet_attn_cache[str(unet_layer)] # [B, H, Q, K]
             B, H, Q, K = unet_attn_logit.shape
             if B == 3 : # self attention
@@ -275,16 +276,15 @@ def main(nframe, cond_num, inference_view_range,
                 query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
                 attn_maps = unet_attn_logit.mean(dim=1) # [3, Q, K]
                 all_scores = torch.softmax(attn_maps[:, query_token_idx_cost], dim=-1)
-                score1 = all_scores[1].reshape(query_size, query_size)
-                score2 = all_scores[2].reshape(query_size, query_size)
+                score1 = all_scores[0].reshape(query_size, query_size)
+                score2 = all_scores[1].reshape(query_size, query_size)
                 score = torch.cat([score1, score2], dim=-1)
             else: 
-                query_idx = [0]
+                query_idx = [nframe-1]
                 if config.unet_visualize.cross_only: 
-                    key_idx = list(range(1, nframe))
+                    key_idx = list(range(nframe-1))
                 else:
                     key_idx = list(range(nframe))
-                    
                 unet_attn_logit = slice_attnmap(unet_attn_logit, query_idx=query_idx, key_idx=key_idx) # [B, H, Q, K]
                 # average over head
                 attn_maps = unet_attn_logit.mean(dim=1)   # [B, Q, K]
@@ -312,7 +312,7 @@ def main(nframe, cond_num, inference_view_range,
             target_marked = torch.from_numpy(tgt_image_marked).permute(2, 0, 1).float() / 255.0
             save_image(target_marked, f"{outdir}/TARGET_MARKED.png")
 
-            ref_imgs = images.squeeze()[1:]
+            ref_imgs = images.squeeze()[:-1]
             ref_concat = torch.cat([img for img in ref_imgs], dim=-1)  # shape [C, H, W*3] # save as one single image save_image(ref_concat, f"{outdir}/REFERENCE.png")
             save_image(ref_concat, f"{outdir}/REFERENCE.png")
             print(f"Saved visualization to outputs.png")
@@ -334,5 +334,7 @@ if __name__ == "__main__":
     nframe = config.unet_visualize.nframe # View length
     cond_num = config.unet_visualize.cond_num # Condition among nframe
     inference_view_range = config.unet_visualize.inference_view_range # change if you want 
-    caching_unet_attn_layers = config.unet_visualize.caching_unet_attn_layers # [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+    caching_unet_attn_layers = config.unet_visualize.caching_unet_attn_layers
+    #caching_unet_attn_layers = range(15)
+
     main(nframe, cond_num, inference_view_range, caching_unet_attn_layers, noise_timestep=noise_timestep, resume_checkpoint=config.unet_visualize.resume_checkpoint, config=config)

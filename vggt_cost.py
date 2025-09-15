@@ -126,9 +126,9 @@ def main(cfg):
         x_feat_cost = int((x_coord / 512) * H)
         query_token_idx_cost = y_feat_cost * H + x_feat_cost
         
-        query_idx = [0]
-        if cfg.cross_only: 
-            key_idx = list(range(1, cfg.nframes))
+        query_idx = [-1]
+        if config.cross_only: 
+            key_idx = list(range(cfg.nframes-1))
         else:
             key_idx = list(range(cfg.nframes))
 
@@ -178,7 +178,7 @@ def main(cfg):
             query, key = query.permute(0, 1, 3, 2), key.permute(0, 1, 3, 2)  # B Head C (FHW)
             HW = H * W
             # take target tokens → shape (1, 3, H, W)
-            query = query[:, 0, :, :HW].reshape(1, 3, H, W)
+            query = query[:, 0, :, (cfg.nframes-1) * HW:].reshape(1, 3, H, W)
             # collect reference tokens for all key_idx
             ref_imgs = []
             for idx in key_idx:
@@ -206,20 +206,18 @@ def main(cfg):
     vggt_model = vggt_model.to(device)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     for i, batch in enumerate(loader):
-        outdir = os.path.join("outputs_vggt", timestamp, f"sample{i}")
-        os.makedirs(outdir, exist_ok=True)
         
         images = batch['image'].to(device)  # B V C H W
         vggt_pred = vggt_model(images)
 
         # --- get target image ---
-        tgt_image = images.squeeze()[0]      # [C, H, W]
+        tgt_image = images.squeeze()[-1]      # [C, H, W]
 
         # --- visualize with grid before input ---
         
         if cfg.view_select:
             overlay_grid_and_save(tgt_image, spacing=64, out_path="VIS_OVERLAY.png")
-            save_image(images.squeeze()[1:], "VIS_REFERENCE.png")
+            save_image(images.squeeze()[:-1], "VIS_REFERENCE.png")
             while True:
                 answer = input("Do you want to visualize? (yes/no): ").strip().lower()
                 if answer == "yes":
@@ -252,6 +250,8 @@ def main(cfg):
             # Random selection
             x_coord = random.randint(0, 511)
             y_coord = random.randint(0, 511)
+        outdir = os.path.join("outputs_vggt", timestamp, f"sample{i}")
+        os.makedirs(outdir, exist_ok=True)
         coords = {"x": x_coord, "y": y_coord}
         json_path = os.path.join(outdir, "coords.json")
         with open(json_path, "w") as f:
@@ -260,20 +260,20 @@ def main(cfg):
         if "track_head" in cfg.mode:
             gt_query, gt_key = vggt_pred['attn_cache']['track_head']['query'], vggt_pred['attn_cache']['track_head']['key'] # torch.Size([1, 1, 2668324, 128])
             score = get_costmap(gt_query, gt_key, x_coord, y_coord, "tracking") # 32, 3*32
-            combined_img = save_image_total(images, x_coord, y_coord, score)
+            combined_img = save_image_total(images, x_coord, y_coord, score,  mode="vertical")
             combined_img.save(f"{outdir}/tracking.png")
         if "attention" in cfg.mode:
             for layer in cfg.attn_idx:
                 gt_query, gt_key = vggt_pred['attn_cache'][f'{layer}']['query'], vggt_pred['attn_cache'][f'{layer}']['key'] # torch.Size([1, 16, 5476, 64])
                 score = get_costmap(gt_query, gt_key, x_coord, y_coord, "attention") # 32, 3*32
-                combined_img = save_image_total(images, x_coord, y_coord, score)
+                combined_img = save_image_total(images, x_coord, y_coord, score, mode="vertical")
                 combined_img.save(f"{outdir}/attn{layer}.png")
         if "pointmap" in cfg.mode:
             pointmap = batch['point_map'] # [1, V, 3, 512, 512]
             gt_query = pointmap.permute(0,1,3,4,2).reshape(1, 1, -1, 3) # [1, 4, 512, 512, 3]
             gt_key = gt_query
             score = get_costmap(gt_query, gt_key, x_coord, y_coord, "pointmap") 
-            combined_img = save_image_total(images, x_coord, y_coord, score)
+            combined_img = save_image_total(images, x_coord, y_coord, score,  mode="vertical")
             combined_img.save(f"{outdir}/pointmap.png")
         
         if cfg.save_originals: 
@@ -282,9 +282,10 @@ def main(cfg):
             target_marked = torch.from_numpy(tgt_image_marked).permute(2, 0, 1).float() / 255.0
             save_image(target_marked, f"{outdir}/TARGET_MARKED.png")
 
-            ref_imgs = images.squeeze()[1:]
-            ref_concat = torch.cat([img for img in ref_imgs], dim=-1)  # shape [C, H, W*3] # save as one single image save_image(ref_concat, f"{outdir}/REFERENCE.png")
-            save_image(ref_concat, f"{outdir}/REFERENCE.png")
+            ref_imgs = images.squeeze()[:-1]
+            #ref_concat = torch.cat([img for img in ref_imgs], dim=-2)  # shape [C, H, W*3] # save as one single image save_image(ref_concat, f"{outdir}/REFERENCE.png")
+            for i, img in enumerate(ref_imgs):
+                save_image(img, f"{outdir}/REFERENCE{i}.png")
             print(f"Saved visualization to outputs.png")
         
         if i == 200: break

@@ -15,6 +15,7 @@ import einops
 import lpips
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
@@ -564,17 +565,22 @@ def main():
 
         # logit heads: input: [B, Head, Q, K]
         from src.distill_utils.attn_logit_head import LOGIT_HEAD_CLS # JIHO TODO: save/load params
-        unet_logit_head = LOGIT_HEAD_CLS[distill_config.unet_logit_head.lower()](**distill_config.unet_logit_head_kwargs)
-        vggt_logit_head = LOGIT_HEAD_CLS[distill_config.vggt_logit_head.lower()](**distill_config.vggt_logit_head_kwargs)
+        from src.distill_utils.attn_processor_cache import SDXL_ATTN_HEAD_NUM
+        unet_logit_head = nn.ModuleDict()
+        vggt_logit_head = nn.ModuleDict()
+        for unet_layer, vggt_layer in distill_pairs:
+            unet_layer_config = {"in_head_num" : SDXL_ATTN_HEAD_NUM[int(unet_layer)]}
+            unet_logit_head[str(unet_layer)] = LOGIT_HEAD_CLS[distill_config.unet_logit_head.lower()](**distill_config.unet_logit_head_kwargs, **unet_layer_config) 
+            vggt_logit_head[str(vggt_layer)] = LOGIT_HEAD_CLS[distill_config.vggt_logit_head.lower()](**distill_config.vggt_logit_head_kwargs)
+            
+        # add to unet (only single module supported in deepspeed...)
+        unet.unet_logit_head = unet_logit_head
+        unet.vggt_logit_head = vggt_logit_head
+        del vggt_logit_head, unet_logit_head
 
         # Set Attention Cache for distillation
         distill_student_unet_attn_layers = [p[0] for p in distill_pairs]
         set_attn_cache(unet, distill_student_unet_attn_layers)
-
-        # add to unet (only single module supported in deepspeed... fuk )
-        unet.vggt_logit_head = vggt_logit_head
-        unet.unet_logit_head = unet_logit_head
-        del vggt_logit_head, unet_logit_head
     else:
         distill_pairs = []
         distill_student_unet_attn_layers = []
@@ -1161,7 +1167,7 @@ def main():
                             gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx, key_idx) # B head f1HW f2HW
 
                             # 4) Prob Map
-                            pred, gt = unet.unet_logit_head(pred_attn_logit), unet.vggt_logit_head(gt_attn_logit) # [B f1HW f2HW]
+                            pred, gt = unet.unet_logit_head[str(unet_layer)](pred_attn_logit), unet.vggt_logit_head[str(vggt_layer)](gt_attn_logit) # [B f1HW f2HW]
 
                             if config.distill_config.get("consistency_check", False):
                                 assert config.distill_config.distill_query == "target", "consistency check only support distill_query to target"

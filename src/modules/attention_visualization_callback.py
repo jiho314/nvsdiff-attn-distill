@@ -11,6 +11,8 @@ import os
 import math
 import numpy as np
 import torch
+import time
+import uuid
 from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
@@ -75,9 +77,123 @@ class AttentionVisualizationCallback(PipelineCallback):
             """Kullback-Leibler divergence loss for attention probabilities."""
             return (prob_gt * (prob_gt.log() - prob.log())).sum(dim=-1).mean()
 
+        def softargmax_l2_from_prob(prob_pred, prob_gt, num_key_views: int):
+            """Compute L2 between 2D soft-argmax coordinates from probability inputs.
+
+            Simplified strict version: requires `num_key_views` (int). Assumes inputs are
+            probabilities shaped [..., Q, K] and sum to 1 along the last dim. K must equal
+            num_key_views * (kp**2) where kp is integer spatial side.
+
+            This function returns L2 computed on *pixel/index coordinates* (0..kp-1), not
+            normalized [0,1] coordinates.
+
+            Returns scalar mean L2 averaged over batch, heads, queries and key-views.
+            """
+            # last-dim K
+            K = int(prob_pred.shape[-1])
+            if K <= 0:
+                raise ValueError(f"Invalid K for softargmax_l2: K={K}")
+
+            num_k = int(num_key_views)
+            if num_k <= 0 or K % num_k != 0:
+                raise ValueError(f"num_key_views={num_k} is not a valid divisor of K={K}")
+
+            other = K // num_k
+            kp = int(round(math.sqrt(other)))
+            if kp * kp != other:
+                raise ValueError(f"Given num_key_views={num_k} does not yield a square kp for K={K}")
+
+            # reshape to [..., Q, num_k, kp, kp]
+            p_pred = prob_pred.view(*prob_pred.shape[:-1], num_k, kp, kp)
+            p_gt = prob_gt.view(*prob_gt.shape[:-1], num_k, kp, kp)
+
+            # coordinate grids in pixel/index space: 0..kp-1
+            xs = torch.arange(0, kp, device=p_pred.device, dtype=p_pred.dtype)
+            ys = torch.arange(0, kp, device=p_pred.device, dtype=p_pred.dtype)
+            # build broadcastable grids matching p_pred shape [..., num_k, kp, kp]
+            nd = p_pred.dim()
+            leading = nd - 3  # number of leading dims before (num_k, kp, kp)
+
+            # grid_x should have shape [..., num_k, 1, kp]
+            grid_x = xs
+            for _ in range(leading + 2):
+                grid_x = grid_x.unsqueeze(0)
+            grid_x = grid_x.to(device=p_pred.device, dtype=p_pred.dtype)
+            grid_x = grid_x.expand(*p_pred.shape[:-2], 1, kp)
+
+            # grid_y should have shape [..., num_k, kp, 1]
+            grid_y = ys
+            for _ in range(leading + 1):
+                grid_y = grid_y.unsqueeze(0)
+            grid_y = grid_y.unsqueeze(-1)
+            grid_y = grid_y.to(device=p_pred.device, dtype=p_pred.dtype)
+            grid_y = grid_y.expand(*p_pred.shape[:-2], kp, 1)
+
+            # expected coordinates per-key-view: [..., Q, num_k]
+            pred_x = (p_pred * grid_x).sum(dim=(-2, -1))
+            pred_y = (p_pred * grid_y).sum(dim=(-2, -1))
+            gt_x = (p_gt * grid_x).sum(dim=(-2, -1))
+            gt_y = (p_gt * grid_y).sum(dim=(-2, -1))
+
+            # stack to coords: [..., Q, num_k, 2]
+            pred_coords = torch.stack([pred_x, pred_y], dim=-1)
+            gt_coords = torch.stack([gt_x, gt_y], dim=-1)
+
+            # Euclidean distance (L2) per key-view: sqrt(sum((x-y)^2))
+            diff = pred_coords - gt_coords
+            per_view_sq = diff.pow(2).sum(dim=-1)  # squared L2 [..., Q, num_k]
+            per_view_l2 = per_view_sq.sqrt()  # Euclidean L2 [..., Q, num_k]
+
+            # average L2 over batch, heads, queries and key-views
+            loss = per_view_l2.mean()
+
+            # # Detailed runtime logging to help debug small loss values
+            # print(f"[softargmax_l2] prob_pred.shape={prob_pred.shape}, prob_gt.shape={prob_gt.shape}, K={K}, num_k={num_k}, kp={kp}")
+            # print(f"[softargmax_l2] pred_prob mean/min/max = {float(prob_pred.mean()):.6e}/{float(prob_pred.min()):.6e}/{float(prob_pred.max()):.6e}")
+            # print(f"[softargmax_l2] gt_prob   mean/min/max = {float(prob_gt.mean()):.6e}/{float(prob_gt.min()):.6e}/{float(prob_gt.max()):.6e}")
+            # # sample a few coordinates (first batch/head/query/keyview)
+            # try:
+            #     sample_pred = pred_coords.detach().cpu().numpy()
+            #     sample_gt = gt_coords.detach().cpu().numpy()
+            #     # print first few coords for first query & first key-view
+            #     print(f"[softargmax_l2] sample pred_coords[0,0,0,:5] = {sample_pred.reshape(-1, sample_pred.shape[-1])[0:5,:].tolist()}")
+            #     print(f"[softargmax_l2] sample gt_coords[0,0,0,:5]   = {sample_gt.reshape(-1, sample_gt.shape[-1])[0:5,:].tolist()}")
+            # except Exception:
+            #     pass
+            # try:
+            #     print(f"[softargmax_l2] per_view_l2 stats mean/min/max = {float(per_view_l2.mean()):.6e}/{float(per_view_l2.min()):.6e}/{float(per_view_l2.max()):.6e}")
+            # except Exception:
+            #     pass
+            # print(f"[softargmax_l2] loss = {float(loss):.6e}")
+            # # Save small visualization: overlay pred/gt heatmaps for first sample
+            
+            # save_dir = "batch_viz/"
+            # if save_dir is not None:
+            #     os.makedirs(save_dir, exist_ok=True)
+            #     # take first batch, first head, first query
+            #     p_sample = prob_pred[0, 0, :].view(num_k, kp, kp).detach().cpu().numpy()
+            #     g_sample = prob_gt[0, 0, :].view(num_k, kp, kp).detach().cpu().numpy()
+            #     # build side-by-side image per key-view
+            #     rows = []
+            #     for v in range(num_k):
+            #         p_img = (p_sample[v] - p_sample[v].min()) / (np.ptp(p_sample[v]) + 1e-8)
+            #         g_img = (g_sample[v] - g_sample[v].min()) / (np.ptp(g_sample[v]) + 1e-8)
+            #         p_rgb = (self._attn_gray_to_rgb(p_img) )
+            #         g_rgb = (self._attn_gray_to_rgb(g_img) )
+            #         row = np.concatenate([p_rgb, g_rgb], axis=1)
+            #         rows.append(row)
+            #     comp = np.concatenate(rows, axis=0)
+            #     fname = os.path.join(save_dir, f"softargmax_viz_{int(time.time())}_{uuid.uuid4().hex[:6]}.png")
+            #     _PILImage.fromarray(comp).save(fname)
+            #     print(f"[softargmax_l2] saved viz: {fname}")
+
+            return loss
+
+
         ATTN_LOSS_FN = {
             "l1": torch.nn.functional.l1_loss,
             "cross_entropy": cross_entropy,
+            "softargmax_l2": softargmax_l2_from_prob,
             "kl_divergence": kl_divergence,
         }
         # always expose mapping attribute
@@ -462,17 +578,31 @@ class AttentionVisualizationCallback(PipelineCallback):
         UNet attention을 캐시에서 가져와 VGGT attention과 비교하여 loss 계산
         """
         
-        # Support separate viz_steps and loss_steps. Empty list means "all steps".
-        viz_steps = self.visualize_config.get('viz_steps', [])
-        loss_steps = self.visualize_config.get('loss_steps', [])
+        # Support separate viz_steps and loss_steps.
+        # Semantics: `None` (not provided) => all steps; empty list [] => no steps;
+        # otherwise only steps in the list are enabled.
+        viz_steps = self.visualize_config.get('viz_steps', None)
+        loss_steps = self.visualize_config.get('loss_steps', None)
 
-        viz_enabled = (not viz_steps) or (step_index in viz_steps)
-        loss_enabled = (not loss_steps) or (step_index in loss_steps)
+        if viz_steps is None:
+            viz_enabled = True # 아예 엾으면 항상
+        elif isinstance(viz_steps, (list, tuple)) and len(viz_steps) == 0:
+            viz_enabled = False # 빈 리스트면 항상 비활성화
+        else:
+            viz_enabled = step_index in viz_steps
+
+        if loss_steps is None:
+            loss_enabled = True # 아예 없으면 항상 활성화
+        elif isinstance(loss_steps, (list, tuple)) and len(loss_steps) == 0:
+            loss_enabled = False # 빈 리스트면 항상 비활성화
+        else:
+            loss_enabled = step_index in loss_steps # 
 
         if not (viz_enabled or loss_enabled):
             print(f"Skipping attention visualization callback for step {step_index}")
             clear_attn_cache(pipeline.unet)
             return callback_kwargs
+        
         
         print(f"AttentionVisualizationCallback.__call__ invoked: step_index={step_index}, timestep={timestep}")
         print(f"do_attn_visualize: {self.do_attn_visualize}")
@@ -498,28 +628,9 @@ class AttentionVisualizationCallback(PipelineCallback):
             
             step_loss_dict = {}
             
-            
-            # Step별 데이터 저장
-            if step_loss_dict:
-                step_avg_loss = sum(step_loss_dict.values()) / len(step_loss_dict)
-                step_loss_dict[f"val/step{step_index}/avg_loss"] = step_avg_loss
-                
-                # step별 layer별 loss 저장
-                self.step_layer_losses[step_index] = {}
-                for key, loss_value in step_loss_dict.items():
-                    if key.startswith(f"val/step{step_index}/") and key != f"val/step{step_index}/avg_loss":
-                        # key에서 step 부분을 제거하여 layer_key만 추출
-                        layer_key = key.replace(f"val/step{step_index}/", "")
-                        self.step_layer_losses[step_index][layer_key] = loss_value.item()
-                
-                self.step_losses.append(step_avg_loss.item())
-                print(f"Step {step_index} avg loss: {step_avg_loss.item():.6f}")
-            
-            # 전체 loss dict에 추가
-            self.visualize_loss_dict.update(step_loss_dict)
-            
             # 각 layer pair에 대해 loss 계산
             visualize_pairs = list(self.visualize_config['pairs'])
+            
             # sort pairs so same unet_layer are consecutive -> avoids popping UNet cache early
             def _get_unet_layer(p):
                 if isinstance(p, dict):
@@ -528,6 +639,7 @@ class AttentionVisualizationCallback(PipelineCallback):
                     return p[0]
                 except Exception:
                     return None
+                
             visualize_pairs = [p for p in visualize_pairs if _get_unet_layer(p) is not None]
             visualize_pairs.sort(key=_get_unet_layer)
             print(f"Processing {len(visualize_pairs)} layer pairs (sorted): {visualize_pairs}")
@@ -620,71 +732,66 @@ class AttentionVisualizationCallback(PipelineCallback):
                 gt_query_resized = self._resize_token(gt_query, pred_query_size, F)
                 gt_key_resized = self._resize_token(gt_key, pred_key_size, F)
 
-                loss_query_idx, loss_key_idx = self._extract_loss_view_indices(F)
-                pred_attn_logit_sliced = self._slice_attention_map(pred_attn_logit, loss_query_idx, loss_key_idx, F)
-
-                pred_head = pred_attn_logit.shape[1]
-                head_gt = gt_query_resized.shape[1] if gt_query_resized.dim() == 4 else 1
-                if head_gt == 1 and pred_head > 1:
-                    gt_query_resized = gt_query_resized.expand(-1, pred_head, -1, -1).contiguous()
-                    gt_key_resized = gt_key_resized.expand(-1, pred_head, -1, -1).contiguous()
-
-                metric_name = pair_metric if pair_metric is not None else self.visualize_config.get('costmap_metric', 'neg_log_l2')
-                metric_fn = COST_METRIC_FN.get(metric_name, None)
-                if metric_fn is None:
-                    print(f"Unknown costmap metric {metric_name}, falling back to neg_log_l2")
-                    metric_fn = COST_METRIC_FN['neg_log_l2']
-                gt_attn_logit = metric_fn(gt_query_resized, gt_key_resized)
-                gt_attn_logit_sliced = self._slice_attention_map(gt_attn_logit, loss_query_idx, loss_key_idx, F)
-
-                pred_processed = pipeline.unet.unet_logit_head(pred_attn_logit_sliced)
-                gt_processed = pipeline.unet.vggt_logit_head(gt_attn_logit_sliced)
-                if pair_loss_fn_name is not None:
-                    local_loss_fn = self.ATTN_LOSS_FN.get(pair_loss_fn_name.lower(), self.loss_fn)
-                else:
-                    local_loss_fn = self.loss_fn
-                loss_value = local_loss_fn(pred_processed, gt_processed)
-
-                layer_key = f"unet{unet_layer}_vggt{vggt_layer}"
                 if loss_enabled:
+                    layer_key = f"unet{unet_layer}_vggt{vggt_layer}"
+
+                    print(f"Calculating loss for step {step_index}, layer {layer_key}")
+                    loss_query_idx, loss_key_idx = self._extract_loss_view_indices(F)
+                    pred_attn_logit_sliced = self._slice_attention_map(pred_attn_logit, loss_query_idx, loss_key_idx, F)
+
+                    pred_head = pred_attn_logit.shape[1]
+                    head_gt = gt_query_resized.shape[1] if gt_query_resized.dim() == 4 else 1
+                    if head_gt == 1 and pred_head > 1:
+                        gt_query_resized = gt_query_resized.expand(-1, pred_head, -1, -1).contiguous()
+                        gt_key_resized = gt_key_resized.expand(-1, pred_head, -1, -1).contiguous()
+
+                    metric_name = pair_metric if pair_metric is not None else self.visualize_config.get('costmap_metric', 'neg_log_l2')
+                    metric_fn = COST_METRIC_FN.get(metric_name, None)
+                    
+                    if metric_fn is None:
+                        print(f"Unknown costmap metric {metric_name}, falling back to neg_log_l2")
+                        metric_fn = COST_METRIC_FN['neg_log_l2']
+                        
+                    gt_attn_logit = metric_fn(gt_query_resized, gt_key_resized)
+                    gt_attn_logit_sliced = self._slice_attention_map(gt_attn_logit, loss_query_idx, loss_key_idx, F)
+
+                    pred_processed = pipeline.unet.unet_logit_head(pred_attn_logit_sliced)
+                    gt_processed = pipeline.unet.vggt_logit_head(gt_attn_logit_sliced)
+                    
                     if self.visualize_config.get('per_head_loss', False):
-                        try:
-                            pred_p = pred_processed.detach()
-                            gt_p = gt_processed.detach()
-                            eps = 1e-8
-                            pred_prob = pred_p.softmax(dim=-1)
-                            gt_prob = gt_p.softmax(dim=-1)
-                            per_head_raw = (-(gt_prob * (pred_prob + eps).log()).sum(dim=-1))
-                            per_head_vals = per_head_raw.mean(dim=tuple(i for i in range(per_head_raw.dim()) if i not in (1,)))
-                            for h_idx in range(per_head_vals.shape[0]):
-                                h_val = per_head_vals[h_idx]
-                                head_key = f"{layer_key}_head{h_idx}"
-                                step_loss_dict[f"val/step{step_index}/{head_key}"] = h_val
-                                print(f"Calculated loss for {head_key}: {float(h_val):.6f}")
-                                if head_key not in self.layer_losses:
-                                    self.layer_losses[head_key] = []
-                                try:
-                                    self.layer_losses[head_key].append(float(h_val))
-                                except Exception:
-                                    self.layer_losses[head_key].append(h_val.item() if hasattr(h_val, 'item') else float(h_val))
-                        except Exception as e:
-                            print(f"Per-head loss computation failed, falling back to aggregated loss: {e}")
-                            step_loss_dict[f"val/step{step_index}/{layer_key}"] = loss_value
-                            print(f"Calculated loss for {layer_key}: {loss_value.item()}")
-                            if layer_key not in self.layer_losses:
-                                self.layer_losses[layer_key] = []
-                            self.layer_losses[layer_key].append(loss_value.item())
+                        # per-head loss 계산
+                        raise NotImplementedError(f"Not implemented per-head loss")
                     else:
+                        # aggregated loss 계산
+                        # determine chosen loss name (pair override or global)
+                        chosen_fn = pair_loss_fn_name.lower()
+
+                        # If softargmax L2, prepare probability inputs and pass pair-level or global num_key_views
+                        if chosen_fn == 'softargmax_l2':
+                            pred_prob = pred_processed
+                            gt_prob = gt_processed
+                            softargmax_num_key_views = self.visualize_config.get('softargmax_num_key_views', None)
+                            # require explicit num_key_views from pair or visualize_config
+                            if softargmax_num_key_views is None:
+                                raise ValueError('softargmax_l2 requires softargmax_num_key_views set in pair or visualize_config')
+                            loss_value = self.ATTN_LOSS_FN['softargmax_l2'](pred_prob, gt_prob, softargmax_num_key_views)
+                            
+                        else:
+                            local_loss_fn = self.ATTN_LOSS_FN.get(chosen_fn, self.loss_fn)
+                            loss_value = local_loss_fn(pred_processed, gt_processed)
+                        
+
                         step_loss_dict[f"val/step{step_index}/{layer_key}"] = loss_value
                         print(f"Calculated loss for {layer_key}: {loss_value.item()}")
                         if layer_key not in self.layer_losses:
                             self.layer_losses[layer_key] = []
                         self.layer_losses[layer_key].append(loss_value.item())
-
-                viz_query_idx, viz_key_idx = self._extract_viz_view_indices(F)
-                pred_attn_logit_viz = self._slice_attention_map(pred_attn_logit, viz_query_idx, viz_key_idx, F)
-                gt_attn_logit_viz = self._slice_attention_map(gt_attn_logit, viz_query_idx, viz_key_idx, F)
+                        
                 if viz_enabled:
+                    viz_query_idx, viz_key_idx = self._extract_viz_view_indices(F)
+                    pred_attn_logit_viz = self._slice_attention_map(pred_attn_logit, viz_query_idx, viz_key_idx, F)
+                    gt_attn_logit_viz = self._slice_attention_map(gt_attn_logit, viz_query_idx, viz_key_idx, F)
+                    
                     print(f"Calling _maybe_save_attn_overlay for step {step_index}, layer {layer_key}")
                     self._maybe_save_attn_overlay(
                         step_index=step_index,
@@ -711,7 +818,30 @@ class AttentionVisualizationCallback(PipelineCallback):
                     pass
 
             # after finishing all pairs for all unet layers, free any remaining pred cache entries
-            # after finishing all pairs for all unet layers, free any remaining pred cache entries
+            # Now aggregate step-level losses collected in step_loss_dict
+            if step_loss_dict:
+                try:
+                    step_avg_loss = sum(step_loss_dict.values()) / len(step_loss_dict)
+                except Exception:
+                    # convert tensors to floats if necessary
+                    vals = [v.item() if hasattr(v, 'item') else float(v) for v in step_loss_dict.values()]
+                    step_avg_loss = sum(vals) / len(vals)
+                step_loss_dict[f"val/step{step_index}/avg_loss"] = step_avg_loss
+
+                # step별 layer별 loss 저장
+                self.step_layer_losses[step_index] = {}
+                for key, loss_value in step_loss_dict.items():
+                    if key.startswith(f"val/step{step_index}/") and key != f"val/step{step_index}/avg_loss":
+                        layer_key = key.replace(f"val/step{step_index}/", "")
+                        self.step_layer_losses[step_index][layer_key] = loss_value.item() if hasattr(loss_value, 'item') else float(loss_value)
+
+                self.step_losses.append(step_avg_loss.item() if hasattr(step_avg_loss, 'item') else float(step_avg_loss))
+                print(f"Step {step_index} avg loss: {float(step_avg_loss):.6f}")
+
+                # 전체 loss dict에 추가
+                self.visualize_loss_dict.update(step_loss_dict)
+                
+                
         except Exception as e:
             print(f"Error in attention visualization callback at step {step_index}: {e}")
             import traceback

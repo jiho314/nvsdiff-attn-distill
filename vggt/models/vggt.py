@@ -268,6 +268,27 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         elif "point_map" in self.cache_costmap_types:
             pass # already saved in batch
 
+        # for jinhyeok
+        elif "refine_track_head" in self.cache_costmap_types:
+            def make_query_points(batch_size, device="cpu"):
+                coords = torch.arange(0, 518, 16.5, device=device)  # (32,)
+                yy, xx = torch.meshgrid(coords, coords, indexing="ij")  # each (32,32)
+
+                grid = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)  # (1024, 2)
+
+                grid = grid.unsqueeze(0).repeat(batch_size, 1, 1)  # (B, 1024, 2)
+
+                return grid
+            query_points = make_query_points(B, device=images.device).to(dtype=dtype) # B HW 2
+            with torch.cuda.amp.autocast(dtype = torch.float32):
+                track_feat = self.track_head.feature_extractor(aggregated_tokens_list, images_vggt, patch_start_idx) # B S C H W
+                coord_preds, vis_e, track_feats, query_track_feat, conf_e = self.track_head.tracker(query_points=query_points, fmaps=track_feat, iters=4, return_feat=True)
+            attn_cache["track_head"] = {
+                'query': query_track_feat.unsqueeze(1), # B Head(1) HW 128
+                "key" : track_feats.unsqueeze(1) # B Head(1) S HW 128
+            }
+            import pdb; pdb.set_trace()
+
         predictions['attn_cache'] = attn_cache
 
         return predictions

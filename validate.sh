@@ -12,6 +12,6 @@ CUDA_VISIBLE_DEVICES=3 accelerate launch --mixed_precision="fp16" \
                   --tracker_project_name "nvs-vggt-distill" \
                   --seed 0 \
                   --val_path="check_points/lr1_cosine_noema" \
-                  --validation_checkpoint="checkpoint-30000" \
+                  --validation_checkpoint="checkpoint-18000" \
                   --val_cfg=2.0 \
                   --visualize_attention_maps \

@@ -2,7 +2,7 @@
 # Distill 
 distill_config:
   distill_pairs:  [
-    [2, "point_map"],
+    [2, "refine_track_head"],
   ] # student(unet)(down_blocks(6), mid_block(1), up_blocks(9)), teacher(vggt)(0~23, "track_head", "point_head")
   # unet: [64,64,32,32,16,16] [8] [16,16,16,32,32,32,64,64,64]
   distill_loss_weight: 0.02 # 0.05 per layer 
@@ -21,7 +21,7 @@ distill_config:
     pixel_threshold: 1.5
 
 # vggt
-vggt_on_fly : false
+vggt_on_fly : true
 use_vggt_camera : false
 
 nframe: 4

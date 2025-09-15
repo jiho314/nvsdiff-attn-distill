@@ -295,9 +295,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
     cond_num = config.fix_cond_num
 
     # visualize_loss_fn 초기화 (validation loop 전에 정의)
-    visualize_loss_fn = None
-    if do_attn_visualize and visualize_config is not None:        
-        visualize_loss_fn = ATTN_LOSS_FN[visualize_config['loss_fn'].lower()]
+    # Note: loss_fn is selected per-pair in the callback; do not assume a global loss_fn here.
 
     # Match train.py: use torch.autocast with explicit dtype
     with torch.no_grad(), torch.autocast("cuda", dtype=weight_dtype):
@@ -326,10 +324,9 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
             tag, sequence_name, depth = None, None , None
             # attention visualization callback 설정
             attention_callback = None
-            if do_attn_visualize and visualize_loss_fn is not None:
+            if do_attn_visualize:
                 # visualize_config 간소화
                 visualize_config_with_fn = visualize_config.copy()
-                visualize_config_with_fn['loss_fn'] = visualize_loss_fn
                 visualize_config_with_fn['viz_log_wandb'] = True
                 
                 # 시퀀스 이름 설정
@@ -762,15 +759,13 @@ def main():
     ## Seonghu TODO: 임시 visualize config
     visualize_config = {
         'timestep_interval': 1,
-        'loss_fn': "cross_entropy",
-        'loss_weight': 1.0,
         
         # 'vggt_layer': "track_head",
         'vggt_layer': "point_map",
-        'costmap_metric': 'neg_log_l2',
+        # 'costmap_metric': 'neg_log_l2',
 
         'vggt_logit_head': "softmax_headmean",
-        'vggt_logit_head_kwargs': {"softmax_temp": 8.0},
+        'vggt_logit_head_kwargs': {"softmax_temp": 0.01},
         'unet_logit_head': "softmax_headmean",
         'unet_logit_head_kwargs': {"softmax_temp": 1.0},
         # 'costmap_metric': 'dot_product',
@@ -782,9 +777,11 @@ def main():
         'viz_query': "target",       # 시각화 시 사용할 query
         'viz_key': "all",            # 시각화 시 사용할 key (self attention 포함)
         'student_unet_attn_layers': list((2,4,6,8,10,12)),
+        
+        
         # 시각화 설정 추가
         # 빈 리스트 = 모든 스텝에서 시각화/로그, 아니면 명시된 스텝만 처리
-        'viz_steps': [0],  # visualization (images) 저장/생성 스텝
+        'viz_steps': [],  # visualization (images) 저장/생성 스텝
         'loss_steps': [0, 10, 20, 30, 40],                 # loss 계산/수집에 사용할 스텝 (빈 리스트 = 모든 스텝)
         # per_head_loss: if True, compute loss per attention head and log each head separately
         'per_head_loss': False,
@@ -794,8 +791,9 @@ def main():
         'viz_query_index': 150,  # None이면 랜덤 선택
         # pairs: list of dicts defining per-pair settings
         # format: {'unet_layer': int, 'vggt_layer': str_or_int, 'costmap_metric': str, 'loss_fn': str}
+        "softargmax_num_key_views": 2,
         'pairs': [
-            {'unet_layer': l, 'vggt_layer': 'point_map', 'costmap_metric': 'neg_log_l2', 'loss_fn': 'cross_entropy'}
+            {'unet_layer': l, 'vggt_layer': 'point_map', 'costmap_metric': 'inverse_l2', 'loss_fn': 'cross_entropy'}
             for l in (2, 4, 6, 8, 10, 12)
         ] + [
             {'unet_layer': l, 'vggt_layer': 'track_head', 'costmap_metric': 'dot_product', 'loss_fn': 'cross_entropy'}

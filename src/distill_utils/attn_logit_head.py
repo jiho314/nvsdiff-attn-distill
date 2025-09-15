@@ -4,49 +4,82 @@ import torch.nn as nn
 '''
 x = [B, Head, Q, K]
 '''
+def build_mlp(in_dim, out_dim, mlp_ratio=4.0, depth=1):
+    if depth <= 0:
+        mlp = [nn.Linear(in_dim, out_dim)]
+    else:
+        mid_dim = int(in_dim * mlp_ratio)
+        mlp += [nn.Linear(in_dim, mid_dim), nn.GELU()]
+        for _ in range(depth - 1):
+            mlp += [nn.Linear(mid_dim, mid_dim), nn.GELU()]
+        mlp += [nn.Linear(mid_dim, out_dim)]
+    return nn.Sequential(*mlp)
 
 class Identity(nn.Module):
     def __init__(self, **kwargs):
         super(Identity, self).__init__()
     def forward(self, x):
         return x
+    
 class Softmax(nn.Module):
-    def __init__(self, softmax_temp=1.0, **kwargs):
+    def __init__(self, softmax_temp=1.0, learnable_temp = False, **kwargs):
         super(Softmax, self).__init__()
         self.softmax_temp = softmax_temp
+        if learnable_temp:
+            self.softmax_temp = nn.Parameter(torch.tensor(softmax_temp))
 
     def forward(self, x):
         x = x / self.softmax_temp
         return x.softmax(dim=-1)
 
-class Softmax_HeadMean(nn.Module):
-    def __init__(self, softmax_temp=1.0, **kwargs):
-        super(Softmax_HeadMean, self).__init__()
-        self.softmax_temp = softmax_temp
-
-    def forward(self, x):
-        x = x / self.softmax_temp
-        return x.softmax(dim=-1).mean(dim=1)
-
-
-class Softmax_HeadMlp(nn.Module):
-    def __init__(self, in_head_num = 24, 
-                 out_head_num = 16, depth = 1,
-                 softmax_temp=1.0, **kwargs):
-        super(Softmax_HeadMlp, self).__init__()
-        self.softmax_temp = softmax_temp
-        mlp = []
-        for _ in range(depth - 1):
-            mlp.append(nn.Linear(in_head_num, in_head_num))
-            mlp.append(nn.ReLU())
-        mlp.append(nn.Linear(in_head_num, out_head_num))
-        self.mlp = nn.Sequential(*mlp)
-
-    # TODO: Pass query and key (or q @ k) to MLP, then compute attention probs
+class Softmax_HeadMean(Softmax):
     def forward(self, x):
         x = x / self.softmax_temp
         x = x.softmax(dim=-1)
-        x = self.mlp(x)
+        return x.mean(dim=1, keepdim=True)
+
+
+class Softmax_HeadMlp(Softmax):
+    def __init__(self, 
+                 in_head_num = 24, out_head_num = 1,
+                 mlp_ratio = 4.0, depth = 1,
+                 softmax_temp=1.0, learnable_temp = False, **kwargs):
+        super(Softmax_HeadMlp, self).__init__(softmax_temp, learnable_temp, **kwargs)
+        self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, depth)
+
+    def forward(self, x):
+        x = x / self.softmax_temp
+        x = x.softmax(dim=-1)
+        x = x.permute(0,2,3,1) # B Q K Head
+        x = self.mlp(x).permute(0,3,1,2) # B Out_head Q K
+        return x
+
+class HeadMlp_Softmax(Softmax):
+    def __init__(self, 
+                 in_head_num = 24, out_head_num = 1,
+                 mlp_ratio = 4.0, depth = 1,
+                 softmax_temp=1.0, learnable_temp = False, **kwargs):
+        super(HeadMlp_Softmax, self).__init__(softmax_temp, learnable_temp, **kwargs)
+        self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, depth)
+
+    def forward(self, x):
+        x = x.permute(0,2,3,1) # B Q K Head
+        x = self.mlp(x).permute(0,3,1,2) # B Out_head Q K
+        x = x / self.softmax_temp
+        x = x.softmax(dim=-1)
+        return x
+
+class HeadMlp(nn.Module):
+    def __init__(self, 
+                 in_head_num = 24, out_head_num = 16,
+                 mlp_ratio = 4.0, depth = 1,
+                 **kwargs):
+        super(HeadMlp, self).__init__(**kwargs)
+        self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, depth)
+
+    def forward(self, x):
+        x = x.permute(0,2,3,1) # B Q K Head
+        x = self.mlp(x).permute(0,3,1,2) # B Out_head Q K
         return x
 
 # class Ref_Softmax_HeadMean(nn.Module):
@@ -71,7 +104,8 @@ LOGIT_HEAD_CLS = {
     "softmax": Softmax,
     "softmax_headmean": Softmax_HeadMean,
     "softmax_headmlp": Softmax_HeadMlp,
-    # "ref_softmax_headmean": Ref_Softmax_HeadMean,
+    "headmlp_softmax": HeadMlp_Softmax,
+    "headmlp": HeadMlp,
 }
 
 def cycle_consistency_checker(costmap, pixel_threshold=None):

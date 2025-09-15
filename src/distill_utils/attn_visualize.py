@@ -24,6 +24,35 @@ def ho(attnmap, query_coord, ):
 
     return attnmap
 
+def stitch_all_vertically(images: List[Image.Image], padding: int = 0, bg_color: tuple = (0, 0, 0)):
+    """
+    Stitches a list of PIL Images vertically (one below the other).
+
+    Args:
+        images (List[PIL.Image]): A list of images to stitch.
+        padding (int): Pixels of space between images.
+        bg_color (tuple): Background color (R, G, B) for the canvas.
+
+    Returns:
+        PIL.Image: The stitched vertical image.
+    """
+    # Total height = sum of all image heights + padding between them
+    total_height = sum(img.height for img in images) + padding * (len(images) - 1)
+    # Width = max width among all images
+    max_width = max(img.width for img in images)
+
+    # Create blank canvas
+    canvas = Image.new("RGB", (max_width, total_height), color=bg_color)
+
+    # Paste images one below another
+    y_offset = 0
+    for img in images:
+        x_offset = (max_width - img.width) // 2  # center horizontally
+        canvas.paste(img, (x_offset, y_offset))
+        y_offset += img.height + padding
+
+    return canvas
+
 
 def stitch_side_by_side_whole(images: List[Image.Image], padding: int = 0, bg_color: tuple = (0, 0, 0)):
     """
@@ -124,7 +153,7 @@ def mark_point_on_img(tgt_img, x, y, radius=6):
 
     return img
 
-def save_image_total(images, x_coord, y_coord, score):
+def save_image_total(images, x_coord, y_coord, score, mode=None):
     """
     images: torch.Tensor [B, V, 3, 512, 512], values in [0,1] or None
     x, y: int coordinates to mark (0–511)
@@ -137,7 +166,7 @@ def save_image_total(images, x_coord, y_coord, score):
 
     # Target image with marked point
     if images is not None: 
-        tgt_image = images[0]
+        tgt_image = images[-1]
         tgt_image = mark_point_on_img(tgt_image, x_coord, y_coord)
         vis_list.append(Image.fromarray(tgt_image))
 
@@ -146,23 +175,33 @@ def save_image_total(images, x_coord, y_coord, score):
     V_score = int(VfHW/fHW)
 
     if V_images != V_score: # cross_only
-        ref_image = images[1:]
+        ref_image = images[:-1]
     else:
         ref_image = images
     background = []
     HW, VHW = score.shape
     V = int(VHW/HW)
-
-    for i in range(V):
-        background_elem = ref_image[i].squeeze().permute(1,2,0).cpu().detach()
-        background.append(background_elem)
-    background = torch.stack(background, dim=1).reshape(512, -1, 3).numpy()
-    background = np.clip(background * 255.0, 0, 255).astype(np.uint8)
+    if mode == "vertical":
+        for i in range(V):
+            background_elem = ref_image[i].squeeze().permute(1,2,0).cpu().detach()
+            background.append(background_elem)
+        import pdb; pdb.set_trace()
+        background = torch.stack(background, dim=0).reshape(-1, 512, 3).numpy()
+        background = np.clip(background * 255.0, 0, 255).astype(np.uint8)
+    else:
+        for i in range(V):
+            background_elem = ref_image[i].squeeze().permute(1,2,0).cpu().detach()
+            background.append(background_elem)
+        background = torch.stack(background, dim=1).reshape(512, -1, 3).numpy()
+        background = np.clip(background * 255.0, 0, 255).astype(np.uint8)
 
     attn_heatmap_img = get_attn_map_whole(score, background)
     vis_list.append(Image.fromarray(attn_heatmap_img.astype(np.uint8)))
-
-    combined_img = stitch_side_by_side_whole(vis_list)
+    
+    if mode == "vertical":
+        combined_img = stitch_all_vertically(vis_list)
+    else: 
+        combined_img = stitch_side_by_side_whole(vis_list)
     return combined_img
 
 def overlay_grid_and_save(img_tensor: torch.Tensor, spacing=64, out_path="grid_overlay.png"):
