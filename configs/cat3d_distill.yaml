@@ -1,29 +1,47 @@
 
 # Distill 
-# feasibility
-# batch=8, tgt/ref=1/3, (2, track_head) : 42GB
-# batch=4, tgt/ref=1/3, (2, track_head) : 35GB
-
 distill_config:
   distill_pairs:  [
-    [2, "track_head"],
+    [2, "point_map"],
+    [4, "point_map"],
+    [6, "point_map"],
+    [8, "point_map"],
+    [10, "point_map"],
   ] # student(unet)(down_blocks(6), mid_block(1), up_blocks(9)), teacher(vggt)(0~23, "track_head", "point_head")
   # unet: [64,64,32,32,16,16] [8] [16,16,16,32,32,32,64,64,64]
-  distill_loss_weight: 0.05 # 0.05 per layer 
+  distill_loss_weight: 0.02 # 0.05 per layer 
   distill_loss_fn: "cross_entropy"  # "cross_entropy", "l1", ...
   vggt_logit_head: "softmax_headmean"  # "softmax_headmean", "identity", "softmax_headmlp"
-  vggt_logit_head_kwargs: {"softmax_temp": 8.0}
+  vggt_logit_head_kwargs: {"softmax_temp": 1.0}
   unet_logit_head: "softmax_headmean"  # "softmax_headmean", "identity", "softmax_headmlp"
   unet_logit_head_kwargs: {"softmax_temp": 1.0} 
 
   distill_query: "target" # "target", "all"
   distill_key: "reference" # "reference", "all", (TODO: "cross")
+  cost_metric: "neg_log_l2" # "dot_product", "neg_l2", "neg_log_le", "inverse_l2"
 
-vggt_on_fly : true
+  consistency_check: True
+  consistency_check_cfg:
+    pixel_threshold: 1.5
+
+# vggt
+vggt_on_fly : false
 use_vggt_camera : false
 
-# pretrained_model_name_or_path: "./check_points/models--stabilityai--stable-diffusion-2-1-base/snapshots/5ede9e4bf3e3fd1cb0ef2f7a3fff13ee514fdf06"
-pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1"
+nframe: 4
+fix_cond_num: null
+min_cond_num: 2
+max_cond_num: 3
+
+
+train_batch_size: 4 # Batch size (per device) for the training dataloader，必须是n_frames_per_seq的倍数
+shuffle_train_rate: 0.5 # the rate to shuffle frames in training dataset
+
+train_timestep_schedule: "uniform" # "uniform" or "gaussian"
+train_timestep_schedule_config:
+  # mean: 1000
+  # std: 200
+
 
 wds_dataset_config:
   url_paths: [ "/mnt/data1/minseop/realestate_wds"  ] # "/mnt/data2/minseop/realestate_train_wds" 
@@ -35,9 +53,12 @@ wds_dataset_config:
   process_kwargs:
     get_square_extrinsic: true
 
-# eval: 20 -> 3 min
+# eval: 20 -> 6 min / 4gpu = 1.5min
+val_nframe: 3
+val_cond_num: 2
 val_compute_fid: false
 val_viz_len: 30
+
 val_wds_dataset_config:
   url_paths: [ "/mnt/data2/minseop/realestate_train_wds"  ] 
   dataset_length: 20
@@ -47,15 +68,16 @@ val_wds_dataset_config:
   max_view_range: 8
   process_kwargs:
     get_square_extrinsic: true
+    
 
-# dynamic_sampling: True
+# test_dataset_cls: build_re10k_wds # build_re10k_wds lvsm_dataset
+# test_dataset_config:
 
-gaussian_timestep_sampling: True
-gaussian_timestep_mean: 1000
-gaussian_timestep_std: 300  
 
-nframe: 4
-train_batch_size: 4 # Batch size (per device) for the training dataloader，必须是n_frames_per_seq的倍数
+
+# pretrained_model_name_or_path: "./check_points/models--stabilityai--stable-diffusion-2-1-base/snapshots/5ede9e4bf3e3fd1cb0ef2f7a3fff13ee514fdf06"
+pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1"
+
 
 image_size: 512
 gradient_accumulation_steps: 1 # Number of updates steps to accumulate before performing a backward/update pass.
@@ -65,7 +87,7 @@ dataloader_num_workers: 8
 max_train_steps: 350000 # Total number of training steps to perform.  If provided, overrides num_train_epochs.
 num_train_epochs: 1500
 checkpointing_steps: 2000 # Save a checkpoint of the training state every X updates.
-checkpoints_total_limit: 5 # -1
+checkpoints_total_limit: -1 # -1
 validation_epochs: 10 # Run validation every X epochs.
 
 # The prediction_type that shall be used for training. Choose between 'epsilon' or 'v_prediction' or leave `None`.
@@ -95,15 +117,11 @@ tag_dict: { # jiho TODO: 이게 뭐여
 match_scheduler: False
 max_overlap: 0.75
 
-# sort_train_rate: 0.5 # the rate to train models with sorted frames (the farthest frame would be more challenging)
-shuffle_train_rate: 0.5 # the rate to shuffle frames in training dataset
-# fix_cond_num: null
-fix_cond_num: 3
-max_cond_num: 3
+
 multi_scale: null # Not Used(only used for data sampler)
 
 # camera params
-camera_longest_side: null # null, 5.0 # TODO
+# camera_longest_side: null # null, 5.0 # not used
 normalize_extrinsic: True
 normalize_t: False # it should be false, if camera_longest_side is not None
 fourier_embedding: False
@@ -133,10 +151,10 @@ model_cfg:
   num_class_embeds: 3
 
 opt_cfg:
-  learning_rate: 5.0e-5 # 5.0e-5 # Initial learning rate (after the potential warmup period) to use.
+  learning_rate: 2.5e-5 # 5.0e-5 # Initial learning rate (after the potential warmup period) to use.
+  scale_lr_base_batch_size: 128 # include frame num(8 scenes *16gpus (64=8scenes x 8frames))
   scale_lr: False # Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.
-  # lr_scheduler: "constant_with_warmup" # ["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
-  lr_scheduler: "constant_with_warmup"
+  lr_scheduler: "constant_with_warmup" # ["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
   lr_warmup_steps: 500 # Number of steps for the warmup in the lr scheduler.
   snr_gamma: null # 'None' means constant 1. SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0.
   use_8bit_adam: False
@@ -146,3 +164,6 @@ opt_cfg:
   adam_weight_decay: 0.01
   adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
+
+
+

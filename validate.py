@@ -522,10 +522,24 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                 if attention_loss_data:
                     log_data.update(attention_loss_data)
                 
-                # attention 이미지들이 있으면 추가
+                # attention 이미지들이 있으면 추가 (callback에서 키에 step 포함됨)
                 if attention_images_data:
                     for key, img_data in attention_images_data.items():
                         log_data[key] = wandb.Image(img_data['image'], caption=img_data['caption'])
+
+                # callback의 step-level loss들도 wandb에 업로드
+                if do_attn_visualize and attention_callback is not None:
+                    loss_dict = attention_callback.get_loss_dict()
+                    for loss_key, loss_val in loss_dict.items():
+                        # loss_val may be a tensor; coerce to float for logging
+                        try:
+                            if hasattr(loss_val, 'item'):
+                                log_data[loss_key] = float(loss_val.item())
+                            else:
+                                log_data[loss_key] = float(loss_val)
+                        except Exception:
+                            # fallback: store as-is if conversion fails
+                            log_data[loss_key] = loss_val
                 
                 print(f"[DEBUG] log_data keys: {list(log_data.keys())}")
                 # 모든 데이터를 한 번에 로깅
@@ -745,21 +759,94 @@ def main():
                                                 ignore_mismatched_sizes=True)
     unet.train()
 
+    ## Seonghu TODO: 임시 visualize config
+    visualize_config = {
+        'timestep_interval': 1,
+        'loss_fn': "cross_entropy",
+        'loss_weight': 1.0,
+        
+        # 'vggt_layer': "track_head",
+        'vggt_layer': "point_map",
+        'costmap_metric': 'neg_log_l2',
+
+        'vggt_logit_head': "softmax_headmean",
+        'vggt_logit_head_kwargs': {"softmax_temp": 8.0},
+        'unet_logit_head': "softmax_headmean",
+        'unet_logit_head_kwargs': {"softmax_temp": 1.0},
+        # 'costmap_metric': 'dot_product',
+        
+        # Loss 계산용 설정 (train과 동일하게)
+        'loss_query': "target",      # loss 계산 시 사용할 query
+        'loss_key': "reference",     # loss 계산 시 사용할 key
+        # Visualization용 설정 (시각화에서만 사용)
+        'viz_query': "target",       # 시각화 시 사용할 query
+        'viz_key': "all",            # 시각화 시 사용할 key (self attention 포함)
+        'student_unet_attn_layers': list((2,4,6,8,10,12)),
+        # 시각화 설정 추가
+        # 빈 리스트 = 모든 스텝에서 시각화/로그, 아니면 명시된 스텝만 처리
+        'viz_steps': [0],  # visualization (images) 저장/생성 스텝
+        'loss_steps': [0, 10, 20, 30, 40],                 # loss 계산/수집에 사용할 스텝 (빈 리스트 = 모든 스텝)
+        # per_head_loss: if True, compute loss per attention head and log each head separately
+        'per_head_loss': False,
+        'viz_log_wandb': True,
+        'viz_alpha': 0.6,
+        'viz_query_xy': None,  # None이면 랜덤 선택
+        'viz_query_index': 150,  # None이면 랜덤 선택
+        # pairs: list of dicts defining per-pair settings
+        # format: {'unet_layer': int, 'vggt_layer': str_or_int, 'costmap_metric': str, 'loss_fn': str}
+        'pairs': [
+            {'unet_layer': l, 'vggt_layer': 'point_map', 'costmap_metric': 'neg_log_l2', 'loss_fn': 'cross_entropy'}
+            for l in (2, 4, 6, 8, 10, 12)
+        ] + [
+            {'unet_layer': l, 'vggt_layer': 'track_head', 'costmap_metric': 'dot_product', 'loss_fn': 'cross_entropy'}
+            for l in (2, 4, 6, 8, 10, 12)
+        ],
+    }
+    # costmap metric 설정: 'neg_log_l2', 'neg_l2', 'inverse_l2', 'dot_product'
+    vggt_layer = visualize_config.get('vggt_layer', None)
     do_attn_visualize = args.visualize_attention_maps
     if do_attn_visualize:
-        if hasattr(config, "distill_config"):
-            vggt_visualize_config = {
-                "cache_attn_layer_ids": list(set([p[1] for p in config.distill_config.distill_pairs if isinstance(p[1], int)])),
-                "cache_costmap_types": list(set([p[1] for p in config.distill_config.distill_pairs if isinstance(p[1], str)]))
-            }
-        else:
-            ## seonghu TODO: default vggt layer; track head
-            print("WARNING: No vggt layer provided for visualize_attention_maps. Defaulting to track head")
-            vggt_visualize_config = {
-                "cache_attn_layer_ids": [],
-                "cache_costmap_types": ["track_head"]
-            }
+        # if hasattr(config, "distill_config"):
+        #     vggt_visualize_config = {
+        #         "cache_attn_layer_ids": list(set([p[1] for p in config.distill_config.distill_pairs if isinstance(p[1], int)])),
+        #         "cache_costmap_types": list(set([p[1] for p in config.distill_config.distill_pairs if isinstance(p[1], str)]))
+        #     }
+        # else:
+        #     ## seonghu TODO: default vggt layer; track head
+        #     print("WARNING: No vggt layer provided for visualize_attention_maps. Defaulting to track head")
+        #     vggt_visualize_config = {
+        #         "cache_attn_layer_ids": [],
+        #         "cache_costmap_types": ["track_head"]
+        #     }
         from vggt.models.vggt import VGGT
+        
+        # derive cache_costmap_types from visualize_config['pairs'] (support dict entries)
+        pairs_list = visualize_config.get('pairs', [])
+        cache_costmap_types = []
+        for p in pairs_list:
+            if isinstance(p, dict):
+                vt = p.get('vggt_layer', None)
+            else:
+                try:
+                    _, vt = p
+                except Exception:
+                    vt = None
+            if vt is not None:
+                if vt not in cache_costmap_types:
+                    cache_costmap_types.append(vt)
+        if not cache_costmap_types:
+            # fallback to single vggt_layer if provided, otherwise to track_head
+            if vggt_layer is not None:
+                cache_costmap_types = [vggt_layer]
+            else:
+                cache_costmap_types = ["track_head"]
+
+        print(f"vggt caching costmap types: {cache_costmap_types}")
+        vggt_visualize_config = {
+            "cache_attn_layer_ids": [],
+            "cache_costmap_types": cache_costmap_types
+        }
+
         # with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
         # Keep VGGT in full precision here; mixed dtypes caused xformers attention to fail
         # (query/key/value dtype mismatch). We rely on later `.to(device, dtype=weight_dtype)`
@@ -772,44 +859,28 @@ def main():
         vggt_model = None
         assert not config.get("use_vggt_camera", False), "use_vggt_camera is only available when vggt_on_fly is set"
 
-    ## Seonghu TODO: 임시 visualize config
-    visualize_config = {
-        'timestep_interval': 1,
-        'loss_fn': "cross_entropy",
-        'loss_weight': 1.0,
-        'vggt_logit_head': "softmax_headmean",
-        'vggt_logit_head_kwargs': {"softmax_temp": 8.0},
-        'unet_logit_head': "softmax_headmean",
-        'unet_logit_head_kwargs': {"softmax_temp": 1.0},
-        # Loss 계산용 설정 (train과 동일하게)
-        'loss_query': "target",      # loss 계산 시 사용할 query
-        'loss_key': "reference",     # loss 계산 시 사용할 key
-        # Visualization용 설정 (시각화에서만 사용)
-        'viz_query': "target",       # 시각화 시 사용할 query
-        'viz_key': "all",            # 시각화 시 사용할 key (self attention 포함)
-        'student_unet_attn_layers': list((0,2,4,6,8,11,14)),
-        # 시각화 설정 추가
-        'viz_steps': [40],  # 빈 리스트 = 모든 스텝에서 시각화, step idx (1-50) 기준
-        'viz_log_wandb': True,
-        'viz_alpha': 0.6,
-        'viz_query_xy': None,  # None이면 랜덤 선택
-        'viz_query_index': 150,  # None이면 랜덤 선택
-    }
-    visualize_config['pairs'] = [(unet_layer, "track_head") for unet_layer in visualize_config['student_unet_attn_layers']]
     
+    # Save attention maps to a separate directory sibling to `args.val_path` (not inside `val/`)
+    if args.val_path:
+        attn_root = os.path.join(os.path.dirname(args.val_path), "attn_maps")
+    else:
+        attn_root = os.path.join(os.getcwd(), "attn_maps")
+    visualize_config['viz_save_dir'] = attn_root
+    # visualize_config['pairs'] is directly used (can be list of dicts)
     ## =====================================
     
     if do_attn_visualize:
         # logit heads: input: [B, Head, Q, K]
         unet_logit_head = LOGIT_HEAD_CLS[visualize_config['unet_logit_head'].lower()](**visualize_config['unet_logit_head_kwargs'])
         vggt_logit_head = LOGIT_HEAD_CLS[visualize_config['vggt_logit_head'].lower()](**visualize_config['vggt_logit_head_kwargs'])
+        vggt_layer = visualize_config['vggt_layer']
 
         # Set Attention Cache for distillation
         ## TODO Seonghu : check max layer number
         visualize_student_unet_attn_layers = visualize_config['student_unet_attn_layers']
         print(f"Number of unet attention layers: {len(list(unet.attn_processors.keys()))}")
         set_attn_cache(unet, visualize_student_unet_attn_layers)
-
+    
         # add to unet (only single module supported in deepspeed... fuk )
         unet.vggt_logit_head = vggt_logit_head
         unet.unet_logit_head = unet_logit_head

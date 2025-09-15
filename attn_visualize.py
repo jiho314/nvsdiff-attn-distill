@@ -23,6 +23,8 @@ from omegaconf import OmegaConf
 from torchvision.utils import save_image
 from datetime import datetime
 import json
+import torchvision.transforms as T
+from src.distill_utils.attn_visualize import mark_point_on_img, save_image_total, overlay_grid_and_save
 
 
 # dataloader_workers: 16
@@ -51,7 +53,7 @@ def main(nframe, cond_num, inference_view_range,
     # args, _, cfg = parse_args()
 
     set_seed(0)
-    device= f"cuda:{rank}"
+    device= f"cuda"
     # 1) model
     vae = AutoencoderKL.from_pretrained(f"{config.pretrained_model_name_or_path}", subfolder="vae").to(device)
     unet = UNet2DConditionModel.from_pretrained(config.pretrained_model_name_or_path,
@@ -128,74 +130,13 @@ def main(nframe, cond_num, inference_view_range,
     
     def slice_attnmap(attnmap, query_idx, key_idx):
         B, Head, Q, K = attnmap.shape
-        F = 4 # warn: hardcoding
+        F = nframe
         HW = Q // F
         attnmap = einops.rearrange(attnmap, 'B Head (F1 HW1) (F2 HW2) -> B Head F1 HW1 F2 HW2', B=B, Head=Head, F1=F, HW1=HW, F2=F, HW2=HW)
         attnmap = attnmap[:, :, query_idx][:, :, :, :, key_idx]
         attnmap = einops.rearrange(attnmap, 'B Head f1 HW1 f2 HW2 -> B Head (f1 HW1) (f2 HW2)', B=B, Head=Head, f1=len(query_idx), f2=len(key_idx), HW1=HW, HW2=HW)
         return attnmap
     
-    def overlay_grid_and_save(img_tensor: torch.Tensor, spacing=64, out_path="grid_overlay.png"):
-        """
-        Overlays a grid every `spacing` pixels, but only labels the
-        x-axis at the top edge and the y-axis at the left edge,
-        with labels in black. The image is shown without flipping.
-        
-        img_tensor: [H, W] or [C, H, W]
-        """
-        # 1. Convert to H×W or H×W×C numpy
-        if img_tensor.ndim == 3:
-            img = img_tensor.permute(1, 2, 0).cpu().numpy()
-        elif img_tensor.ndim == 2:
-            img = img_tensor.cpu().numpy()
-        else:
-            raise ValueError(f"Unsupported shape {img_tensor.shape}")
-
-        H, W = img.shape[:2]
-        xs = np.arange(0, W, spacing)
-        ys = np.arange(0, H, spacing)
-
-        # 2. Plot
-        fig, ax = plt.subplots()
-        ax.imshow(img, cmap=None if img.ndim == 3 else "gray", origin="upper")
-        # — no ax.invert_xaxis(), so image is not flipped
-
-        # 3. Draw grid lines
-        for y in ys:
-            ax.axhline(y, color="white", linewidth=0.8)
-        for x in xs:
-            ax.axvline(x, color="white", linewidth=0.8)
-
-        # 4. Set ticks at grid lines
-        ax.set_xticks(xs)
-        ax.set_yticks(ys)
-
-        # 5. Label ticks in black
-        ax.set_xticklabels([str(x) for x in xs], color="black", fontsize=8)
-        ax.set_yticklabels([str(y) for y in ys], color="black", fontsize=8)
-
-        # 6. Show x labels on top only, y labels on left only
-        ax.tick_params(
-            axis='x', which='both',
-            labelbottom=False,
-            labeltop=True,
-            bottom=False, top=False
-        )
-        ax.tick_params(
-            axis='y', which='both',
-            labelleft=True,
-            labelright=False,
-            left=False, right=False
-        )
-
-        # 7. Remove frame lines
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=300)
-        plt.close(fig)
-
     # 3) Model Inference
     def unet_inference(batch):
         # batch: always order by seq idx
@@ -268,7 +209,8 @@ def main(nframe, cond_num, inference_view_range,
 
     # minkyung TODO: 여러 idx에 대해서 viz
     for idx, batch in enumerate(val_dataloader):
-        outdir = os.path.join("outputs", timestamp, f"sample{idx}")
+        ckpt_name = os.path.basename(resume_checkpoint)
+        outdir = os.path.join("outputs_unet_attn", timestamp, ckpt_name, f"{noise_timestep}", f"sample{idx}")
         os.makedirs(outdir, exist_ok=True)
         
         images = batch['image'].to(device)  # B V C H W
@@ -276,7 +218,7 @@ def main(nframe, cond_num, inference_view_range,
 
         # --- visualize with grid before input ---
         
-        if cfg.view_select:
+        if config.unet_visualize.view_select:
             overlay_grid_and_save(tgt_image, spacing=64, out_path="VIS_OVERLAY.png")
             save_image(images.squeeze()[1:], "VIS_REFERENCE.png")
             while True:
@@ -295,8 +237,8 @@ def main(nframe, cond_num, inference_view_range,
             if counter_out:
                 continue
         
-        if cfg.coord_select:
-            if cfg.view_select is False:
+        if config.unet_visualize.coord_select:
+            if config.unet_visualize.view_select is False:
                 overlay_grid_and_save(tgt_image, spacing=64, out_path="VIS_OVERLAY.png")
                 save_image(images.squeeze()[1:], "VIS_REFERENCE.png")
             # Ask user for coordinates
@@ -323,18 +265,59 @@ def main(nframe, cond_num, inference_view_range,
         ''' unet_attn_cache(dict): {layer_id(str): attnmap tensor(B, head, Q(VHW), K(VHW)}
         '''
         for unet_layer in caching_unet_attn_layers:
-            unet_attn_logit = unet_attn_cache[str(unet_layer)] # B Head VHW VHW
-            unet_attn_logit = slice_attnmap(unet_attn_logit, query_idx=[0], key_idx=[1,2,3])
-            pred_query_size, pred_key_size = 32, 32
-            import pdb; pdb.set_trace()
-            # Convert pixel coords -> feature map index
-            y_feat_cost = int((y_coord / 512) * pred_query_size)
-            x_feat_cost = int((x_coord / 512) * pred_query_size)
-            query_token_idx_cost = y_feat_cost * pred_query_size + x_feat_cost
-            attn_maps = unet_attn_logit.mean(dim=1) # average over head
-            attn_maps = attn_maps.squeeze()
-            all_scores = torch.softmax(attn_maps[query_token_idx_cost] / 8, dim=-1)
-            import pdb ; pdb.set_trace()
+            unet_attn_logit = unet_attn_cache[str(unet_layer)] # [B, H, Q, K]
+            B, H, Q, K = unet_attn_logit.shape
+            if B == 3 : # self attention
+                query_size = int(math.sqrt(Q))
+                # Convert pixel coords -> feature map index
+                y_feat_cost = int((y_coord / 512) * query_size)
+                x_feat_cost = int((x_coord / 512) * query_size)
+                query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
+                attn_maps = unet_attn_logit.mean(dim=1) # [3, Q, K]
+                all_scores = torch.softmax(attn_maps[:, query_token_idx_cost], dim=-1)
+                score1 = all_scores[1].reshape(query_size, query_size)
+                score2 = all_scores[2].reshape(query_size, query_size)
+                score = torch.cat([score1, score2], dim=-1)
+            else: 
+                query_idx = [0]
+                if config.unet_visualize.cross_only: 
+                    key_idx = list(range(1, nframe))
+                else:
+                    key_idx = list(range(nframe))
+                    
+                unet_attn_logit = slice_attnmap(unet_attn_logit, query_idx=query_idx, key_idx=key_idx) # [B, H, Q, K]
+                # average over head
+                attn_maps = unet_attn_logit.mean(dim=1)   # [B, Q, K]
+                attn_maps = attn_maps[0]                  # take batch 0 → [Q, K]
+                
+                B, H, Q, K = unet_attn_logit.shape
+                query_size = int(math.sqrt(Q))
+                # Convert pixel coords -> feature map index
+                y_feat_cost = int((y_coord / 512) * query_size)
+                x_feat_cost = int((x_coord / 512) * query_size)
+                query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
+                
+                # attention for chosen query token
+                all_scores = torch.softmax(attn_maps[query_token_idx_cost], dim=-1)
+                tokens_per_img = query_size * query_size
+                scores_split = all_scores.split(tokens_per_img)
+                score = torch.cat([s.reshape(query_size, query_size) for s in scores_split], dim=-1)
+
+            combined_img = save_image_total(images, x_coord, y_coord, score)
+            combined_img.save(f"{outdir}/attn{unet_layer}.png")
+        
+        if config.unet_visualize.save_originals:
+            save_image(tgt_image, f"{outdir}/TARGET.png")
+            tgt_image_marked = mark_point_on_img(tgt_image, x_coord, y_coord)
+            target_marked = torch.from_numpy(tgt_image_marked).permute(2, 0, 1).float() / 255.0
+            save_image(target_marked, f"{outdir}/TARGET_MARKED.png")
+
+            ref_imgs = images.squeeze()[1:]
+            ref_concat = torch.cat([img for img in ref_imgs], dim=-1)  # shape [C, H, W*3] # save as one single image save_image(ref_concat, f"{outdir}/REFERENCE.png")
+            save_image(ref_concat, f"{outdir}/REFERENCE.png")
+            print(f"Saved visualization to outputs.png")
+        
+        if idx == 200: break
         
 
 if __name__ == "__main__":
@@ -342,16 +325,14 @@ if __name__ == "__main__":
     # minkyung TODO
     # unet: (down_blocks(6), mid_block(1), up_blocks(9))
     #  size: [64,64,32,32,16,16] [8] [16,16,16,32,32,32,64,64,64]
-    
-    # noise
-    noise_timestep = 100
-    # data
-    nframe = 3 # View length
-    cond_num = 2 # Condition among nframe
-    inference_view_range = 6 # change if you want 
     # checkpoint
-    resume_checkpoint = 'check_points/lr1_cosine_noema/checkpoint-30000'
     config_file_path = 'configs/viz.yaml'
     config = EasyDict(OmegaConf.load(config_file_path))
-    caching_unet_attn_layers = config.unet_visulaize.caching_unet_attn_layers # [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
-    main(nframe, cond_num, inference_view_range, caching_unet_attn_layers, noise_timestep=noise_timestep, resume_checkpoint=resume_checkpoint, config=config, rank = 0)
+    # noise
+    noise_timestep = config.unet_visualize.noise_timestep
+    # data
+    nframe = config.unet_visualize.nframe # View length
+    cond_num = config.unet_visualize.cond_num # Condition among nframe
+    inference_view_range = config.unet_visualize.inference_view_range # change if you want 
+    caching_unet_attn_layers = config.unet_visualize.caching_unet_attn_layers # [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+    main(nframe, cond_num, inference_view_range, caching_unet_attn_layers, noise_timestep=noise_timestep, resume_checkpoint=config.unet_visualize.resume_checkpoint, config=config)

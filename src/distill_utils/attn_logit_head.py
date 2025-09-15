@@ -75,7 +75,8 @@ LOGIT_HEAD_CLS = {
 }
 
 def cycle_consistency_checker(costmap, pixel_threshold=None):
-    ''' costmap : (B, HW, VHW)
+    ''' costmap : [B, HW, (V-1)*HW]
+        cross cost/attn only
     '''
     # Get dimensions from the input tensor
     B, HW, _ = costmap.shape

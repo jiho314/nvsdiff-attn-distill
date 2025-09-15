@@ -311,7 +311,8 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
         #     if config.image_size > 256:
         #         show_images[j] = cv2.resize(show_images[j], None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
             # accelerator.log({f"val/gt_masked_pred_images{j}": wandb.Image(show_images[j])}, step=step)
-        accelerator.log({"val/show_images": wandb.Image(show_images_full)}, step=step)
+        # accelerator.log({"val/show_images": wandb.Image(show_images_full)}, step=step)
+        pass
 
     del loss_fn_alex
     torch.cuda.empty_cache()
@@ -379,7 +380,7 @@ def log_train(accelerator, config, args, pipeline, weight_dtype, batch, step, **
 
     # tracker = accelerator.get_tracker("wandb", unwrap=True)
     # tracker.add_images("train/gt_masked_pred_images", show_image, step, dataformats="HWC")
-    accelerator.log({"train/gt_masked_pred_images": wandb.Image(show_image), }, step=step)
+    # accelerator.log({"train/gt_masked_pred_images": wandb.Image(show_image), }, step=step)
 
 
 def parse_args():
@@ -479,7 +480,7 @@ def main():
     accelerator = Accelerator(
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with="wandb",
+        # log_with="wandb",
         project_config=accelerator_project_config,
     )
 
@@ -786,11 +787,11 @@ def main():
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
-    if accelerator.is_main_process:
-        accelerator.init_trackers(
-            project_name=args.tracker_project_name,
-            init_kwargs={"wandb": {"name": args.run_name}} if args.run_name is not None else {},
-        )
+    # if accelerator.is_main_process:
+    #     accelerator.init_trackers(
+    #         project_name=args.tracker_project_name,
+    #         init_kwargs={"wandb": {"name": args.run_name}} if args.run_name is not None else {},
+    #     )
 
     # Train!
     total_batch_size = config.train_batch_size * accelerator.num_processes * config.gradient_accumulation_steps
@@ -1091,10 +1092,8 @@ def main():
                             batch['point_map'] = vggt_pred.get('world_points_from_depth', None)
 
                     distill_vggt_gt = [p[1] for p in config.distill_config.distill_pairs]
-                    if "point_map" in distill_vggt_gt: # process point_map -> query / key tokens
+                    if "point_map" in distill_vggt_gt:
                         point_map = batch["point_map"].to(device)  # b,f,3,h,w
-                        assert point_map.shape[2] == 3, f"pointmap coord im should be on 2 (b,f,3,h,w) but {point_map.shape}"
-                        assert point_map.shape[-1] == h and point_map.shape[-2] == w, f"pointmap im should be {h} {w} but {point_map.shape}"
                         point_map = einops.rearrange(point_map, "b f c h w -> b (f h w) c").unsqueeze(1)# B,1,FHW,3
                         distill_gt_dict["point_map"] = dict(query=point_map, key=point_map)
 
@@ -1104,7 +1103,7 @@ def main():
                         distill_pairs = config.distill_config.distill_pairs
                         for unet_layer, vggt_layer in distill_pairs:
                             '''
-                                gt(VGGT): query and key (B Head N(FHW) C) 
+                                gt(VGGT): query and key (B Head N(VHW) C) 
                                     - if using cost map feat, Head=1
                                 pred(UNet): attention map(logit, before softmax) ( B Head Q(FHW) K(FHW) )
                             '''
@@ -1113,26 +1112,20 @@ def main():
                             Q, K = pred_attn_logit.shape[-2], pred_attn_logit.shape[-1]
                             assert Q==K, f"pred attn should have same Q,K dim, but {pred_attn_logit.shape}"
 
-                            # 1) gt Query/key -> logit map
-                            with torch.no_grad():
-                                # resize qk
-                                def resize_tok(tok, target_size):
-                                    B, Head, FHW, C = tok.shape
-                                    HW = FHW // F
-                                    H = W = int(math.sqrt(HW))
-                                    tok = einops.rearrange(tok, 'B Head (F H W) C -> (B Head F) C H W', B=B, Head=Head, F=F, H=H, W=W, C=C)
-                                    tok = torch.nn.functional.interpolate(tok, size=(target_size, target_size), mode='bilinear')
-                                    tok = einops.rearrange(tok, '(B Head F) C H W -> B Head (F H W) C',  B=B, Head=Head, F=F, H=target_size, W=target_size, C=C)
-                                    return tok
-                                pred_query_size, pred_key_size = int(math.sqrt(Q // F)), int(math.sqrt(K // F))
-                                gt_query, gt_key = resize_tok(gt_query, target_size=pred_query_size), resize_tok(gt_key, target_size=pred_key_size)
-                                # qk -> logit map
-                                gt_attn_logit = distill_cost_fn(gt_query, gt_key)
-
+                            # 1) Resize token: gt -> pred
+                            def resize_tok(tok, target_size):
+                                B, Head, FHW, C = tok.shape
+                                HW = FHW // F
+                                H = W = int(math.sqrt(HW))
+                                tok = einops.rearrange(tok, 'B Head (F H W) C -> (B Head F) C H W', B=B, Head=Head, F=F, H=H, W=W, C=C)
+                                tok = torch.nn.functional.interpolate(tok, size=(target_size, target_size), mode='bilinear')
+                                tok = einops.rearrange(tok, '(B Head F) C H W -> B Head (F H W) C',  B=B, Head=Head, F=F, H=target_size, W=target_size, C=C)
+                                return tok
+                            
+                            pred_query_size, pred_key_size = int(math.sqrt(Q // F)), int(math.sqrt(K // F))
+                            gt_query, gt_key = resize_tok(gt_query, target_size=pred_query_size), resize_tok(gt_key, target_size=pred_key_size)
 
                             # 2) Extract Distill Views
-                            ''' View idx order: [Reference, Target]
-                            '''
                             # Distill Query to target/all 
                             if config.distill_config.distill_query == "target":
                                 query_idx = list(range(random_cond_num, F))
@@ -1158,13 +1151,13 @@ def main():
                                 return attnmap
                             
                             pred_attn_logit = slice_attnmap(pred_attn_logit, query_idx, key_idx)
-                            gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx, key_idx) # B head f1HW f2HW
+                            with torch.no_grad():
+                                gt_attn_logit = distill_cost_fn(gt_query, gt_key)
+                            gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx, key_idx)
 
-                            # 4) Prob Map
-                            pred, gt = unet.unet_logit_head(pred_attn_logit), unet.vggt_logit_head(gt_attn_logit) # [B f1HW f2HW]
+                            pred, gt = unet.unet_logit_head(pred_attn_logit), unet.vggt_logit_head(gt_attn_logit)
 
                             if config.distill_config.get("consistency_check", False):
-                                assert config.distill_config.distill_query == "target", "consistency check only support distill_query to target"
                                 B, Head, F1HW, F2HW = gt_attn_logit.shape  
                                 F1, F2, HW = len(query_idx), len(key_idx), F1HW // len(query_idx)
                                 gt_attn_logit_HW = einops.rearrange(gt_attn_logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1) HW1 (F2 HW2)', B=B,Head=Head, F1=F1, F2=F2, HW1=HW, HW2=HW)
@@ -1173,8 +1166,10 @@ def main():
                                 assert Head == 1, "Track Head costmap should have only one head"
                                 consistency_mask = consistency_mask.reshape(B*Head, F1HW)
                                 pred, gt = pred[consistency_mask.bool()], gt[consistency_mask.bool()]
+                            from torchvision.utils import save_image
+                            import matplotlib.pyplot as plt
+                            import pdb; pdb.set_trace()
 
-                            # 5) distill loss 
                             distill_loss_dict[f"train/distill/unet{unet_layer}_vggt{vggt_layer}"] = distill_loss_fn(pred.float(), gt.float())
                         distill_loss = sum(distill_loss_dict.values()) / len(distill_loss_dict.values()) if len(distill_loss_dict) > 0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
                     loss = diff_loss + distill_loss * distill_loss_weight

@@ -2,13 +2,13 @@
 
 # export WANDB_API_KEY='4ab8d4a0db9aec6c80956ccf58616de15392a463'
 export WANDB_API_KEY='3177b4c2c8cf009d18dc8cfc41cfa1d2fc813f67'
-CUDA_VISIBLE_DEVICES=3 accelerate launch --mixed_precision="fp16" \
-                  --num_processes=2 \
+CUDA_VISIBLE_DEVICES=0 accelerate launch --mixed_precision="fp16" \
+                  --num_processes=1 \
                   --num_machines 1 \
                   --main_process_port 29443 \
-                  --config_file configs/deepspeed/acc_zero2.yaml train.py \
+                  --config_file configs/deepspeed/acc_zero2.yaml train_debug.py \
                   --tracker_project_name "nvs-vggt-distill" \
-                  --config_file="configs/cat3d_distill.yaml" \
+                  --config_file="configs/cat3d_distill_debug.yaml" \
                   --output_dir="check_points/cat3d_distill" \
                   --train_log_interval=500000000000 \
                   --val_interval=200 \

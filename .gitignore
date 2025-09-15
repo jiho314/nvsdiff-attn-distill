@@ -8,3 +8,6 @@ debug_images/
 
 outputs/
 demo/
+outputs_unet_attn/
+outputs_vggt/
+*.png

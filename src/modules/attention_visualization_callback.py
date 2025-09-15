@@ -4,6 +4,7 @@ import einops
 from typing import Dict, List, Tuple, Optional, Any
 from my_diffusers.callbacks import PipelineCallback
 from src.distill_utils.attn_processor_cache import pop_cached_attn, clear_attn_cache
+from src.distill_utils.query_key_cost_metric import COST_METRIC_FN
 
 
 import os
@@ -63,27 +64,33 @@ class AttentionVisualizationCallback(PipelineCallback):
     def _setup_loss_function(self):
         """Loss function을 문자열에서 실제 함수로 변환"""
         loss_fn = self.visualize_config.get('loss_fn', 'cross_entropy')
-        
+
+        # define canonical loss functions and store mapping for per-pair overrides
+        def cross_entropy(prob, prob_gt):
+            """Cross entropy loss for attention probabilities."""
+            eps = 1e-8
+            return - (prob_gt * (prob + eps).log()).sum(dim=-1).mean()
+
+        def kl_divergence(prob, prob_gt):
+            """Kullback-Leibler divergence loss for attention probabilities."""
+            return (prob_gt * (prob_gt.log() - prob.log())).sum(dim=-1).mean()
+
+        ATTN_LOSS_FN = {
+            "l1": torch.nn.functional.l1_loss,
+            "cross_entropy": cross_entropy,
+            "kl_divergence": kl_divergence,
+        }
+        # always expose mapping attribute
+        self.ATTN_LOSS_FN = ATTN_LOSS_FN
+
+        # set default loss_fn
         if callable(loss_fn):
-            # 이미 함수인 경우 (validate.py에서 전달된 경우)
             self.loss_fn = loss_fn
         elif isinstance(loss_fn, str):
-            # 문자열인 경우 함수로 변환
-            def cross_entropy(prob, prob_gt):
-                """Cross entropy loss for attention probabilities."""
-                eps = 1e-8
-                return - (prob_gt * (prob + eps).log()).sum(dim=-1).mean()
-
-            def kl_divergence(prob, prob_gt):
-                """Kullback-Leibler divergence loss for attention probabilities."""
-                return (prob_gt * (prob_gt.log() - prob.log())).sum(dim=-1).mean()
-
-            ATTN_LOSS_FN = {
-                "l1": torch.nn.functional.l1_loss,
-                "cross_entropy": cross_entropy,
-                "kl_divergence": kl_divergence,
-            }
-            self.loss_fn = ATTN_LOSS_FN[loss_fn.lower()]
+            key = loss_fn.lower()
+            if key not in ATTN_LOSS_FN:
+                raise ValueError(f"Unsupported loss_fn string: {loss_fn}")
+            self.loss_fn = ATTN_LOSS_FN[key]
         else:
             raise ValueError(f"Unsupported loss_fn type: {type(loss_fn)}")
     
@@ -96,7 +103,22 @@ class AttentionVisualizationCallback(PipelineCallback):
     
     def _resize_token(self, tok: torch.Tensor, target_size: int, F: int) -> torch.Tensor:
         """토큰을 target_size로 리사이즈"""
-        B, Head, FHW, C = tok.shape
+        # Support inputs with and without explicit Head dimension.
+        # Acceptable input shapes:
+        # - (B, Head, FHW, C)
+        # - (B, FHW, C)  -> treated as Head=1
+        if tok.dim() == 4:
+            B, Head, FHW, C = tok.shape
+            has_head = True
+        elif tok.dim() == 3:
+            B, FHW, C = tok.shape
+            Head = 1
+            has_head = False
+            # add head dim at dim=1 for consistent processing
+            tok = tok.unsqueeze(1)  # (B,1,FHW,C)
+        else:
+            raise ValueError(f"Unexpected token tensor shape for _resize_token: {tok.shape}")
+
         HW = FHW // F
         H = W = int(math.sqrt(HW))
         tok = einops.rearrange(tok, 'B Head (F H W) C -> (B Head F) C H W', 
@@ -104,6 +126,8 @@ class AttentionVisualizationCallback(PipelineCallback):
         tok = torch.nn.functional.interpolate(tok, size=(target_size, target_size), mode='bilinear')
         tok = einops.rearrange(tok, '(B Head F) C H W -> B Head (F H W) C', 
                               B=B, Head=Head, F=F, H=target_size, W=target_size, C=C)
+
+        # If original input had no head dim, keep Head dim=1 (caller should handle)
         return tok
     
     def _slice_attention_map(self, attnmap: torch.Tensor, query_idx: List[int], 
@@ -416,10 +440,11 @@ class AttentionVisualizationCallback(PipelineCallback):
                 seq = 'sample'
 
             # attention 이미지를 callback 내부에 저장 (wandb 로깅은 메인에서)
-            key = f"val/attn/{seq}/{layer_key}"
+            # include step in the key so multiple viz steps don't overwrite each other
+            key = f"attn/{seq}/step{int(step_index)}/{layer_key}"
             if not hasattr(self, 'attention_images'):
                 self.attention_images = {}
-            
+
             self.attention_images[key] = {
                 'image': canvas,
                 'caption': f"{seq} | {layer_key} | step {int(step_index)}"
@@ -437,9 +462,14 @@ class AttentionVisualizationCallback(PipelineCallback):
         UNet attention을 캐시에서 가져와 VGGT attention과 비교하여 loss 계산
         """
         
+        # Support separate viz_steps and loss_steps. Empty list means "all steps".
         viz_steps = self.visualize_config.get('viz_steps', [])
-        
-        if step_index not in viz_steps:
+        loss_steps = self.visualize_config.get('loss_steps', [])
+
+        viz_enabled = (not viz_steps) or (step_index in viz_steps)
+        loss_enabled = (not loss_steps) or (step_index in loss_steps)
+
+        if not (viz_enabled or loss_enabled):
             print(f"Skipping attention visualization callback for step {step_index}")
             clear_attn_cache(pipeline.unet)
             return callback_kwargs
@@ -468,91 +498,6 @@ class AttentionVisualizationCallback(PipelineCallback):
             
             step_loss_dict = {}
             
-            # 각 layer pair에 대해 loss 계산
-            visualize_pairs = self.visualize_config['pairs']
-            print(f"Processing {len(visualize_pairs)} layer pairs: {visualize_pairs}")
-            
-            for unet_layer, vggt_layer in visualize_pairs:
-                if str(unet_layer) not in unet_attn_cache:
-                    continue
-                if str(vggt_layer) not in self.batch['vggt_attn_cache']:
-                    continue
-                
-                # GT (VGGT) query, key 가져오기
-                gt_query = self.batch['vggt_attn_cache'][str(vggt_layer)]['query'].detach()  # B Head VHW C
-                gt_key = self.batch['vggt_attn_cache'][str(vggt_layer)]['key'].detach()      # B Head VHW C
-                
-                # Pred (UNet) attention logit 가져오기
-                pred_attn_logit = unet_attn_cache[str(unet_layer)]  # B Head Q(FHW) K(FHW)
-                
-                # dtype과 device 일치 확인
-                target_dtype = pred_attn_logit.dtype
-                target_device = pred_attn_logit.device
-                gt_query = gt_query.to(dtype=target_dtype, device=target_device)
-                gt_key = gt_key.to(dtype=target_dtype, device=target_device)
-                
-                Q, K = pred_attn_logit.shape[-2], pred_attn_logit.shape[-1]
-                if Q != K:
-                    print(f"Warning: pred attn should have same Q,K dim, but got {pred_attn_logit.shape}")
-                    continue
-                
-                # F truncate 로직: Q가 F로 나누어떨어지지 않으면 자르기; Up block concat issue 
-                if Q % F != 0 or K % F != 0:
-                    print(f"Warning: pred attnmap should be divisible by F, but got {pred_attn_logit.shape} and F={F}")
-                    continue
-                
-                # 1) 토큰 크기 맞추기: gt(VGGT)를 pred(UNet)의 토큰 크기로 리사이즈
-                pred_query_size = int(math.sqrt(Q // F))
-                pred_key_size = int(math.sqrt(K // F))
-                gt_query_resized = self._resize_token(gt_query, pred_query_size, F)
-                gt_key_resized = self._resize_token(gt_key, pred_key_size, F)
-                
-                ## ========= LOSS CALCULATION =========
-                # 2) Loss 계산용 View index 추출
-                loss_query_idx, loss_key_idx = self._extract_loss_view_indices(F)
-                
-                # 3) Loss 계산용 Attention map 슬라이싱
-                pred_attn_logit_sliced = self._slice_attention_map(pred_attn_logit, loss_query_idx, loss_key_idx, F)
-                
-                # GT attention logit 계산
-                gt_attn_logit = gt_query_resized @ gt_key_resized.transpose(-1, -2)
-                gt_attn_logit_sliced = self._slice_attention_map(gt_attn_logit, loss_query_idx, loss_key_idx, F)
-                
-                # 4) Logit head 통과시켜 최종 loss 계산
-                pred_processed = pipeline.unet.unet_logit_head(pred_attn_logit_sliced)
-                gt_processed = pipeline.unet.vggt_logit_head(gt_attn_logit_sliced)
-                
-                loss_value = self.loss_fn(pred_processed, gt_processed)
-
-                layer_key = f"unet{unet_layer}_vggt{vggt_layer}"
-                step_loss_dict[f"val/step{step_index}/{layer_key}"] = loss_value
-                
-                print(f"Calculated loss for {layer_key}: {loss_value.item()}")
-                
-                # layer별 누적 loss 저장
-                if layer_key not in self.layer_losses:
-                    self.layer_losses[layer_key] = []
-                self.layer_losses[layer_key].append(loss_value.item())
-
-                ## ========= VISUALIZATION =========
-                # 5) Visualization용 View index 추출 (별도)
-                viz_query_idx, viz_key_idx = self._extract_viz_view_indices(F)
-                
-                # Visualization용 Attention map 슬라이싱
-                pred_attn_logit_viz = self._slice_attention_map(pred_attn_logit, viz_query_idx, viz_key_idx, F)
-                gt_attn_logit_viz = self._slice_attention_map(gt_attn_logit, viz_query_idx, viz_key_idx, F)
-
-                # Optional visualization save
-                print(f"Calling _maybe_save_attn_overlay for step {step_index}, layer {layer_key}")
-                self._maybe_save_attn_overlay(
-                    step_index=step_index,
-                    layer_key=layer_key,
-                    pred_logits=pred_attn_logit_viz,
-                    gt_logits=gt_attn_logit_viz,
-                    F=F,
-                    query_idx_list=viz_query_idx,
-                    key_idx_list=viz_key_idx,
-                )
             
             # Step별 데이터 저장
             if step_loss_dict:
@@ -573,6 +518,200 @@ class AttentionVisualizationCallback(PipelineCallback):
             # 전체 loss dict에 추가
             self.visualize_loss_dict.update(step_loss_dict)
             
+            # 각 layer pair에 대해 loss 계산
+            visualize_pairs = list(self.visualize_config['pairs'])
+            # sort pairs so same unet_layer are consecutive -> avoids popping UNet cache early
+            def _get_unet_layer(p):
+                if isinstance(p, dict):
+                    return p.get('unet_layer')
+                try:
+                    return p[0]
+                except Exception:
+                    return None
+            visualize_pairs = [p for p in visualize_pairs if _get_unet_layer(p) is not None]
+            visualize_pairs.sort(key=_get_unet_layer)
+            print(f"Processing {len(visualize_pairs)} layer pairs (sorted): {visualize_pairs}")
+
+            current_unet = None
+            pred_attn_logit = None
+
+            for pair in visualize_pairs:
+                # support dict entries
+                if isinstance(pair, dict):
+                    unet_layer = pair.get('unet_layer')
+                    vggt_layer = pair.get('vggt_layer')
+                    pair_metric = pair.get('costmap_metric', None)
+                    pair_loss_fn_name = pair.get('loss_fn', None)
+                else:
+                    try:
+                        unet_layer, vggt_layer = pair
+                        pair_metric = None
+                        pair_loss_fn_name = None
+                    except Exception:
+                        print(f"Invalid pair entry: {pair}")
+                        continue
+
+                # when encountering a new unet layer, free previous pred and load new one
+                if current_unet != unet_layer:
+                    # free previous
+                    if current_unet is not None:
+                        try:
+                            del pred_attn_logit
+                        except Exception:
+                            pass
+                        try:
+                            unet_attn_cache.pop(str(current_unet), None)
+                        except Exception:
+                            pass
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+
+                    current_unet = unet_layer
+                    # ensure UNet cache exists for this unet_layer
+                    if str(current_unet) not in unet_attn_cache:
+                        print(f"UNet attention cache missing for layer {current_unet}; skipping group")
+                        pred_attn_logit = None
+                        continue
+                    pred_attn_logit = unet_attn_cache[str(current_unet)]
+
+                print(f"Processing layer pair: {unet_layer}, {vggt_layer}")
+                print(f"UNet attention cache keys: {list(unet_attn_cache.keys()) if unet_attn_cache else 'None'}")
+                print(f"VGGT attention cache keys: {list(self.batch.get('vggt_attn_cache', {}).keys()) if self.batch.get('vggt_attn_cache') else 'None'}")
+
+                # get GT
+                if vggt_layer == "point_map":
+                    if 'point_map' not in self.batch:
+                        print("No point_map in batch; skipping")
+                        continue
+                    pointmap = self.batch['point_map']
+                    try:
+                        Bp, Vp, Cp, Hp, Wp = pointmap.shape
+                        gt_query = pointmap.permute(0, 1, 3, 4, 2).reshape(Bp, 1, -1, Cp)
+                        gt_key = gt_query
+                    except Exception as e:
+                        print(f"Unexpected point_map shape {getattr(pointmap, 'shape', None)}: {e}")
+                        continue
+                else:
+                    if 'vggt_attn_cache' not in self.batch or str(vggt_layer) not in self.batch['vggt_attn_cache']:
+                        continue
+                    gt_query = self.batch['vggt_attn_cache'][str(vggt_layer)]['query'].detach()
+                    gt_key = self.batch['vggt_attn_cache'][str(vggt_layer)]['key'].detach()
+
+                # move GT to pred dtype/device
+                if pred_attn_logit is None:
+                    continue
+                target_dtype = pred_attn_logit.dtype
+                target_device = pred_attn_logit.device
+                gt_query = gt_query.to(dtype=target_dtype, device=target_device)
+                gt_key = gt_key.to(dtype=target_dtype, device=target_device)
+
+                Q, K = pred_attn_logit.shape[-2], pred_attn_logit.shape[-1]
+                if Q != K:
+                    print(f"Warning: pred attn should have same Q,K dim, but got {pred_attn_logit.shape}")
+                    continue
+                if Q % F != 0 or K % F != 0:
+                    print(f"Warning: pred attnmap should be divisible by F, but got {pred_attn_logit.shape} and F={F}")
+                    continue
+
+                pred_query_size = int(math.sqrt(Q // F))
+                pred_key_size = int(math.sqrt(K // F))
+                gt_query_resized = self._resize_token(gt_query, pred_query_size, F)
+                gt_key_resized = self._resize_token(gt_key, pred_key_size, F)
+
+                loss_query_idx, loss_key_idx = self._extract_loss_view_indices(F)
+                pred_attn_logit_sliced = self._slice_attention_map(pred_attn_logit, loss_query_idx, loss_key_idx, F)
+
+                pred_head = pred_attn_logit.shape[1]
+                head_gt = gt_query_resized.shape[1] if gt_query_resized.dim() == 4 else 1
+                if head_gt == 1 and pred_head > 1:
+                    gt_query_resized = gt_query_resized.expand(-1, pred_head, -1, -1).contiguous()
+                    gt_key_resized = gt_key_resized.expand(-1, pred_head, -1, -1).contiguous()
+
+                metric_name = pair_metric if pair_metric is not None else self.visualize_config.get('costmap_metric', 'neg_log_l2')
+                metric_fn = COST_METRIC_FN.get(metric_name, None)
+                if metric_fn is None:
+                    print(f"Unknown costmap metric {metric_name}, falling back to neg_log_l2")
+                    metric_fn = COST_METRIC_FN['neg_log_l2']
+                gt_attn_logit = metric_fn(gt_query_resized, gt_key_resized)
+                gt_attn_logit_sliced = self._slice_attention_map(gt_attn_logit, loss_query_idx, loss_key_idx, F)
+
+                pred_processed = pipeline.unet.unet_logit_head(pred_attn_logit_sliced)
+                gt_processed = pipeline.unet.vggt_logit_head(gt_attn_logit_sliced)
+                if pair_loss_fn_name is not None:
+                    local_loss_fn = self.ATTN_LOSS_FN.get(pair_loss_fn_name.lower(), self.loss_fn)
+                else:
+                    local_loss_fn = self.loss_fn
+                loss_value = local_loss_fn(pred_processed, gt_processed)
+
+                layer_key = f"unet{unet_layer}_vggt{vggt_layer}"
+                if loss_enabled:
+                    if self.visualize_config.get('per_head_loss', False):
+                        try:
+                            pred_p = pred_processed.detach()
+                            gt_p = gt_processed.detach()
+                            eps = 1e-8
+                            pred_prob = pred_p.softmax(dim=-1)
+                            gt_prob = gt_p.softmax(dim=-1)
+                            per_head_raw = (-(gt_prob * (pred_prob + eps).log()).sum(dim=-1))
+                            per_head_vals = per_head_raw.mean(dim=tuple(i for i in range(per_head_raw.dim()) if i not in (1,)))
+                            for h_idx in range(per_head_vals.shape[0]):
+                                h_val = per_head_vals[h_idx]
+                                head_key = f"{layer_key}_head{h_idx}"
+                                step_loss_dict[f"val/step{step_index}/{head_key}"] = h_val
+                                print(f"Calculated loss for {head_key}: {float(h_val):.6f}")
+                                if head_key not in self.layer_losses:
+                                    self.layer_losses[head_key] = []
+                                try:
+                                    self.layer_losses[head_key].append(float(h_val))
+                                except Exception:
+                                    self.layer_losses[head_key].append(h_val.item() if hasattr(h_val, 'item') else float(h_val))
+                        except Exception as e:
+                            print(f"Per-head loss computation failed, falling back to aggregated loss: {e}")
+                            step_loss_dict[f"val/step{step_index}/{layer_key}"] = loss_value
+                            print(f"Calculated loss for {layer_key}: {loss_value.item()}")
+                            if layer_key not in self.layer_losses:
+                                self.layer_losses[layer_key] = []
+                            self.layer_losses[layer_key].append(loss_value.item())
+                    else:
+                        step_loss_dict[f"val/step{step_index}/{layer_key}"] = loss_value
+                        print(f"Calculated loss for {layer_key}: {loss_value.item()}")
+                        if layer_key not in self.layer_losses:
+                            self.layer_losses[layer_key] = []
+                        self.layer_losses[layer_key].append(loss_value.item())
+
+                viz_query_idx, viz_key_idx = self._extract_viz_view_indices(F)
+                pred_attn_logit_viz = self._slice_attention_map(pred_attn_logit, viz_query_idx, viz_key_idx, F)
+                gt_attn_logit_viz = self._slice_attention_map(gt_attn_logit, viz_query_idx, viz_key_idx, F)
+                if viz_enabled:
+                    print(f"Calling _maybe_save_attn_overlay for step {step_index}, layer {layer_key}")
+                    self._maybe_save_attn_overlay(
+                        step_index=step_index,
+                        layer_key=layer_key,
+                        pred_logits=pred_attn_logit_viz,
+                        gt_logits=gt_attn_logit_viz,
+                        F=F,
+                        query_idx_list=viz_query_idx,
+                        key_idx_list=viz_key_idx,
+                    )
+
+                # cleanup per-pair intermediates
+                try:
+                    del gt_query, gt_key, gt_query_resized, gt_key_resized, gt_attn_logit, gt_attn_logit_sliced
+                except Exception:
+                    pass
+                try:
+                    del pred_attn_logit_viz, gt_attn_logit_viz, pred_attn_logit_sliced
+                except Exception:
+                    pass
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+            # after finishing all pairs for all unet layers, free any remaining pred cache entries
+            # after finishing all pairs for all unet layers, free any remaining pred cache entries
         except Exception as e:
             print(f"Error in attention visualization callback at step {step_index}: {e}")
             import traceback

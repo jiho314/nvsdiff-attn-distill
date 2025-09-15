@@ -1,4 +1,8 @@
 mode: ["pointmap", "track_head", "attention"] # "attention", "track_head", "pointmap"
 attn_idx: [4,11,17,23]
-view_select: false # select scene
-coord_select: false # select coordinate
+view_select: true # select scene
+coord_select: true # select coordinate
+nframes: 3 # total num of frames
+cross_only: true # self attention too if false
+save_originals: true
+inference_view_range: 20
