@@ -43,15 +43,22 @@ class Softmax_HeadMlp(Softmax):
     def __init__(self, 
                  in_head_num = 24, out_head_num = 1,
                  mlp_ratio = 4.0, mlp_depth = 1,
-                 softmax_temp=1.0, learnable_temp = False, **kwargs):
+                 softmax_temp=1.0, learnable_temp = False, 
+                 final_activation = None,
+        **kwargs):
         super(Softmax_HeadMlp, self).__init__(softmax_temp, learnable_temp, **kwargs)
         self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, mlp_depth)
+        if final_activation == "sigmoid":
+            self.final_activation = nn.Sigmoid()
+        else:
+            self.final_activation = nn.Identity()
 
     def forward(self, x):
         x = x / self.softmax_temp
         x = x.softmax(dim=-1)
         x = x.permute(0,2,3,1) # B Q K Head
         x = self.mlp(x).permute(0,3,1,2) # B Out_head Q K
+        x = self.final_activation(x)
         return x
 
 class HeadMlp_Softmax(Softmax):
@@ -72,14 +79,19 @@ class HeadMlp_Softmax(Softmax):
 class HeadMlp(nn.Module):
     def __init__(self, 
                  in_head_num = 24, out_head_num = 16,
-                 mlp_ratio = 4.0, mlp_depth = 1,
+                 mlp_ratio = 4.0, mlp_depth = 1, final_activation = None,
                  **kwargs):
         super(HeadMlp, self).__init__(**kwargs)
         self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, mlp_depth)
+        if final_activation == "sigmoid":
+            self.final_activation = nn.Sigmoid()
+        else:
+            self.final_activation = nn.Identity()
 
     def forward(self, x):
         x = x.permute(0,2,3,1) # B Q K Head
         x = self.mlp(x).permute(0,3,1,2) # B Out_head Q K
+        x = self.final_activation(x)
         return x
 
 # class Ref_Softmax_HeadMean(nn.Module):
