@@ -6,3 +6,4 @@ nframes: 3 # total num of frames
 cross_only: true # self attention too if false
 save_originals: true
 inference_view_range: 20
+save_individuals: true

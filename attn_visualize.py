@@ -316,7 +316,6 @@ def main(nframe, cond_num, inference_view_range,
             ref_concat = torch.cat([img for img in ref_imgs], dim=-1)  # shape [C, H, W*3] # save as one single image save_image(ref_concat, f"{outdir}/REFERENCE.png")
             save_image(ref_concat, f"{outdir}/REFERENCE.png")
             print(f"Saved visualization to outputs.png")
-        
         if idx == 200: break
         
 

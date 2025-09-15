@@ -793,10 +793,10 @@ def main():
         # format: {'unet_layer': int, 'vggt_layer': str_or_int, 'costmap_metric': str, 'loss_fn': str}
         "softargmax_num_key_views": 2,
         'pairs': [
-            {'unet_layer': l, 'vggt_layer': 'point_map', 'costmap_metric': 'inverse_l2', 'loss_fn': 'cross_entropy'}
+            {'unet_layer': l, 'vggt_layer': 'point_map', 'costmap_metric': 'inverse_l2', 'loss_fn': 'softargmax_l2'}
             for l in (2, 4, 6, 8, 10, 12)
         ] + [
-            {'unet_layer': l, 'vggt_layer': 'track_head', 'costmap_metric': 'dot_product', 'loss_fn': 'cross_entropy'}
+            {'unet_layer': l, 'vggt_layer': 'point_map', 'costmap_metric': 'inverse_l2', 'loss_fn': 'argmax_l2'}
             for l in (2, 4, 6, 8, 10, 12)
         ],
     }

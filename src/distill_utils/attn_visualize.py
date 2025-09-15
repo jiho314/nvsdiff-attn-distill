@@ -24,35 +24,6 @@ def ho(attnmap, query_coord, ):
 
     return attnmap
 
-def stitch_all_vertically(images: List[Image.Image], padding: int = 0, bg_color: tuple = (0, 0, 0)):
-    """
-    Stitches a list of PIL Images vertically (one below the other).
-
-    Args:
-        images (List[PIL.Image]): A list of images to stitch.
-        padding (int): Pixels of space between images.
-        bg_color (tuple): Background color (R, G, B) for the canvas.
-
-    Returns:
-        PIL.Image: The stitched vertical image.
-    """
-    # Total height = sum of all image heights + padding between them
-    total_height = sum(img.height for img in images) + padding * (len(images) - 1)
-    # Width = max width among all images
-    max_width = max(img.width for img in images)
-
-    # Create blank canvas
-    canvas = Image.new("RGB", (max_width, total_height), color=bg_color)
-
-    # Paste images one below another
-    y_offset = 0
-    for img in images:
-        x_offset = (max_width - img.width) // 2  # center horizontally
-        canvas.paste(img, (x_offset, y_offset))
-        y_offset += img.height + padding
-
-    return canvas
-
 
 def stitch_side_by_side_whole(images: List[Image.Image], padding: int = 0, bg_color: tuple = (0, 0, 0)):
     """
@@ -132,55 +103,6 @@ def get_attn_map_whole(attn_layer: torch.Tensor, background: np.ndarray) -> np.n
 
     return final_map
 
-def overlay_attn_on_background(attn_layer: torch.Tensor, background: np.ndarray) -> np.ndarray:
-    """
-    Overlay an attention heatmap on a vertical (or arbitrary) background image.
-
-    Args:
-        attn_layer (torch.Tensor): 2D attention map, shape (H_small, W_small).
-        background (np.ndarray): Background image, shape (H_large, W_large, 3).
-
-    Returns:
-        np.ndarray: Visualization with heatmap and marked max-attention point.
-    """
-    H_small, W_small = attn_layer.shape
-    H_large, W_large = background.shape[:2]
-
-    # --- 1. Normalize the attention map ---
-    attn_layer = attn_layer - attn_layer.min()
-    if attn_layer.max() > 0:
-        attn_layer = attn_layer / attn_layer.max()
-
-    # --- 2. Resize attn_layer to match background (handles vertical or horizontal) ---
-    attn_layer_resized = cv2.resize(
-        attn_layer.cpu().numpy(),
-        (W_large, H_large),
-        interpolation=cv2.INTER_LINEAR
-    )  # shape (H_large, W_large)
-
-    # --- 3. Heatmap ---
-    normalizer = mpl.colors.Normalize(vmin=attn_layer_resized.min(), vmax=attn_layer_resized.max())
-    mapper = cm.ScalarMappable(norm=normalizer, cmap="viridis")
-    heatmap = (mapper.to_rgba(attn_layer_resized)[:, :, :3] * 255).astype(np.uint8)
-
-    # --- 4. Blend heatmap with background ---
-    background_uint8 = background.astype(np.uint8).copy()
-    blended_map = cv2.addWeighted(background_uint8, 0.3, heatmap, 0.7, 0)
-
-    # --- 5. Find max attention in original small map ---
-    attn_np_small = attn_layer.cpu().numpy()
-    max_idx_y, max_idx_x = np.unravel_index(np.argmax(attn_np_small), attn_np_small.shape)
-
-    # --- 6. Scale max point to background size ---
-    max_x = int((max_idx_x + 0.5) * (W_large / W_small))
-    max_y = int((max_idx_y + 0.5) * (H_large / H_small))
-
-    # --- 7. Draw circles ---
-    cv2.circle(blended_map, (max_x, max_y), 10, (255, 255, 255), -1)
-    cv2.circle(blended_map, (max_x, max_y), 6, (255, 0, 0), -1)
-
-    return blended_map
-
 
 def mark_point_on_img(tgt_img, x, y, radius=6):
     """
@@ -202,7 +124,7 @@ def mark_point_on_img(tgt_img, x, y, radius=6):
 
     return img
 
-def save_image_total(images, x_coord, y_coord, score, mode=None):
+def save_image_total(images, x_coord, y_coord, score):
     """
     images: torch.Tensor [B, V, 3, 512, 512], values in [0,1] or None
     x, y: int coordinates to mark (0–511)
@@ -230,27 +152,17 @@ def save_image_total(images, x_coord, y_coord, score, mode=None):
     background = []
     HW, VHW = score.shape
     V = int(VHW/HW)
-    if mode == "vertical":
-        for i in range(V):
-            background_elem = ref_image[i].squeeze().permute(1,2,0).cpu().detach()
-            background.append(background_elem)
-        background = torch.stack(background, dim=0).reshape(-1, 512, 3).numpy()
-        background = np.clip(background * 255.0, 0, 255).astype(np.uint8)
-    else:
-        for i in range(V):
-            background_elem = ref_image[i].squeeze().permute(1,2,0).cpu().detach()
-            background.append(background_elem)
-        background = torch.stack(background, dim=1).reshape(512, -1, 3).numpy()
-        background = np.clip(background * 255.0, 0, 255).astype(np.uint8)
 
-    if mode == "vertical":
-        combined_img = stitch_all_vertically(vis_list)
-        attn_heatmap_img = overlay_attn_on_background(score, background)
-        vis_list.append(Image.fromarray(attn_heatmap_img.astype(np.uint8)))
-    else: 
-        combined_img = stitch_side_by_side_whole(vis_list)
-        attn_heatmap_img = get_attn_map_whole(score, background)
-        vis_list.append(Image.fromarray(attn_heatmap_img.astype(np.uint8)))
+    for i in range(V):
+        background_elem = ref_image[i].squeeze().permute(1,2,0).cpu().detach()
+        background.append(background_elem)
+    background = torch.stack(background, dim=1).reshape(512, -1, 3).numpy()
+    background = np.clip(background * 255.0, 0, 255).astype(np.uint8)
+    
+    attn_heatmap_img = get_attn_map_whole(score, background)
+    vis_list.append(Image.fromarray(attn_heatmap_img.astype(np.uint8)))
+    combined_img = stitch_side_by_side_whole(vis_list)
+
     return combined_img
 
 def overlay_grid_and_save(img_tensor: torch.Tensor, spacing=64, out_path="grid_overlay.png"):

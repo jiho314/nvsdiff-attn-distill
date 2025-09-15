@@ -4,13 +4,13 @@ import torch.nn as nn
 '''
 x = [B, Head, Q, K]
 '''
-def build_mlp(in_dim, out_dim, mlp_ratio=4.0, depth=1):
-    if depth <= 0:
+def build_mlp(in_dim, out_dim, mlp_ratio=4.0, mlp_depth=1):
+    if mlp_depth <= 0:
         mlp = [nn.Linear(in_dim, out_dim)]
     else:
         mid_dim = int(in_dim * mlp_ratio)
         mlp += [nn.Linear(in_dim, mid_dim), nn.GELU()]
-        for _ in range(depth - 1):
+        for _ in range(mlp_depth - 1):
             mlp += [nn.Linear(mid_dim, mid_dim), nn.GELU()]
         mlp += [nn.Linear(mid_dim, out_dim)]
     return nn.Sequential(*mlp)
@@ -42,10 +42,10 @@ class Softmax_HeadMean(Softmax):
 class Softmax_HeadMlp(Softmax):
     def __init__(self, 
                  in_head_num = 24, out_head_num = 1,
-                 mlp_ratio = 4.0, depth = 1,
+                 mlp_ratio = 4.0, mlp_depth = 1,
                  softmax_temp=1.0, learnable_temp = False, **kwargs):
         super(Softmax_HeadMlp, self).__init__(softmax_temp, learnable_temp, **kwargs)
-        self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, depth)
+        self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, mlp_depth)
 
     def forward(self, x):
         x = x / self.softmax_temp
@@ -57,10 +57,10 @@ class Softmax_HeadMlp(Softmax):
 class HeadMlp_Softmax(Softmax):
     def __init__(self, 
                  in_head_num = 24, out_head_num = 1,
-                 mlp_ratio = 4.0, depth = 1,
+                 mlp_ratio = 4.0, mlp_depth = 1,
                  softmax_temp=1.0, learnable_temp = False, **kwargs):
         super(HeadMlp_Softmax, self).__init__(softmax_temp, learnable_temp, **kwargs)
-        self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, depth)
+        self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, mlp_depth)
 
     def forward(self, x):
         x = x.permute(0,2,3,1) # B Q K Head
@@ -72,10 +72,10 @@ class HeadMlp_Softmax(Softmax):
 class HeadMlp(nn.Module):
     def __init__(self, 
                  in_head_num = 24, out_head_num = 16,
-                 mlp_ratio = 4.0, depth = 1,
+                 mlp_ratio = 4.0, mlp_depth = 1,
                  **kwargs):
         super(HeadMlp, self).__init__(**kwargs)
-        self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, depth)
+        self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, mlp_depth)
 
     def forward(self, x):
         x = x.permute(0,2,3,1) # B Q K Head

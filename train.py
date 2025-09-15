@@ -588,9 +588,7 @@ def main():
         distill_loss_fn = None
         distill_loss_weight = 0.0
         
-    # set feat cache for repa distill # JIHO TODO: repa 
-    # from src.modules.attn_processor_cache import set_feat_cache, unset_feat_cache, pop_cached_feat, clear_feat_cache
-    
+    # set feat cache for repa distill # JIHO TODO: repa     
 
     if args.use_ema:
         ema_unet = copy.deepcopy(unet)

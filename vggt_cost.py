@@ -108,7 +108,16 @@ def main(cfg):
         tok = torch.nn.functional.interpolate(tok, size=(target_size, target_size), mode='bilinear')
         tok = einops.rearrange(tok, '(B Head F) C H W -> B Head (F H W) C',  B=B, Head=Head, F=F, H=target_size, W=target_size, C=C)
         return tok
+    
+    def save_individuals(combined_img, outdir):
+        W, H = combined_img.size
+        nimgs = W // H
 
+        for i in range(1, nimgs):
+            # crop region (left, upper, right, lower)
+            crop_box = (i * H, 0, (i + 1) * H, H)
+            img_slice = combined_img.crop(crop_box)
+            img_slice.save(f"{outdir}_ref{i-1}.png")
 
     def get_costmap(gt_query, gt_key, x_coord, y_coord, mode):
         '''
@@ -260,21 +269,27 @@ def main(cfg):
         if "track_head" in cfg.mode:
             gt_query, gt_key = vggt_pred['attn_cache']['track_head']['query'], vggt_pred['attn_cache']['track_head']['key'] # torch.Size([1, 1, 2668324, 128])
             score = get_costmap(gt_query, gt_key, x_coord, y_coord, "tracking") # 32, 3*32
-            combined_img = save_image_total(images, x_coord, y_coord, score,  mode="vertical")
+            combined_img = save_image_total(images, x_coord, y_coord, score)
             combined_img.save(f"{outdir}/tracking.png")
+            save_individuals(combined_img, f"{outdir}/tracking")  
         if "attention" in cfg.mode:
             for layer in cfg.attn_idx:
                 gt_query, gt_key = vggt_pred['attn_cache'][f'{layer}']['query'], vggt_pred['attn_cache'][f'{layer}']['key'] # torch.Size([1, 16, 5476, 64])
                 score = get_costmap(gt_query, gt_key, x_coord, y_coord, "attention") # 32, 3*32
-                combined_img = save_image_total(images, x_coord, y_coord, score, mode="vertical")
+                combined_img = save_image_total(images, x_coord, y_coord, score)
                 combined_img.save(f"{outdir}/attn{layer}.png")
+                if cfg.save_individuals: 
+                    save_individuals(combined_img, f"{outdir}/attn{layer}")  
         if "pointmap" in cfg.mode:
             pointmap = batch['point_map'] # [1, V, 3, 512, 512]
             gt_query = pointmap.permute(0,1,3,4,2).reshape(1, 1, -1, 3) # [1, 4, 512, 512, 3]
             gt_key = gt_query
             score = get_costmap(gt_query, gt_key, x_coord, y_coord, "pointmap") 
-            combined_img = save_image_total(images, x_coord, y_coord, score,  mode="vertical")
+            combined_img = save_image_total(images, x_coord, y_coord, score)
             combined_img.save(f"{outdir}/pointmap.png")
+            
+            if cfg.save_individuals: 
+                save_individuals(combined_img, f"{outdir}/pointmap")
         
         if cfg.save_originals: 
             save_image(tgt_image, f"{outdir}/TARGET.png")

@@ -189,11 +189,61 @@ class AttentionVisualizationCallback(PipelineCallback):
 
             return loss
 
+        def argmax_l2_from_prob(prob_pred, prob_gt, num_key_views: int):
+            """Compute L2 between argmax coordinates from probability inputs.
+
+            This is a discrete (hard) argmax variant: for each key-view we take the
+            index of the maximum probability and compute pixel/index coordinates
+            then L2 to the GT argmax. Inputs have same shape/assumptions as
+            `softargmax_l2_from_prob`.
+            """
+            # last-dim K
+            K = int(prob_pred.shape[-1])
+            if K <= 0:
+                raise ValueError(f"Invalid K for argmax_l2: K={K}")
+
+            num_k = int(num_key_views)
+            if num_k <= 0 or K % num_k != 0:
+                raise ValueError(f"num_key_views={num_k} is not a valid divisor of K={K}")
+
+            other = K // num_k
+            kp = int(round(math.sqrt(other)))
+            if kp * kp != other:
+                raise ValueError(f"Given num_key_views={num_k} does not yield a square kp for K={K}")
+
+            # reshape to [..., Q, num_k, kp, kp]
+            p_pred = prob_pred.view(*prob_pred.shape[:-1], num_k, kp, kp)
+            p_gt = prob_gt.view(*prob_gt.shape[:-1], num_k, kp, kp)
+
+            # compute argmax indices per tile -> (..., Q, num_k)
+            # flatten last two dims and argmax
+            p_pred_flat = p_pred.view(*p_pred.shape[:-2], -1)
+            p_gt_flat = p_gt.view(*p_gt.shape[:-2], -1)
+            pred_idx = p_pred_flat.argmax(dim=-1)
+            gt_idx = p_gt_flat.argmax(dim=-1)
+
+            # convert 1D index to 2D coords (y,x): y = idx // kp, x = idx % kp
+            pred_y = (pred_idx // kp).to(dtype=prob_pred.dtype, device=prob_pred.device)
+            pred_x = (pred_idx % kp).to(dtype=prob_pred.dtype, device=prob_pred.device)
+            gt_y = (gt_idx // kp).to(dtype=prob_gt.dtype, device=prob_gt.device)
+            gt_x = (gt_idx % kp).to(dtype=prob_gt.dtype, device=prob_gt.device)
+
+            pred_coords = torch.stack([pred_x, pred_y], dim=-1)
+            gt_coords = torch.stack([gt_x, gt_y], dim=-1)
+
+            diff = pred_coords - gt_coords
+            per_view_sq = diff.pow(2).sum(dim=-1)
+            per_view_l2 = per_view_sq.sqrt()
+
+            loss = per_view_l2.mean()
+            return loss
+
 
         ATTN_LOSS_FN = {
             "l1": torch.nn.functional.l1_loss,
             "cross_entropy": cross_entropy,
             "softargmax_l2": softargmax_l2_from_prob,
+            "argmax_l2": argmax_l2_from_prob,
             "kl_divergence": kl_divergence,
         }
         # always expose mapping attribute
@@ -207,6 +257,7 @@ class AttentionVisualizationCallback(PipelineCallback):
             if key not in ATTN_LOSS_FN:
                 raise ValueError(f"Unsupported loss_fn string: {loss_fn}")
             self.loss_fn = ATTN_LOSS_FN[key]
+            print(f"Using loss_fn: {key}")
         else:
             raise ValueError(f"Unsupported loss_fn type: {type(loss_fn)}")
     
@@ -764,22 +815,39 @@ class AttentionVisualizationCallback(PipelineCallback):
                     else:
                         # aggregated loss 계산
                         # determine chosen loss name (pair override or global)
-                        chosen_fn = pair_loss_fn_name.lower()
+                        if pair_loss_fn_name is not None:
+                            # pair may provide a string name
+                            chosen_fn = pair_loss_fn_name.lower() if isinstance(pair_loss_fn_name, str) else None
+                        else:
+                            # fall back to global visualize_config name if string
+                            vis_loss_cfg = self.visualize_config.get('loss_fn', None)
+                            chosen_fn = vis_loss_cfg.lower() if isinstance(vis_loss_cfg, str) else None
 
-                        # If softargmax L2, prepare probability inputs and pass pair-level or global num_key_views
-                        if chosen_fn == 'softargmax_l2':
+                        # log the chosen function (or note fallback)
+                        print(f"Using loss_fn: {chosen_fn if chosen_fn is not None else 'default_callable'}")
+
+                        # If softargmax or argmax L2, prepare probability inputs and pass pair-level or global num_key_views
+                        if chosen_fn in ('softargmax_l2', 'argmax_l2'):
                             pred_prob = pred_processed
                             gt_prob = gt_processed
-                            softargmax_num_key_views = self.visualize_config.get('softargmax_num_key_views', None)
-                            # require explicit num_key_views from pair or visualize_config
+                            # allow per-pair override for num_key_views
+                            softargmax_num_key_views = None
+                            if isinstance(pair, dict):
+                                softargmax_num_key_views = pair.get('softargmax_num_key_views', None)
                             if softargmax_num_key_views is None:
-                                raise ValueError('softargmax_l2 requires softargmax_num_key_views set in pair or visualize_config')
-                            loss_value = self.ATTN_LOSS_FN['softargmax_l2'](pred_prob, gt_prob, softargmax_num_key_views)
-                            
+                                softargmax_num_key_views = self.visualize_config.get('softargmax_num_key_views', None)
+                            if softargmax_num_key_views is None:
+                                raise ValueError(f"{chosen_fn} requires softargmax_num_key_views set in pair or visualize_config")
+                            # call appropriate implementation (hard argmax or soft argmax)
+                            loss_value = self.ATTN_LOSS_FN[chosen_fn](pred_prob, gt_prob, softargmax_num_key_views)
                         else:
-                            local_loss_fn = self.ATTN_LOSS_FN.get(chosen_fn, self.loss_fn)
-                            loss_value = local_loss_fn(pred_processed, gt_processed)
-                        
+                            # non-argmax losses expect (pred, gt)
+                            local_loss_fn = self.ATTN_LOSS_FN.get(chosen_fn, None) if chosen_fn is not None else None
+                            if local_loss_fn is None:
+                                # fallback to previously-resolved callable self.loss_fn
+                                loss_value = self.loss_fn(pred_processed, gt_processed)
+                            else:
+                                loss_value = local_loss_fn(pred_processed, gt_processed)
 
                         step_loss_dict[f"val/step{step_index}/{layer_key}"] = loss_value
                         print(f"Calculated loss for {layer_key}: {loss_value.item()}")
