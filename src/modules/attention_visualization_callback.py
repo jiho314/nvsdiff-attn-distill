@@ -617,6 +617,122 @@ class AttentionVisualizationCallback(PipelineCallback):
                 'caption': f"{seq} | {layer_key} | step {int(step_index)}"
             }
 
+    def _debug_save_argmax_softargmax(
+            self,
+            pred_prob: torch.Tensor,
+            gt_prob: torch.Tensor,
+            num_key_views: int,
+            step_index: int,
+            layer_key: str,
+    ) -> None:
+        """디버그용: pred/gt에 대해 softargmax vs argmax 좌표를 계산해 npz로 저장하고 요약 로그를 출력함."""
+        if not self.visualize_config.get('debug_softargmax', False):
+            return
+
+        save_dir = self.visualize_config.get('debug_save_dir', None)
+        if save_dir is None:
+            # 기본 디렉토리
+            save_dir = os.path.join(os.getcwd(), "debug_attn")
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 기대하는 입력 shape: [B, Head, Q, K]
+        pred = pred_prob.detach().to(dtype=torch.float32, device='cpu')
+        gt = gt_prob.detach().to(dtype=torch.float32, device='cpu')
+
+        B, Hh, Q, K = pred.shape
+        num_k = int(num_key_views)
+        other = K // num_k
+        kp = int(round(math.sqrt(other)))
+
+        # 샘플 소량만 저장 (첫 배치, 첫 헤드들, 최대 4 쿼리)
+        b = 0
+        max_q = min(Q, 4)
+        heads_to_check = min(Hh, 2)
+
+        out = {
+            'meta': {
+                'step': int(step_index),
+                'layer': layer_key,
+                'num_key_views': num_k,
+                'kp': kp,
+                'K': K,
+                'Q': Q,
+            },
+            'entries': []
+        }
+
+        # coordinate grids for softargmax
+        xs = torch.arange(0, kp, dtype=pred.dtype)
+        ys = torch.arange(0, kp, dtype=pred.dtype)
+        # build grids with shape (num_k, kp, kp)
+        gx = xs.view(1, 1, 1, kp).expand(1, 1, kp, kp)
+        gy = ys.view(1, 1, kp, 1).expand(1, 1, kp, kp)
+
+        for h in range(heads_to_check):
+            for q in range(max_q):
+                vec_pred = pred[b, h, q]  # [K]
+                vec_gt = gt[b, h, q]
+
+                # reshape into (num_k, kp, kp)
+                p_pred = vec_pred.view(num_k, kp, kp)
+                p_gt = vec_gt.view(num_k, kp, kp)
+
+                # argmax coords
+                p_pred_flat = p_pred.reshape(num_k, -1)
+                p_gt_flat = p_gt.reshape(num_k, -1)
+                pred_idx = p_pred_flat.argmax(dim=-1).to(dtype=torch.int32).numpy()
+                gt_idx = p_gt_flat.argmax(dim=-1).to(dtype=torch.int32).numpy()
+                pred_y = (pred_idx // kp).astype(np.int32)
+                pred_x = (pred_idx % kp).astype(np.int32)
+                gt_y = (gt_idx // kp).astype(np.int32)
+                gt_x = (gt_idx % kp).astype(np.int32)
+
+                # softargmax coords (expectation)
+                # compute sums over kp dims
+                p_pred_np = p_pred.numpy()
+                p_gt_np = p_gt.numpy()
+                pred_sx = (p_pred_np * np.arange(kp).reshape(1, 1, kp)).sum(axis=(1,2)) / (p_pred_np.sum(axis=(1,2)) + 1e-12)
+                pred_sy = (p_pred_np * np.arange(kp).reshape(1, kp, 1)).sum(axis=(1,2)) / (p_pred_np.sum(axis=(1,2)) + 1e-12)
+                gt_sx = (p_gt_np * np.arange(kp).reshape(1, 1, kp)).sum(axis=(1,2)) / (p_gt_np.sum(axis=(1,2)) + 1e-12)
+                gt_sy = (p_gt_np * np.arange(kp).reshape(1, kp, 1)).sum(axis=(1,2)) / (p_gt_np.sum(axis=(1,2)) + 1e-12)
+
+                # per-view differences between softargmax and argmax
+                per_view_diff = np.sqrt((pred_sx - pred_x)**2 + (pred_sy - pred_y)**2)
+
+                entry = {
+                    'batch': b,
+                    'head': h,
+                    'query': q,
+                    'pred_argmax_x': pred_x.tolist(),
+                    'pred_argmax_y': pred_y.tolist(),
+                    'pred_softargmax_x': pred_sx.tolist(),
+                    'pred_softargmax_y': pred_sy.tolist(),
+                    'gt_argmax_x': gt_x.tolist(),
+                    'gt_argmax_y': gt_y.tolist(),
+                    'gt_softargmax_x': gt_sx.tolist(),
+                    'gt_softargmax_y': gt_sy.tolist(),
+                    'per_view_diff': per_view_diff.tolist(),
+                    'pred_vec': p_pred_np.tolist(),
+                    'gt_vec': p_gt_np.tolist(),
+                }
+                out['entries'].append(entry)
+
+        fname = os.path.join(save_dir, f"debug_softargmax_step{int(step_index)}_{layer_key}_{int(time.time())}_{uuid.uuid4().hex[:6]}.npz")
+        try:
+            # save as npz
+            np.savez_compressed(fname, data=out)
+            print(f"Saved softargmax debug NPZ: {fname}")
+
+            # print concise summary: max difference
+            max_diff = 0.0
+            for e in out['entries']:
+                d = np.array(e['per_view_diff'], dtype=np.float32)
+                if d.size:
+                    max_diff = max(max_diff, float(d.max()))
+            print(f"[debug_softargmax] step={step_index} layer={layer_key} max_soft_vs_hard_pixel_diff={max_diff:.4f}")
+        except Exception as e:
+            print(f"Failed saving softargmax debug file {fname}: {e}")
+
     def __call__(
         self,
         pipeline,

@@ -5,8 +5,9 @@ import torch.nn as nn
 x = [B, Head, Q, K]
 '''
 def build_mlp(in_dim, out_dim, mlp_ratio=4.0, mlp_depth=1):
+    mlp = []
     if mlp_depth <= 0:
-        mlp = [nn.Linear(in_dim, out_dim)]
+        mlp += [nn.Linear(in_dim, out_dim)]
     else:
         mid_dim = int(in_dim * mlp_ratio)
         mlp += [nn.Linear(in_dim, mid_dim), nn.GELU()]
