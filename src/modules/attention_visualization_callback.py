@@ -849,8 +849,15 @@ class AttentionVisualizationCallback(PipelineCallback):
                             else:
                                 loss_value = local_loss_fn(pred_processed, gt_processed)
 
-                        step_loss_dict[f"val/step{step_index}/{layer_key}"] = loss_value
-                        print(f"Calculated loss for {layer_key}: {loss_value.item()}")
+                        # include chosen loss function name in the step-level key
+                        chosen_fn_str = chosen_fn if chosen_fn is not None else 'default_callable'
+                        # sanitize chosen_fn_str for use in metric key
+                        try:
+                            chosen_fn_str = str(chosen_fn_str).replace('/', '_')
+                        except Exception:
+                            chosen_fn_str = 'default_callable'
+                        step_loss_dict[f"val/step{step_index}/{layer_key}/P{chosen_fn_str}"] = loss_value
+                        print(f"Calculated loss for {layer_key} (fn={chosen_fn_str}): {loss_value.item()}")
                         if layer_key not in self.layer_losses:
                             self.layer_losses[layer_key] = []
                         self.layer_losses[layer_key].append(loss_value.item())
@@ -900,7 +907,9 @@ class AttentionVisualizationCallback(PipelineCallback):
                 self.step_layer_losses[step_index] = {}
                 for key, loss_value in step_loss_dict.items():
                     if key.startswith(f"val/step{step_index}/") and key != f"val/step{step_index}/avg_loss":
+                        # Preserve the rest of the key after val/step{step_index}/ as-is
                         layer_key = key.replace(f"val/step{step_index}/", "")
+                        # store numeric value for metric
                         self.step_layer_losses[step_index][layer_key] = loss_value.item() if hasattr(loss_value, 'item') else float(loss_value)
 
                 self.step_losses.append(step_avg_loss.item() if hasattr(step_avg_loss, 'item') else float(step_avg_loss))

@@ -782,7 +782,7 @@ def main():
         # 시각화 설정 추가
         # 빈 리스트 = 모든 스텝에서 시각화/로그, 아니면 명시된 스텝만 처리
         'viz_steps': [],  # visualization (images) 저장/생성 스텝
-        'loss_steps': [0, 10, 20, 30, 40],                 # loss 계산/수집에 사용할 스텝 (빈 리스트 = 모든 스텝)
+        'loss_steps': [40],                 # loss 계산/수집에 사용할 스텝 (빈 리스트 = 모든 스텝)
         # per_head_loss: if True, compute loss per attention head and log each head separately
         'per_head_loss': False,
         'viz_log_wandb': True,

@@ -1165,7 +1165,7 @@ def main():
                             gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx, key_idx) # B head f1HW f2HW
 
                             # 4) Prob Map
-                            pred, gt = unet.unet_logit_head[str(unet_layer)](pred_attn_logit), unet.vggt_logit_head[str(vggt_layer)](gt_attn_logit) # [B f1HW f2HW]
+                            pred, gt = unet.unet_logit_head[str(unet_layer)](pred_attn_logit), unet.vggt_logit_head[str(vggt_layer)](gt_attn_logit) # [B head f1HW f2HW]
 
                             if config.distill_config.get("consistency_check", False):
                                 assert config.distill_config.distill_query == "target", "consistency check only support distill_query to target"
@@ -1175,7 +1175,7 @@ def main():
                                 consistency_mask = cycle_consistency_checker(gt_attn_logit_HW, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1) HW1 (F2 HW2)
                                 consistency_mask = einops.rearrange(consistency_mask, '(B Head F1) HW 1 -> B Head (F1 HW) 1', B=B, Head=Head, F1=F1, HW=HW)
                                 assert Head == 1, "Track Head costmap should have only one head"
-                                consistency_mask = consistency_mask.reshape(B*Head, F1HW)
+                                consistency_mask = consistency_mask.reshape(B, Head, F1HW)
                                 pred, gt = pred[consistency_mask.bool()], gt[consistency_mask.bool()]
 
                             # 5) distill loss 
