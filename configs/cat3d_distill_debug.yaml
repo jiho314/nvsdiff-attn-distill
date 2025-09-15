@@ -25,7 +25,7 @@ vggt_on_fly : false
 use_vggt_camera : false
 
 nframe: 4
-fix_cond_num: 2
+fix_cond_num: null
 min_cond_num: 2
 max_cond_num: 3
 

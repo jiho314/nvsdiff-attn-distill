@@ -5,7 +5,7 @@ wandb/
 __pycache__/
 
 debug_images/
-
+nvsdiff-attn-distill/
 outputs/
 demo/
 outputs_unet_attn/

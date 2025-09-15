@@ -1165,10 +1165,13 @@ def main():
                                 consistency_mask = einops.rearrange(consistency_mask, '(B Head F1) HW 1 -> B Head (F1 HW) 1', B=B, Head=Head, F1=F1, HW=HW)
                                 assert Head == 1, "Track Head costmap should have only one head"
                                 consistency_mask = consistency_mask.reshape(B*Head, F1HW)
-                                pred, gt = pred[consistency_mask.bool()], gt[consistency_mask.bool()]
+                                # pred, gt = pred[consistency_mask.bool()], gt[consistency_mask.bool()]
                             from torchvision.utils import save_image
                             import matplotlib.pyplot as plt
                             import pdb; pdb.set_trace()
+                            save_image(image[1], 'stack.png')
+                            pred, gt = pred[1, 685].reshape(3, 32, 32).permute(1, 0, 2).reshape(32, -1), gt[1, 685].reshape(3, 32, 32).permute(1, 0, 2).reshape(32, -1)
+                            plt.imsave('vis.png', torch.cat((pred, gt), dim=0).cpu().detach().numpy(), cmap='viridis')
 
                             distill_loss_dict[f"train/distill/unet{unet_layer}_vggt{vggt_layer}"] = distill_loss_fn(pred.float(), gt.float())
                         distill_loss = sum(distill_loss_dict.values()) / len(distill_loss_dict.values()) if len(distill_loss_dict) > 0 else torch.tensor(0.0).to(device, dtype=weight_dtype)

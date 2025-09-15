@@ -1175,6 +1175,9 @@ def main():
                                 pred, gt = pred[consistency_mask.bool()], gt[consistency_mask.bool()]
 
                             # 5) distill loss 
+                            if torch.isnan(gt).any().item():
+                                accelerator.print("NaN in gt attn, skip this layer distill...")
+                                continue
                             distill_loss_dict[f"train/distill/unet{unet_layer}_vggt{vggt_layer}"] = distill_loss_fn(pred.float(), gt.float())
                         distill_loss = sum(distill_loss_dict.values()) / len(distill_loss_dict.values()) if len(distill_loss_dict) > 0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
                     loss = diff_loss + distill_loss * distill_loss_weight
