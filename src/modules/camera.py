@@ -61,6 +61,12 @@ def batch_sample_rays(intrinsic, extrinsic, image_h=None, image_w=None,
 
     device = intrinsic.device
     B = intrinsic.shape[0]
+    if extrinsic.shape[-2] == 3:
+        new_extrinsic = torch.zeros((B, 4, 4), device=extrinsic.device, dtype=extrinsic.dtype)
+        new_extrinsic[:, :3, :4] = extrinsic
+        new_extrinsic[:, 3, 3] = 1.0
+        extrinsic = new_extrinsic
+        
     if normalize_extrinsic:
         extri_ = einops.rearrange(extrinsic, "(b f) r c -> b f r c", f=nframe)
         c2w_view0 = extri_[:, normalize_extrinsic_tgt].inverse().to(device)  # [B,4,4]

@@ -36,8 +36,8 @@ from transformers.utils import ContextManagers
 from my_diffusers.models import UNet2DConditionModel
 from my_diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_multiview import StableDiffusionMultiViewPipeline
 from my_diffusers.training_utils import EMAModel
-from src.datasets.global_datasets import load_global_dataset
-from src.datasets.global_sampler import GlobalConcatSampler
+# from src.datasets.global_datasets import load_global_dataset
+# from src.datasets.global_sampler import GlobalConcatSampler
 from src.modules.camera import get_camera_embedding
 from src.modules.position_encoding import depth_freq_encoding, global_position_encoding_3d, get_3d_priors
 from src.modules.schedulers import get_diffusion_scheduler
@@ -111,8 +111,10 @@ def uniform_push_batch(batch, random_cond_num=0):
     new_idx = torch.cat([ref_idx, tgt_idx], dim=0)[:F]  # in case target_num +2 > F
 
     for k in batch.keys():
-        if not "key" in k:
-            batch[k] = batch[k][:, new_idx]
+        data = batch[k]
+        if torch.is_tensor(data):
+            if data.ndim >= 2:
+                batch[k] = batch[k][:, new_idx]
     return batch
 
 def slice_vae_encode(vae, image, sub_size):  # vae fails to encode large tensor directly, we need to slice it

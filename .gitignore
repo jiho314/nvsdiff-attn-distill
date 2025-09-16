@@ -14,3 +14,4 @@ outputs_vggt/
 
 validation_metrics_correlation_wandb_per_metric/
 *.png
+outputs_comparison/

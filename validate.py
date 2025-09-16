@@ -35,8 +35,7 @@ from transformers.utils import ContextManagers
 from my_diffusers.models import UNet2DConditionModel
 from my_diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_multiview import StableDiffusionMultiViewPipeline
 from my_diffusers.training_utils import EMAModel
-from src.datasets.global_datasets import load_global_dataset
-from src.datasets.global_sampler import GlobalConcatSampler
+
 from src.modules.camera import get_camera_embedding
 from src.modules.position_encoding import depth_freq_encoding, global_position_encoding_3d, get_3d_priors
 from src.modules.schedulers import get_diffusion_scheduler
@@ -764,24 +763,24 @@ def main():
         'vggt_layer': "point_map",
         # 'costmap_metric': 'neg_log_l2',
 
-        'vggt_logit_head': "softmax_headmean",
-        'vggt_logit_head_kwargs': {"softmax_temp": 0.01},
-        'unet_logit_head': "softmax_headmean",
-        'unet_logit_head_kwargs': {"softmax_temp": 1},
+        # Logit head settings moved into each pair dict (pair must include
+        # 'vggt_logit_head','vggt_logit_head_kwargs','unet_logit_head','unet_logit_head_kwargs')
         # 'costmap_metric': 'dot_product',
         
         # Loss 계산용 설정 (train과 동일하게)
         'loss_query': "target",      # loss 계산 시 사용할 query
         'loss_key': "reference",     # loss 계산 시 사용할 key
+        
+        # Loss settings moved into each pair dict (pair must include 'loss_fn', 'loss_softmax_mode', 'loss_num_key_views')
         # Visualization용 설정 (시각화에서만 사용)
         'viz_query': "target",       # 시각화 시 사용할 query
         'viz_key': "reference",            # 시각화 시 사용할 key (self attention 포함)
-        'student_unet_attn_layers': list((0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)),
+        'student_unet_attn_layers': list((2,4,6,8,10,12)),
         
         
         # 시각화 설정 추가
         # 빈 리스트 = 모든 스텝에서 시각화/로그, 아니면 명시된 스텝만 처리
-        'viz_steps': [],  # visualization (images) 저장/생성 스텝
+        'viz_steps': [40],  # visualization (images) 저장/생성 스텝
         'loss_steps': [40],                 # loss 계산/수집에 사용할 스텝 (빈 리스트 = 모든 스텝)
         # per_head_loss: if True, compute loss per attention head and log each head separately
         'per_head_loss': False,
@@ -791,16 +790,42 @@ def main():
         'viz_query_index': 150,  # None이면 랜덤 선택
         # pairs: list of dicts defining per-pair settings
         # format: {'unet_layer': int, 'vggt_layer': str_or_int, 'costmap_metric': str, 'loss_fn': str}
-        "softargmax_num_key_views": 2,
-        "roll_gt_map" : 1,
+
+        # "roll_gt_map" : 3,
         # debug options: enable detailed softargmax vs argmax dumps
         # 'debug_softargmax': True,
         # 'debug_save_dir': 'debug_attn_maps',
         'pairs': [
-            {'unet_layer': l, 'vggt_layer': 'point_map', 'costmap_metric': 'neg_log_l2', 'loss_fn': 'cross_entropy'}
+            {
+                'unet_layer': l,
+                'vggt_layer': 'point_map',
+                'costmap_metric': 'neg_log_l2',
+                'loss_fn': 'gauss_b2a',
+                'loss_softmax_mode': 'global',
+                'loss_num_key_views': 2,
+                'vggt_logit_head': 'softmax_headmean',
+                'vggt_logit_head_kwargs': {"softmax_temp": 0.01},
+                'unet_logit_head': 'softmax_headmean',
+                'unet_logit_head_kwargs': {"softmax_temp": 1},
+            }
             for l in list((2,4,6,8,10,12))
-        ],
+        ] 
     }
+    # Validate pairs: require per-pair loss and logit-head configuration (no globals).
+    required_pair_keys = (
+        'loss_fn', 'loss_softmax_mode', 'loss_num_key_views',
+        'unet_logit_head', 'unet_logit_head_kwargs',
+        'vggt_logit_head', 'vggt_logit_head_kwargs'
+    )
+    pairs_list = visualize_config.get('pairs', [])
+    if not isinstance(pairs_list, (list, tuple)):
+        raise ValueError("visualize_config['pairs'] must be a list of pair dicts")
+    for i, p in enumerate(pairs_list):
+        if not isinstance(p, dict):
+            raise ValueError(f"visualize_config['pairs'][{i}] must be a dict, got {type(p)}")
+        missing = [k for k in required_pair_keys if k not in p]
+        if missing:
+            raise ValueError(f"visualize_config['pairs'][{i}] missing required keys: {missing}")
     # costmap metric 설정: 'neg_log_l2', 'neg_l2', 'inverse_l2', 'dot_product'
     vggt_layer = visualize_config.get('vggt_layer', None)
     do_attn_visualize = args.visualize_attention_maps
@@ -869,21 +894,12 @@ def main():
     ## =====================================
     
     if do_attn_visualize:
-        # logit heads: input: [B, Head, Q, K]
-        unet_logit_head = LOGIT_HEAD_CLS[visualize_config['unet_logit_head'].lower()](**visualize_config['unet_logit_head_kwargs'])
-        vggt_logit_head = LOGIT_HEAD_CLS[visualize_config['vggt_logit_head'].lower()](**visualize_config['vggt_logit_head_kwargs'])
-        vggt_layer = visualize_config['vggt_layer']
-
-        # Set Attention Cache for distillation
-        ## TODO Seonghu : check max layer number
+        # Per-pair logit head configuration is required and will be instantiated
+        # inside the AttentionVisualizationCallback for each pair. We only set
+        # attention cache here.
         visualize_student_unet_attn_layers = visualize_config['student_unet_attn_layers']
         print(f"Number of unet attention layers: {len(list(unet.attn_processors.keys()))}")
         set_attn_cache(unet, visualize_student_unet_attn_layers)
-    
-        # add to unet (only single module supported in deepspeed... fuk )
-        unet.vggt_logit_head = vggt_logit_head
-        unet.unet_logit_head = unet_logit_head
-        del vggt_logit_head, unet_logit_head
     else:
         visualize_pairs = visualize_config['pairs']
         visualize_student_unet_attn_layers = []
@@ -935,7 +951,7 @@ def main():
     from src.datasets.re10k_wds import build_re10k_wds
 
     val_wds_dataset_config = {'url_paths': [ "/mnt/data2/minseop/realestate_val_wds", ],
-        'dataset_length': 200,
+        'dataset_length': 53,
         'resampled': False,
         'shardshuffle': False,
         'num_viewpoints': 3,

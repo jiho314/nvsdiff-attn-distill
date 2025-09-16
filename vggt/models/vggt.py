@@ -210,7 +210,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         # 1) camera params
         predictions['fovy'], predictions['fovx'] = predictions['pose_enc'][..., 7] , predictions['pose_enc'][..., 8]
         extrinsics, intrinsics = pose_encoding_to_extri_intri(predictions['pose_enc'], images.shape[-2:]) # original img resolution
-        predictions['extrinsics'], predictions['intrinsics'] = extrinsics, intrinsics
+        predictions['extrinsic'], predictions['intrinsic'] = extrinsics, intrinsics
         
         # # 2) pointmap w/ depth head & Camera
         # depth head가 비활성화되어 있으므로 depth 처리도 주석 처리

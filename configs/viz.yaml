@@ -153,11 +153,11 @@ unet_visualize:
   caching_unet_attn_layers: [2,3,4,5,6,7,8,9,10,11,12] # [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
   view_select: false # select scene
   coord_select: false # select coordinate
-  nframe: 4
+  nframe: 3
   cross_only: true
   noise_timestep: 999 #(0, 1000)
-  inference_view_range: 20
-  cond_num: 3 #reference num
-  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/naive_0915/checkpoint-4000'
+  inference_view_range: 25
+  cond_num: 2 #reference num
+  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/lr1_cosine_noema/checkpoint-30000'
   save_originals: true
 

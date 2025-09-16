@@ -21,7 +21,8 @@ CUDA_VISIBLE_DEVICES=3 accelerate launch --mixed_precision="fp16" \
                 #   --use_ema \
                 #   --ema_decay_step=30 \
                 #   --ema_decay=0.9995 \
-
+                #   --resume_from_checkpoint checkpoint-2000
+                #   --resume_path dir
 # export WANDB_API_KEY='4ab8d4a0db9aec6c80956ccf58616de15392a463'
 # CUDA_VISIBLE_DEVICES=0,1 accelerate launch --mixed_precision="fp16" \
 #                   --num_processes=2 \

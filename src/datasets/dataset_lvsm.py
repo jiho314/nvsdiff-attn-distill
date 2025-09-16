@@ -27,24 +27,40 @@ class Dataset(Dataset):
             raise e
         
 
-        self.use_idx_file = self.config.use_view_idx_file
+        self.use_idx_file = self.config.use_idx_file
+        self.target_view_indices = None
+        self.single_target_eval = self.use_idx_file and getattr(self.config, "num_tgt_views", 1) == 1
         # Load file that specifies the input and target view indices to use for inference
         if self.use_idx_file:
             self.view_idx_list = dict()
-            if self.config.view_idx_file_path is not None:
-                if os.path.exists(self.config.view_idx_file_path):
-                    with open(self.config.view_idx_file_path, 'r') as f:
+            if self.config.idx_file_path is not None:
+                if os.path.exists(self.config.idx_file_path):
+                    with open(self.config.idx_file_path, 'r') as f:
                         self.view_idx_list = json.load(f)
-                        # filter out None values, i.e. scenes that don't have specified input and targetviews
-                        self.view_idx_list_filtered = [k for k, v in self.view_idx_list.items() if v is not None]
+                    # filter out scenes without specified input/target pairs
                     filtered_scene_paths = []
+                    filtered_targets = []
                     for scene in self.all_scene_paths:
                         file_name = scene.split("/")[-1]
                         scene_name = file_name.split(".")[0]
-                        if scene_name in self.view_idx_list_filtered:
+                        view_indices = self.view_idx_list.get(scene_name)
+                        if view_indices is None:
+                            continue
+                        targets = view_indices.get("target")
+                        if targets is None:
+                            continue
+                        if not isinstance(targets, (list, tuple)):
+                            targets = [targets]
+                        if self.single_target_eval:
+                            for target_idx in targets:
+                                filtered_scene_paths.append(scene)
+                                filtered_targets.append(int(target_idx))
+                        else:
                             filtered_scene_paths.append(scene)
 
                     self.all_scene_paths = filtered_scene_paths
+                    if self.single_target_eval:
+                        self.target_view_indices = filtered_targets
 
 
     def __len__(self):
@@ -165,7 +181,8 @@ class Dataset(Dataset):
         start_frame = random.randint(0, len(frames) - frame_dist - 1)
         end_frame = start_frame + frame_dist
         sampled_frames = random.sample(range(start_frame + 1, end_frame), N-2)
-        image_indices = sampled_frames + [start_frame, end_frame]
+        image_indices = [start_frame, end_frame] + sampled_frames 
+        image_indices = sorted(image_indices) 
         if self.config.shuffle_prob > random.random():
             random.shuffle(image_indices)
         return image_indices
@@ -179,7 +196,20 @@ class Dataset(Dataset):
 
         if self.use_idx_file and scene_name in self.view_idx_list:
             current_view_idx = self.view_idx_list[scene_name]
-            image_indices= current_view_idx["target"] + current_view_idx["context"] # TODO: Eval per single target! (in code!)
+            context_indices = current_view_idx.get("context", [])
+            if not isinstance(context_indices, (list, tuple)):
+                context_indices = [context_indices]
+            context_indices = [int(i) for i in context_indices]
+
+            if self.single_target_eval and self.target_view_indices is not None:
+                target_idx = int(self.target_view_indices[idx])
+                image_indices = context_indices + [target_idx]
+            else:
+                target_indices = current_view_idx.get("target", [])
+                if not isinstance(target_indices, (list, tuple)):
+                    target_indices = [target_indices]
+                target_indices = [int(i) for i in target_indices]
+                image_indices = context_indices + target_indices
         else:
             # sample input and target views
             image_indices = self.view_selector(frames)
@@ -207,11 +237,11 @@ class Dataset(Dataset):
         indices = torch.cat([image_indices, scene_indices], dim=-1)  # [v, 2]
         
         return {
-            "images": input_images,
-            "extrinsics": input_w2cs,
-            "intrinsics": intrinsic_matrices,
-            "c2w": input_c2ws,
-            "fxfycxcy": input_intrinsics,
+            "image": input_images,
+            "extrinsic": input_w2cs,
+            "intrinsic": intrinsic_matrices,
+            # "c2w": input_c2ws,
+            # "fxfycxcy": input_intrinsics,
             "index": indices,
             "scene_name": scene_name
         }
@@ -223,4 +253,3 @@ class Dataset(Dataset):
         #     "index": indices,
         #     "scene_name": scene_name
         # }
-

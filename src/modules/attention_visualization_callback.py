@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple, Optional, Any
 from my_diffusers.callbacks import PipelineCallback
 from src.distill_utils.attn_processor_cache import pop_cached_attn, clear_attn_cache
 from src.distill_utils.query_key_cost_metric import COST_METRIC_FN
+from src.distill_utils.attn_logit_head import LOGIT_HEAD_CLS
 
 
 import os
@@ -69,7 +70,10 @@ class AttentionVisualizationCallback(PipelineCallback):
 
         # define canonical loss functions and store mapping for per-pair overrides
         def cross_entropy(prob, prob_gt):
-            """Cross entropy loss for attention probabilities."""
+            """Cross entropy loss for attention probabilities.
+
+            Expects inputs to already be probabilities over last dim.
+            """
             eps = 1e-8
             return - (prob_gt * (prob + eps).log()).sum(dim=-1).mean()
 
@@ -189,6 +193,106 @@ class AttentionVisualizationCallback(PipelineCallback):
 
             return loss
 
+        def _logits_to_probs(logits: torch.Tensor, num_key_views: int, mode: Optional[str] = None) -> torch.Tensor:
+            """Convert logits to probabilities according to `mode`.
+
+            Args:
+                logits: tensor of shape [..., K] or [B,Head,Q,K]
+                num_key_views: number of key views (K must be divisible by this).
+                mode: one of {'per_view', 'global', 'per_view_batch'}. If None, read
+                      from `self.visualize_config['softmax_mode']` (default 'per_view').
+
+            Returns:
+                probs tensor with same shape as `logits`.
+            """
+            if logits is None:
+                return logits
+            if mode is None:
+                raise ValueError("_logits_to_probs requires explicit 'mode' (pair-level configuration only)")
+
+            # preserve dtype/device
+            device = logits.device
+            dtype = logits.dtype
+
+            # quick check: if values along K already sum to ~1, assume probs and return
+            try:
+                sums = logits.sum(dim=-1)
+                if torch.allclose(sums, torch.ones_like(sums), atol=1e-3):
+                    return logits
+            except Exception:
+                pass
+
+            if mode == 'global':
+                return logits.softmax(dim=-1)
+
+            # expect K divisible by num_key_views
+            K = int(logits.shape[-1])
+            num_k = int(num_key_views)
+            if num_k <= 0 or K % num_k != 0:
+                raise ValueError(f"softmax per-view requires num_key_views that divides K: num_key_views={num_k}, K={K}")
+            per = K // num_k
+
+            if mode == 'per_view':
+                # reshape last dim to (..., num_k, per) and softmax over per
+                leading = logits.shape[:-1]
+                view_shaped = logits.view(*leading, num_k, per)
+                probs = view_shaped.softmax(dim=-1)
+                return probs.view(*leading, K)
+
+            if mode == 'per_view_batch':
+                # move key-views into an expanded batch, softmax each, then restore
+                B, Head, Q, K = logits.shape
+                kp = per
+                lv = logits.view(B, Head, Q, num_k, kp)
+                # permute to (B, num_k, Head, Q, kp) then collapse front dims for batch softmax
+                p = lv.permute(0, 3, 1, 2, 4).contiguous()
+                flat = p.view(-1, kp)
+                flat = flat.softmax(dim=-1)
+                p = flat.view(B, num_k, Head, Q, kp)
+                p = p.permute(0, 2, 3, 1, 4).contiguous()
+                return p.view(B, Head, Q, K)
+
+            raise ValueError(f"Unsupported softmax mode: {mode}")
+
+        def cross_entropy_per_view(prob_pred, prob_gt, num_key_views: int):
+            """Per-view cross entropy. Expects inputs shaped [..., K] or [B,Head,Q,K].
+
+            This computes cross-entropy per key-view tile and averages.
+            """
+            # unify shapes to [..., K]
+            if prob_pred.dim() == 4:
+                # [B,Head,Q,K] -> [..., K]
+                flat_pred = prob_pred
+                flat_gt = prob_gt
+            else:
+                flat_pred = prob_pred
+                flat_gt = prob_gt
+
+            K = int(flat_pred.shape[-1])
+            num_k = int(num_key_views)
+            if num_k <= 0 or K % num_k != 0:
+                raise ValueError(f"num_key_views must divide K: num_key_views={num_k}, K={K}")
+            per = K // num_k
+
+            # reshape to [..., num_k, per]
+            p_pred = flat_pred.view(*flat_pred.shape[:-1], num_k, per)
+            p_gt = flat_gt.view(*flat_gt.shape[:-1], num_k, per)
+
+            # ensure each tile is probability distribution
+            # apply softmax per tile if sums not ~1
+            pred_flat = p_pred.view(-1, per)
+            gt_flat = p_gt.view(-1, per)
+            if not torch.allclose(pred_flat.sum(dim=-1), torch.ones_like(pred_flat.sum(dim=-1)), atol=1e-3):
+                pred_flat = pred_flat.softmax(dim=-1)
+            if not torch.allclose(gt_flat.sum(dim=-1), torch.ones_like(gt_flat.sum(dim=-1)), atol=1e-3):
+                gt_flat = gt_flat.softmax(dim=-1)
+
+            # compute cross entropy per tile
+            eps = 1e-8
+            ce = - (gt_flat * (pred_flat + eps).log()).sum(dim=-1)
+            # average across tiles and remaining dims
+            return ce.view(*p_pred.shape[:-2], num_k).mean()
+
         def argmax_l2_from_prob(prob_pred, prob_gt, num_key_views: int):
             """Compute L2 between argmax coordinates from probability inputs.
 
@@ -238,6 +342,139 @@ class AttentionVisualizationCallback(PipelineCallback):
             loss = per_view_l2.mean()
             return loss
 
+        def gaussian_a2b_nll_from_prob(prob_pred, prob_gt, num_key_views: int, sigma: float):
+            """Gaussian NLL interpreted as A->B: -sum_x A(x) log K_sigma(x,y*)
+
+            Here prob_gt is expected to be a one-hot (delta) per tile; we infer y* from argmax of prob_gt.
+            The NLL reduces (up to const) to (1/(2 sigma^2)) * E_x[||x - y*||^2].
+            We compute E[x^2+y^2] - 2 E[x]·y* + ||y*||^2 per tile and average.
+            """
+            # unify shapes [..., K]
+            flat_pred = prob_pred
+            flat_gt = prob_gt
+            K = int(flat_pred.shape[-1])
+            num_k = int(num_key_views)
+            if num_k <= 0 or K % num_k != 0:
+                raise ValueError(f"num_key_views must divide K: num_key_views={num_k}, K={K}")
+            per = K // num_k
+
+            # reshape to [..., num_k, per]
+            p_pred = flat_pred.view(*flat_pred.shape[:-1], num_k, per)
+            p_gt = flat_gt.view(*flat_gt.shape[:-1], num_k, per)
+
+            # coordinate grids
+            device = p_pred.device
+            dtype = p_pred.dtype
+            xs = torch.arange(0, per, device=device, dtype=dtype)
+            ys = torch.arange(0, per, device=device, dtype=dtype)
+            # build grid coords (x,y) for index idx -> (x=idx%kp, y=idx//kp) where kp = sqrt(per)
+            kp = int(round(math.sqrt(per)))
+            gx = (xs % kp).to(dtype=dtype)
+            gy = (xs // kp).to(dtype=dtype)
+
+            # compute expectations per tile: E[x], E[y], E[x^2+y^2]
+            # p_pred shape [..., num_k, per]
+            ex = (p_pred * gx.view(*([1] * (p_pred.dim() - 2)), kp).reshape([1]*(p_pred.dim()-2) + [kp]).view(-1)).sum(dim=-1)
+            # above broadcasting is tricky; instead compute with explicit tensors
+            # compute gx,gy as tensors of shape (per,)
+            gx = gx.view(1, 1, 1, -1) if p_pred.dim() == 4 else gx.view(1, -1)
+            gy = gy.view(1, 1, 1, -1) if p_pred.dim() == 4 else gy.view(1, -1)
+            # fallback generic computation using broadcasting with torch
+            # reshape p_pred to (-1, per) to compute easily
+            pred_flat = p_pred.view(-1, per)
+            ex_flat = (pred_flat * (torch.arange(0, per, device=device, dtype=dtype) % kp)).sum(dim=-1)
+            ey_flat = (pred_flat * (torch.arange(0, per, device=device, dtype=dtype) // kp)).sum(dim=-1)
+            ex2_flat = (pred_flat * ((torch.arange(0, per, device=device, dtype=dtype) % kp)**2 + (torch.arange(0, per, device=device, dtype=dtype) // kp)**2)).sum(dim=-1)
+
+            # get gt hard coords per tile from p_gt argmax
+            gt_flat = p_gt.view(-1, per)
+            gt_idx = gt_flat.argmax(dim=-1)
+            gt_x = (gt_idx % kp).to(dtype=dtype)
+            gt_y = (gt_idx // kp).to(dtype=dtype)
+
+            # Align counts between pred tiles and gt tiles if broadcasting occurred
+            pred_flat = p_pred.view(-1, per)
+            Np = pred_flat.shape[0]
+            Ng = gt_flat.shape[0]
+            if Np != Ng:
+                if Np % Ng == 0:
+                    factor = Np // Ng
+                    gt_x = gt_x.repeat_interleave(factor)
+                    gt_y = gt_y.repeat_interleave(factor)
+                elif Ng % Np == 0:
+                    factor = Ng // Np
+                    # replicate pred expectations to match gt (rare); do by repeating rows
+                    ex_flat = ex_flat.repeat_interleave(factor)
+                    ey_flat = ey_flat.repeat_interleave(factor)
+                    ex2_flat = ex2_flat.repeat_interleave(factor)
+                else:
+                    raise ValueError(f"Incompatible pred/gt tile counts for gaussian_a2b: pred_tiles={Np}, gt_tiles={Ng}")
+
+            # compute expected squared dist per tile
+            # E||x - y*||^2 = E[x^2+y^2] - 2(E[x]*y_x + E[y]*y_y) + (y_x^2 + y_y^2)
+            term = ex2_flat - 2.0 * (ex_flat * gt_x + ey_flat * gt_y) + (gt_x * gt_x + gt_y * gt_y)
+
+            # reshape back to [..., num_k]
+            out = term.view(*p_pred.shape[:-2], num_k)
+            # mean over tiles and remaining dims, scale by 1/(2 sigma^2)
+            loss = out.mean() / (2.0 * (sigma**2))
+            return loss
+
+        def gaussian_b2a_nll_from_prob(prob_pred, prob_gt, num_key_views: int, sigma: float, eps: float = 1e-8):
+            """Compute -log( (K_sigma * A)(y*) ) where y* is GT argmax per tile.
+
+            This computes for each tile: -log( sum_x A(x) * exp(-||x-y*||^2/(2 sigma^2)) ).
+            """
+            flat_pred = prob_pred
+            flat_gt = prob_gt
+            K = int(flat_pred.shape[-1])
+            num_k = int(num_key_views)
+            if num_k <= 0 or K % num_k != 0:
+                raise ValueError(f"num_key_views must divide K: num_key_views={num_k}, K={K}")
+            per = K // num_k
+
+            p_pred = flat_pred.view(-1, num_k, per)
+            p_gt = flat_gt.view(-1, num_k, per)
+
+            kp = int(round(math.sqrt(per)))
+            # create coordinate grid indices 0..per-1
+            idx = torch.arange(0, per, device=flat_pred.device, dtype=flat_pred.dtype)
+            gx = (idx % kp).to(dtype=flat_pred.dtype)
+            gy = (idx // kp).to(dtype=flat_pred.dtype)
+
+            # gt indices
+            gt_flat = p_gt.view(-1, per)
+            gt_idx = gt_flat.argmax(dim=-1)
+            gt_x = (gt_idx % kp).to(dtype=flat_pred.dtype).unsqueeze(-1)
+            gt_y = (gt_idx // kp).to(dtype=flat_pred.dtype).unsqueeze(-1)
+
+            # compute squared distances (per gt tile vs all x)
+            dx2 = (gx.unsqueeze(0) - gt_x)**2
+            dy2 = (gy.unsqueeze(0) - gt_y)**2
+            dist2 = dx2 + dy2  # shape (Ntiles, per)
+
+            # gaussian kernel weights (unnormalized)
+            weights = torch.exp(-dist2 / (2.0 * sigma**2))
+
+            pred_flat = p_pred.view(-1, per)
+
+            # Align counts: if pred_flat rows != weights rows, try broadcasting by repeating gt rows
+            Np = pred_flat.shape[0]
+            Nw = weights.shape[0]
+            if Np != Nw:
+                if Np % Nw == 0:
+                    factor = Np // Nw
+                    weights = weights.repeat_interleave(factor, dim=0)
+                elif Nw % Np == 0:
+                    factor = Nw // Np
+                    pred_flat = pred_flat.repeat_interleave(factor, dim=0)
+                else:
+                    raise ValueError(f"Incompatible pred/gt tile counts for gaussian_b2a: pred_tiles={Np}, weight_tiles={Nw}")
+
+            numer = (pred_flat * weights).sum(dim=-1)
+            vals = -torch.log(numer + eps)
+            loss = vals.mean()
+            return loss
 
         ATTN_LOSS_FN = {
             "l1": torch.nn.functional.l1_loss,
@@ -245,6 +482,9 @@ class AttentionVisualizationCallback(PipelineCallback):
             "softargmax_l2": softargmax_l2_from_prob,
             "argmax_l2": argmax_l2_from_prob,
             "kl_divergence": kl_divergence,
+            "gauss_a2b": lambda pred, gt, num_k: gaussian_a2b_nll_from_prob(pred, gt, num_k, sigma=2.0),
+            "gauss_b2a": lambda pred, gt, num_k: gaussian_b2a_nll_from_prob(pred, gt, num_k, sigma=2.0),
+            "gauss_both": lambda pred, gt, num_k: 0.5 * (gaussian_a2b_nll_from_prob(pred, gt, num_k, sigma=2.0) + gaussian_b2a_nll_from_prob(pred, gt, num_k, sigma=2.0))
         }
         # always expose mapping attribute
         self.ATTN_LOSS_FN = ATTN_LOSS_FN
@@ -267,6 +507,65 @@ class AttentionVisualizationCallback(PipelineCallback):
             image = self.batch['image'].to(self.device)  # [B,F,3,H,W]
             vggt_pred = self.vggt_model(image)
             self.batch['vggt_attn_cache'] = vggt_pred['attn_cache']
+
+    def _logits_to_probs(self, logits: torch.Tensor, num_key_views: int, mode: Optional[str]) -> torch.Tensor:
+        """Convert logits to probabilities according to `mode`.
+
+        This is a class-level helper (accessible via self) — pair-level callers must
+        provide an explicit `mode` (no global fallbacks).
+        """
+        if logits is None:
+            return logits
+        if mode is None:
+            raise ValueError("_logits_to_probs requires explicit 'mode' (pair-level configuration only)")
+
+        # preserve dtype/device
+        device = logits.device
+        dtype = logits.dtype
+
+        # quick check: if values along K already sum to ~1, assume probs and return
+        try:
+            sums = logits.sum(dim=-1)
+            if torch.allclose(sums, torch.ones_like(sums), atol=1e-3):
+                return logits
+        except Exception:
+            pass
+
+        if mode == 'global':
+            return logits.softmax(dim=-1)
+
+        # expect K divisible by num_key_views
+        K = int(logits.shape[-1])
+        num_k = int(num_key_views)
+        if num_k <= 0 or K % num_k != 0:
+            raise ValueError(f"softmax per-view requires num_key_views that divides K: num_key_views={num_k}, K={K}")
+        per = K // num_k
+
+        if mode == 'per_view':
+            # reshape last dim to (..., num_k, per) and softmax over per
+            leading = logits.shape[:-1]
+            view_shaped = logits.view(*leading, num_k, per)
+            probs = view_shaped.softmax(dim=-1)
+            return probs.view(*leading, K)
+
+        if mode == 'per_view_batch':
+            # expect logits shaped [B,Head,Q,K]
+            if logits.dim() != 4:
+                raise ValueError("per_view_batch mode requires logits of shape [B,Head,Q,K]")
+            B, Head, Q, Kcheck = logits.shape
+            if Kcheck != K:
+                raise ValueError("inconsistent K in logits shape")
+            kp = per
+            lv = logits.view(B, Head, Q, num_k, kp)
+            # permute to (B, num_k, Head, Q, kp) then collapse front dims for batch softmax
+            p = lv.permute(0, 3, 1, 2, 4).contiguous()
+            flat = p.view(-1, kp)
+            flat = flat.softmax(dim=-1)
+            p = flat.view(B, num_k, Head, Q, kp)
+            p = p.permute(0, 2, 3, 1, 4).contiguous()
+            return p.view(B, Head, Q, K)
+
+        raise ValueError(f"Unsupported softmax mode: {mode}")
     
     def _resize_token(self, tok: torch.Tensor, target_size: int, F: int) -> torch.Tensor:
         """토큰을 target_size로 리사이즈"""
@@ -396,26 +695,63 @@ class AttentionVisualizationCallback(PipelineCallback):
         """각 view별로 가장 확률이 높은 부분에 파란 점을 그림"""
         d = _PILDraw.Draw(img)
         w, h = img.size
-        
-        # attention_tile에서 최대값 위치 찾기
-        max_idx = np.argmax(attention_tile.flatten())
+        # compute argmax index
+        flat = attention_tile.flatten()
+        max_idx = int(np.argmax(flat))
         max_y, max_x = np.unravel_index(max_idx, attention_tile.shape)
-        
+
+        # compute softargmax (expectation) on the tile for consistency with debug
+        xs = np.arange(tile_side)
+        # note: attention_tile shape is (tile_side, tile_side)
+        total = attention_tile.sum()
+        if total > 0:
+            pred_sx = (attention_tile * xs.reshape(1, tile_side)).sum(axis=(0, 1)) / (total + 1e-12)
+            pred_sy = (attention_tile * xs.reshape(tile_side, 1)).sum(axis=(0, 1)) / (total + 1e-12)
+        else:
+            pred_sx = float(max_x)
+            pred_sy = float(max_y)
+
         # tile 좌표를 이미지 좌표로 변환
         sx = w / float(tile_side)
         sy = h / float(tile_side)
-        cx = int((max_x + 0.5) * sx)
-        cy = int((max_y + 0.5) * sy)
-        
-        # 점 크기 계산
+        cx_hard = int((max_x + 0.5) * sx)
+        cy_hard = int((max_y + 0.5) * sy)
+        cx_soft = int((pred_sx + 0.5) * sx)
+        cy_soft = int((pred_sy + 0.5) * sy)
+
+        # dot sizes
         r_in = max(3, min(w, h) // 80)
-        
-        # 빨간 점 그리기 (흰색 테두리 + 빨간색 내부, 크기 줄임)
-        r_small = max(2, r_in // 2)  # 크기를 절반으로 줄임
-        d.ellipse((cx - r_small*2, cy - r_small*2, cx + r_small*2, cy + r_small*2), fill=(255, 255, 255))
-        d.ellipse((cx - r_small, cy - r_small, cx + r_small, cy + r_small), fill=(255, 0, 0))
-        
+
+        # draw argmax (red) with white border
+        r_small = max(2, r_in // 2)
+        d.ellipse((cx_hard - (r_small+2), cy_hard - (r_small+2), cx_hard + (r_small+2), cy_hard + (r_small+2)), fill=(255,255,255))
+        d.ellipse((cx_hard - r_small, cy_hard - r_small, cx_hard + r_small, cy_hard + r_small), fill=(255,0,0))
+
+        # draw softargmax (yellow) with black border for contrast
+        d.ellipse((cx_soft - (r_in+2), cy_soft - (r_in+2), cx_soft + (r_in+2), cy_soft + (r_in+2)), fill=(0,0,0))
+        d.ellipse((cx_soft - r_in, cy_soft - r_in, cx_soft + r_in, cy_soft + r_in), fill=(255,255,0))
+
         return img
+
+    def _coords_argmax(self, tile: np.ndarray) -> Tuple[int, int]:
+        """Return (x,y) integer coords of argmax within tile."""
+        idx = int(np.argmax(tile.flatten()))
+        y, x = np.unravel_index(idx, tile.shape)
+        return int(x), int(y)
+
+    def _coords_softargmax(self, tile: np.ndarray) -> Tuple[float, float]:
+        """Return (x,y) soft-argmax (expectation) within tile as floats."""
+        side = tile.shape[0]
+        xs = np.arange(side)
+        total = float(tile.sum())
+        if total <= 0:
+            # fallback to argmax if tile is all zeros
+            ax, ay = self._coords_argmax(tile)
+            return float(ax), float(ay)
+        # pred_sx sums over columns for x coordinate, pred_sy sums over rows for y
+        pred_sx = (tile * xs.reshape(1, side)).sum(axis=(0, 1)) / (total + 1e-12)
+        pred_sy = (tile * xs.reshape(side, 1)).sum(axis=(0, 1)) / (total + 1e-12)
+        return float(pred_sx), float(pred_sy)
 
     def _maybe_save_attn_overlay(
             self,
@@ -427,6 +763,8 @@ class AttentionVisualizationCallback(PipelineCallback):
             F: int,
             query_idx_list: List[int],
             key_idx_list: List[int],
+            viz_mode: str,
+            viz_num_k: int,
     ) -> None:
         """Save attention overlay image similar to example, if configured.
 
@@ -473,9 +811,11 @@ class AttentionVisualizationCallback(PipelineCallback):
             qy, qx = divmod(q_in_view, q_side)
         q_idx = tgt_q_view_pos * q_hw + q_in_view
 
-        # softmax over K and mean over heads → [B,Q,K]
-        pred_prob = pred.softmax(dim=-1).mean(dim=1)[0]  # [Q,K]
-        gt_prob = gt.softmax(dim=-1).mean(dim=1)[0]      # [Q,K]
+        # convert logits to probabilities using pair-provided viz_mode and viz_num_k
+        pred_p = self._logits_to_probs(pred, int(viz_num_k), mode=viz_mode)
+        gt_p = self._logits_to_probs(gt, int(viz_num_k), mode=viz_mode)
+        pred_prob = pred_p.mean(dim=1)[0]  # [Q,K]
+        gt_prob = gt_p.mean(dim=1)[0]      # [Q,K]
 
         # select query row
         pred_vec = pred_prob[q_idx]  # [K]
@@ -525,7 +865,7 @@ class AttentionVisualizationCallback(PipelineCallback):
                 Hc, Wc = bg.shape[0], bg.shape[1]
                 # colorize heatmap and resize to bg size
                 color = self._attn_gray_to_rgb(tile)
-                color_img = _PILImage.fromarray(color).resize((Wc, Hc), _PILImage.BILINEAR)
+                color_img = _PILImage.fromarray(color).resize((Wc, Hc), _PILImage.NEAREST)
                 color_np = np.array(color_img)
                 alpha = float(self.visualize_config.get('viz_alpha', 0.6))
                 blended = (bg.astype(np.float32) * (1.0 - alpha) + color_np.astype(np.float32) * alpha).clip(0, 255).astype(np.uint8)
@@ -555,7 +895,7 @@ class AttentionVisualizationCallback(PipelineCallback):
 
         # build Q panel (with query dot)
         q_side_px = min(q_bg_np.shape[0], q_bg_np.shape[1])
-        q_panel = _PILImage.fromarray(q_bg_np).resize((q_side_px, q_side_px), _PILImage.BILINEAR)
+        q_panel = _PILImage.fromarray(q_bg_np).resize((q_side_px, q_side_px), _PILImage.NEAREST)
         q_panel = self._draw_query_point(q_panel, qx, qy, q_side)
 
         # compose final image: two rows (Q+Pred) and (Q+GT)
@@ -634,6 +974,7 @@ class AttentionVisualizationCallback(PipelineCallback):
             return gt_tensor
 
         try:
+            print(f"Rolling GT map by {shift_int} positions")
             return torch.roll(gt_tensor, shifts=shift_int, dims=-1)
         except Exception as e:
             print(f"Warning: roll_gt_map failed: {e}")
@@ -646,36 +987,43 @@ class AttentionVisualizationCallback(PipelineCallback):
             num_key_views: int,
             step_index: int,
             layer_key: str,
+            mode: Optional[str] = None,
             chosen_fn: Optional[str] = None,
     ) -> None:
         """디버그용 시각화: pred/gt heatmap에 argmax(빨강)와 softargmax(파랑) 좌표를 오버레이한 PNG를 저장하고
         callback 내부 이미지 캐시에 추가합니다. 저장은 `visualize_config['debug_save_dir']`로 이루어집니다.
         """
-        if not self.visualize_config.get('debug_softargmax', False):
-            return
-
-        save_dir = self.visualize_config.get('debug_save_dir', None)
-        if save_dir is None:
-            save_dir = os.path.join(os.getcwd(), "debug_attn")
-        os.makedirs(save_dir, exist_ok=True)
+        # Debugging visualizations removed by user request.
+        return
 
         # Keep a copy of original inputs to detect whether they already look like probabilities
         inp_pred = pred_prob.detach().to(dtype=torch.float32, device='cpu')
         inp_gt = gt_prob.detach().to(dtype=torch.float32, device='cpu')
 
-        # Heuristic: if sums along K ~ 1 -> already probabilities
-        try:
-            pred_sums = inp_pred.sum(dim=-1)
-            gt_sums = inp_gt.sum(dim=-1)
-            pred_is_prob = bool(torch.allclose(pred_sums, torch.ones_like(pred_sums), atol=1e-3))
-            gt_is_prob = bool(torch.allclose(gt_sums, torch.ones_like(gt_sums), atol=1e-3))
-        except Exception:
-            pred_is_prob = False
-            gt_is_prob = False
+        # If caller provided an explicit mode, use it to convert logits->probs.
+        # Ensure pred_is_prob/gt_is_prob are defined for later annotation.
+        pred_is_prob = False
+        gt_is_prob = False
+        if mode is not None:
+            pred = self._logits_to_probs(inp_pred, num_key_views, mode=mode)
+            gt = self._logits_to_probs(inp_gt, num_key_views, mode=mode)
+            # after conversion, inputs are probabilities
+            pred_is_prob = True
+            gt_is_prob = True
+        else:
+            # Heuristic: if sums along K ~ 1 -> already probabilities
+            try:
+                pred_sums = inp_pred.sum(dim=-1)
+                gt_sums = inp_gt.sum(dim=-1)
+                pred_is_prob = bool(torch.allclose(pred_sums, torch.ones_like(pred_sums), atol=1e-3))
+                gt_is_prob = bool(torch.allclose(gt_sums, torch.ones_like(gt_sums), atol=1e-3))
+            except Exception:
+                pred_is_prob = False
+                gt_is_prob = False
 
-        # ensure probabilities for visualization
-        pred = inp_pred.softmax(dim=-1) if not pred_is_prob else inp_pred
-        gt = inp_gt.softmax(dim=-1) if not gt_is_prob else inp_gt
+            # ensure probabilities for visualization
+            pred = inp_pred.softmax(dim=-1) if not pred_is_prob else inp_pred
+            gt = inp_gt.softmax(dim=-1) if not gt_is_prob else inp_gt
 
         B, Hh, Q, K = pred.shape
         num_k = int(num_key_views)
@@ -711,20 +1059,14 @@ class AttentionVisualizationCallback(PipelineCallback):
             else:
                 g_vis = np.zeros_like(tile_g)
 
-            # argmax (hard)
-            pred_idx = int(tile_p.reshape(-1).argmax())
-            gt_idx = int(tile_g.reshape(-1).argmax())
-            pred_y = pred_idx // kp; pred_x = pred_idx % kp
-            gt_y = gt_idx // kp; gt_x = gt_idx % kp
+            # compute coordinates using canonical helpers (real argmax / softargmax)
+            pred_x_hard, pred_y_hard = self._coords_argmax(tile_p)
+            gt_x_hard, gt_y_hard = self._coords_argmax(tile_g)
+            pred_sx, pred_sy = self._coords_softargmax(tile_p)
+            gt_sx, gt_sy = self._coords_softargmax(tile_g)
 
-            # softargmax (expectation)
-            xs = np.arange(kp)
-            pred_sx = (tile_p * xs.reshape(1, kp)).sum(axis=(0,1)) / (tile_p.sum() + 1e-12)
-            pred_sy = (tile_p * xs.reshape(kp, 1)).sum(axis=(0,1)) / (tile_p.sum() + 1e-12)
-            gt_sx = (tile_g * xs.reshape(1, kp)).sum(axis=(0,1)) / (tile_g.sum() + 1e-12)
-            gt_sy = (tile_g * xs.reshape(kp, 1)).sum(axis=(0,1)) / (tile_g.sum() + 1e-12)
-
-            diffs.append(float(np.sqrt((pred_sx - pred_x)**2 + (pred_sy - pred_y)**2)))
+            # record diff between softargmax and argmax (in tile coords)
+            diffs.append(float(math.sqrt((pred_sx - pred_x_hard)**2 + (pred_sy - pred_y_hard)**2)))
 
             p_rgb = self._attn_gray_to_rgb(p_vis)
             g_rgb = self._attn_gray_to_rgb(g_vis)
@@ -737,27 +1079,25 @@ class AttentionVisualizationCallback(PipelineCallback):
             sy = tile_px / float(kp)
             r = max(2, tile_px // 32)
 
-            # pred markers: argmax red, softargmax blue
-            cx_pred_hard = int((pred_x + 0.5) * sx)
-            cy_pred_hard = int((pred_y + 0.5) * sy)
-            # draw argmax (red) with white border for visibility
+            # draw Pred argmax (red) and Pred softargmax (yellow)
+            cx_pred_hard = int((pred_x_hard + 0.5) * sx); cy_pred_hard = int((pred_y_hard + 0.5) * sy)
+            cx_pred_soft = int((pred_sx + 0.5) * sx); cy_pred_soft = int((pred_sy + 0.5) * sy)
             draw_p.ellipse((cx_pred_hard - (r+2), cy_pred_hard - (r+2), cx_pred_hard + (r+2), cy_pred_hard + (r+2)), fill=(255,255,255))
             draw_p.ellipse((cx_pred_hard - r, cy_pred_hard - r, cx_pred_hard + r, cy_pred_hard + r), fill=(255,0,0))
-            cx_pred_soft = int((pred_sx + 0.5) * sx)
-            cy_pred_soft = int((pred_sy + 0.5) * sy)
-            # draw softargmax (yellow) with black border for contrast on blue bg
             draw_p.ellipse((cx_pred_soft - (r+2), cy_pred_soft - (r+2), cx_pred_soft + (r+2), cy_pred_soft + (r+2)), fill=(0,0,0))
             draw_p.ellipse((cx_pred_soft - r, cy_pred_soft - r, cx_pred_soft + r, cy_pred_soft + r), fill=(255,255,0))
 
-            # gt markers
-            cx_gt_hard = int((gt_x + 0.5) * sx)
-            cy_gt_hard = int((gt_y + 0.5) * sy)
+            # draw GT argmax (red outline) and GT softargmax (yellow) on GT panel
+            cx_gt_hard = int((gt_x_hard + 0.5) * sx); cy_gt_hard = int((gt_y_hard + 0.5) * sy)
+            cx_gt_soft = int((gt_sx + 0.5) * sx); cy_gt_soft = int((gt_sy + 0.5) * sy)
             draw_g.ellipse((cx_gt_hard - (r+2), cy_gt_hard - (r+2), cx_gt_hard + (r+2), cy_gt_hard + (r+2)), fill=(255,255,255))
             draw_g.ellipse((cx_gt_hard - r, cy_gt_hard - r, cx_gt_hard + r, cy_gt_hard + r), fill=(255,0,0))
-            cx_gt_soft = int((gt_sx + 0.5) * sx)
-            cy_gt_soft = int((gt_sy + 0.5) * sy)
             draw_g.ellipse((cx_gt_soft - (r+2), cy_gt_soft - (r+2), cx_gt_soft + (r+2), cy_gt_soft + (r+2)), fill=(0,0,0))
             draw_g.ellipse((cx_gt_soft - r, cy_gt_soft - r, cx_gt_soft + r, cy_gt_soft + r), fill=(255,255,0))
+
+            # annotate small legend and coords on the pred panel
+            legend_txt = f"v{v} A=({pred_x_hard},{pred_y_hard}) S=({pred_sx:.2f},{pred_sy:.2f})"
+            draw_p.text((4,4), legend_txt, fill=(255,255,255))
 
             combined = _PILImage.new('RGB', (tile_px * 2 + 6, tile_px), color=(0,0,0))
             combined.paste(p_img, (0,0))
@@ -987,8 +1327,26 @@ class AttentionVisualizationCallback(PipelineCallback):
                     gt_attn_logit = metric_fn(gt_query_resized, gt_key_resized)
                     gt_attn_logit_sliced = self._slice_attention_map(gt_attn_logit, loss_query_idx, loss_key_idx, F)
 
-                    pred_processed = pipeline.unet.unet_logit_head(pred_attn_logit_sliced)
-                    gt_processed = pipeline.unet.vggt_logit_head(gt_attn_logit_sliced)
+                    # instantiate per-pair logit heads (pair must provide head names/kwargs)
+                    if isinstance(pair, dict) and pair.get('unet_logit_head', None) is not None:
+                        unet_head_name = pair['unet_logit_head'].lower()
+                        unet_head_kwargs = pair.get('unet_logit_head_kwargs', {})
+                        unet_head = LOGIT_HEAD_CLS[unet_head_name](**unet_head_kwargs)
+                    else:
+                        raise ValueError(f"Pair must provide 'unet_logit_head' for visualization/loss: {pair}")
+                    if isinstance(pair, dict) and pair.get('vggt_logit_head', None) is not None:
+                        vggt_head_name = pair['vggt_logit_head'].lower()
+                        vggt_head_kwargs = pair.get('vggt_logit_head_kwargs', {})
+                        vggt_head = LOGIT_HEAD_CLS[vggt_head_name](**vggt_head_kwargs)
+                    else:
+                        raise ValueError(f"Pair must provide 'vggt_logit_head' for visualization/loss: {pair}")
+
+                    # For loss, use raw logits (identity) so loss softmax mode is applied deterministically
+                    pred_processed_loss = pred_attn_logit_sliced
+                    gt_processed_loss = gt_attn_logit_sliced
+                    # For visualization, still process through configured logit heads
+                    pred_processed_viz = unet_head(pred_attn_logit_sliced)
+                    gt_processed_viz = vggt_head(gt_attn_logit_sliced)
                     
                     if self.visualize_config.get('per_head_loss', False):
                         # per-head loss 계산
@@ -1000,46 +1358,68 @@ class AttentionVisualizationCallback(PipelineCallback):
                             # pair may provide a string name
                             chosen_fn = pair_loss_fn_name.lower() if isinstance(pair_loss_fn_name, str) else None
                         else:
-                            # fall back to global visualize_config name if string
-                            vis_loss_cfg = self.visualize_config.get('loss_fn', None)
-                            chosen_fn = vis_loss_cfg.lower() if isinstance(vis_loss_cfg, str) else None
+                            # pair MUST provide loss function name
+                            raise ValueError(f"Pair must provide 'loss_fn' entry for loss calculation: pair={pair}")
 
                         # log the chosen function (or note fallback)
                         print(f"Using loss_fn: {chosen_fn if chosen_fn is not None else 'default_callable'}")
 
                         # If softargmax or argmax L2, prepare probability inputs and pass pair-level or global num_key_views
                         if chosen_fn in ('softargmax_l2', 'argmax_l2'):
-                            pred_prob = pred_processed
-                            gt_prob = gt_processed
-                            # allow per-pair override for num_key_views
-                            softargmax_num_key_views = None
-                            if isinstance(pair, dict):
-                                softargmax_num_key_views = pair.get('softargmax_num_key_views', None)
-                            if softargmax_num_key_views is None:
-                                softargmax_num_key_views = self.visualize_config.get('softargmax_num_key_views', None)
-                            if softargmax_num_key_views is None:
-                                raise ValueError(f"{chosen_fn} requires softargmax_num_key_views set in pair or visualize_config")
+                            # require pair-provided loss mode/num_k (no global fallbacks)
+                            if not isinstance(pair, dict):
+                                raise ValueError(f"Pair entry must be a dict with loss settings for {chosen_fn}: {pair}")
+                            loss_mode = pair.get('loss_softmax_mode', None)
+                            loss_k = pair.get('loss_num_key_views', None)
+                            if loss_mode is None or loss_k is None:
+                                raise ValueError(f"Pair must provide 'loss_softmax_mode' and 'loss_num_key_views' for {chosen_fn}: pair={pair}")
+                            pred_prob = self._logits_to_probs(pred_processed_loss, int(loss_k), mode=loss_mode)
+                            gt_prob = self._logits_to_probs(gt_processed_loss, int(loss_k), mode=loss_mode)
                             # Debug: save numeric comparison between softargmax and argmax if enabled
                             try:
-                                self._debug_save_argmax_softargmax(pred_prob, gt_prob, softargmax_num_key_views, step_index, layer_key, chosen_fn=chosen_fn)
+                                self._debug_save_argmax_softargmax(pred_prob, gt_prob, int(loss_k), step_index, layer_key, mode=loss_mode, chosen_fn=chosen_fn)
                             except Exception:
                                 # intentionally do not crash validation loop on debug failure
                                 print(f"Warning: debug softargmax save failed for step {step_index}, layer {layer_key}")
                             # call appropriate implementation (hard argmax or soft argmax)
                             # allow optional GT rolling for ablation (applies to all losses)
                             gt_prob = self._roll_gt_map(gt_prob)
-                            pred_prob = pred_prob
-                            loss_value = self.ATTN_LOSS_FN[chosen_fn](pred_prob, gt_prob, softargmax_num_key_views)
+                            loss_value = self.ATTN_LOSS_FN[chosen_fn](pred_prob, gt_prob, int(loss_k))
                         else:
-                            # non-argmax losses expect (pred, gt)
-                            local_loss_fn = self.ATTN_LOSS_FN.get(chosen_fn, None) if chosen_fn is not None else None
-                            # apply roll to gt for all non-argmax losses as well
-                            gt_proc = self._roll_gt_map(gt_processed)
-                            if local_loss_fn is None:
-                                # fallback to previously-resolved callable self.loss_fn
-                                loss_value = self.loss_fn(pred_processed, gt_proc)
+                            # non-argmax losses: special-case gaussian variants which need per-view probs
+                            gauss_keys = ('gauss_a2b', 'gauss_b2a', 'gauss_softmin', 'gauss_both')
+                            if chosen_fn in gauss_keys:
+                                # require pair-level softmax mode and num_k
+                                if not isinstance(pair, dict):
+                                    raise ValueError(f"Pair entry must be a dict with loss settings for {chosen_fn}: {pair}")
+                                loss_mode = pair.get('loss_softmax_mode', None)
+                                loss_k = pair.get('loss_num_key_views', None)
+                                loss_sigma = float(pair.get('loss_sigma', 2.0))
+                                if loss_mode is None or loss_k is None:
+                                    raise ValueError(f"Pair must provide 'loss_softmax_mode' and 'loss_num_key_views' for {chosen_fn}: pair={pair}")
+                                pred_prob = self._logits_to_probs(pred_processed_loss, int(loss_k), mode=loss_mode)
+                                gt_prob = self._logits_to_probs(gt_processed_loss, int(loss_k), mode=loss_mode)
+                                # allow optional GT rolling for ablation
+                                gt_prob = self._roll_gt_map(gt_prob)
+                                # call gaussian implementations directly with sigma
+                                if chosen_fn == 'gauss_a2b':
+                                    loss_value = self.ATTN_LOSS_FN['gauss_a2b'](pred_prob, gt_prob, int(loss_k))
+                                elif chosen_fn == 'gauss_b2a' or chosen_fn == 'gauss_softmin':
+                                    loss_value = self.ATTN_LOSS_FN['gauss_b2a'](pred_prob, gt_prob, int(loss_k))
+                                else:  # gauss_both
+                                    la = self.ATTN_LOSS_FN['gauss_a2b'](pred_prob, gt_prob, int(loss_k))
+                                    lb = self.ATTN_LOSS_FN['gauss_b2a'](pred_prob, gt_prob, int(loss_k))
+                                    loss_value = 0.5 * (la + lb)
                             else:
-                                loss_value = local_loss_fn(pred_processed, gt_proc)
+                                # regular non-argmax loss path: functions accept (pred, gt)
+                                local_loss_fn = self.ATTN_LOSS_FN.get(chosen_fn, None) if chosen_fn is not None else None
+                                # apply roll to gt for all non-argmax losses as well
+                                gt_proc = self._roll_gt_map(gt_processed_loss)
+                                if local_loss_fn is None:
+                                    # fallback to previously-resolved callable self.loss_fn
+                                    loss_value = self.loss_fn(pred_processed_loss, gt_proc)
+                                else:
+                                    loss_value = local_loss_fn(pred_processed_loss, gt_proc)
 
                         # include chosen loss function name in the step-level key
                         chosen_fn_str = chosen_fn if chosen_fn is not None else 'default_callable'
@@ -1060,10 +1440,31 @@ class AttentionVisualizationCallback(PipelineCallback):
                     gt_attn_logit_viz = self._slice_attention_map(gt_attn_logit, viz_query_idx, viz_key_idx, F)
 
                     # Process through configured logit heads so visualization respects softmax_temp / head processing
-                    pred_processed_viz = pipeline.unet.unet_logit_head(pred_attn_logit_viz)
-                    gt_processed_viz = pipeline.unet.vggt_logit_head(gt_attn_logit_viz)
+                    # per-pair viz heads
+                    if isinstance(pair, dict) and pair.get('unet_logit_head', None) is not None:
+                        unet_head_name = pair['unet_logit_head'].lower()
+                        unet_head_kwargs = pair.get('unet_logit_head_kwargs', {})
+                        unet_head = LOGIT_HEAD_CLS[unet_head_name](**unet_head_kwargs)
+                    else:
+                        raise ValueError(f"Pair must provide 'unet_logit_head' for visualization: {pair}")
+                    if isinstance(pair, dict) and pair.get('vggt_logit_head', None) is not None:
+                        vggt_head_name = pair['vggt_logit_head'].lower()
+                        vggt_head_kwargs = pair.get('vggt_logit_head_kwargs', {})
+                        vggt_head = LOGIT_HEAD_CLS[vggt_head_name](**vggt_head_kwargs)
+                    else:
+                        raise ValueError(f"Pair must provide 'vggt_logit_head' for visualization: {pair}")
+
+                    pred_processed_viz = unet_head(pred_attn_logit_viz)
+                    gt_processed_viz = vggt_head(gt_attn_logit_viz)
 
                     print(f"Calling _maybe_save_attn_overlay for step {step_index}, layer {layer_key} (using processed logits)")
+                    # derive viz softmax settings from pair (fallback to loss settings)
+                    if isinstance(pair, dict):
+                        viz_mode = pair.get('viz_softmax_mode', pair.get('loss_softmax_mode'))
+                        viz_num_k = int(pair.get('viz_num_key_views', pair.get('loss_num_key_views')))
+                    else:
+                        viz_mode = 'per_view'
+                        viz_num_k = 1
                     self._maybe_save_attn_overlay(
                         step_index=step_index,
                         layer_key=layer_key,
@@ -1072,6 +1473,8 @@ class AttentionVisualizationCallback(PipelineCallback):
                         F=F,
                         query_idx_list=viz_query_idx,
                         key_idx_list=viz_key_idx,
+                        viz_mode=viz_mode,
+                        viz_num_k=viz_num_k,
                     )
 
                 # cleanup per-pair intermediates

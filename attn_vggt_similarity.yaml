@@ -1,0 +1,40 @@
+mode: ["pointmap"] # "attention", "track_head", "pointmap"
+attn_idx: [4,11,17,23]
+view_select: false # select scene
+coord_select: false # select coordinate
+nframes: 3 # total num of frames
+cross_only: true # self attention too if false
+inference_view_range: 25
+save_individuals: false
+
+
+# for unet
+caching_unet_attn_layers: [2,3,4,5,6,7,8,9,10,11,12] # [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+noise_timestep: 999 #(0, 1000)
+cond_num: 2 #reference num
+resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/lr1_cosine_noema/checkpoint-30000'
+save_originals: false
+pretrained_model_name_or_path: "stabilityai/stable-diffusion-2-1"
+
+model_cfg:
+  cfg_training_rate: 0.1
+  coords_cfg: null # 0.15
+  enable_depth: False
+  align_depth: False
+  priors3d: False
+  prior_type: null # 3dpe (coord_dim=192), latent, warp_latent (coord_dim=4), 3dpe+pixel (coord_dim=192, add_in_ch=11), 3dpe+latent or 3dpe+warp_latent (coord_dim=192+4=196)
+  coord_dim: null
+  depth_mid_times: null # 计算depth中位数，超出中位数*N倍的depth将会被contract截断
+  coord_encoder: null # "conv_in" is used for conv inputs, "attn_in" is used before qk-dot in global attn, "cross_in" is used for cross-attention injection
+  coord_dropout: null # null
+  coord_downsample_type: null # "conv", "resize"
+  use_rope: False
+  depth_freq: null # 32
+  additional_in_channels: 7 # (mask 1, camera 6, depth 1~x) # 7, [7, 54], 8
+  no_text_cross_attn: True # True
+  qk_norm: True
+  # domain switcher
+  # domain_dict: {"others": 0, "megascenes": 1, "objaverse": 2}
+  domain_dict: null
+  class_embed_type: "zero_init"
+  num_class_embeds: 3

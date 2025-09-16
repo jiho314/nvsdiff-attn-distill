@@ -1,0 +1,35 @@
+
+re10k_wds_test:
+  cls_name: re10k_wds
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 100
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 3
+    inference_view_range: 6
+    process_kwargs:
+      get_square_extrinsic: true
+
+re10k_pixelsplat_test:
+  cls_name: lvsm_dataset
+  config:
+    config:
+      dataset_path: /mnt/data2/nvs-data/re10k/re10k_lvsm/test/full_list.txt
+      use_idx_file: true
+      idx_file_path:  /mnt/data2/nvs-data/re10k/re10k_lvsm/assets/evaluation_index_re10k.json
+      image_size: 512
+      scene_scale_factor: 1.35 # TODO... if not vggt. how?
+      num_tgt_views: 4
+
+dtu_test:
+  cls_name: lvsm_dataset
+  config:
+    config:
+      dataset_path:  /mnt/data2/nvs-data/dtu/dtu_lvsm/test/full_list.txt
+      use_idx_file: true
+      idx_file_path: /mnt/data2/nvs-data/dtu/dtu_lvsm/assets/evaluation_index_dtu.json
+      image_size: 512
+      scene_scale_factor: 1.35 # TODO... if not vggt. how?
+      num_tgt_views: 4
