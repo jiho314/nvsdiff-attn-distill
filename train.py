@@ -975,7 +975,7 @@ def main():
                 if config.train_timestep_schedule == "uniform":
                     timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
                 elif config.train_timestep_schedule == "gaussian":
-                    timesteps = truncated_normal((bsz,), mean=config.gaussian_timestep_mean, std=config.gaussian_timestep_std).to(device=latents.device).long()
+                    timesteps = truncated_normal((bsz,), **config.train_timestep_schedule_config).to(device=latents.device).long()
                 else:
                     raise NotImplementedError
                 
