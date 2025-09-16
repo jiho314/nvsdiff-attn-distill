@@ -518,7 +518,7 @@ def main():
     os.environ['WANDB_API_KEY'] = "5e4d6a67a9287ff9ad9b05ccc97582fcb1d48dfe"
     # args.run_id = "jsh0423_/nvs-vggt-distill/kkprdt1l" # 2000
     # args.run_id = "jsh0423_/nvs-vggt-distill/96m4i9kp" # 6000
-    args.run_id = "jsh0423_/nvs-vggt-distill/rkp4yw6x"
+    args.run_id = "jsh0423_/nvs-vggt-distill/xplfu6su"
     
     history = fetch_run_metrics(args.run_id)
 

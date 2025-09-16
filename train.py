@@ -621,8 +621,11 @@ def main():
 
     # set trainable parameters
     trainable_params = []
-    params = [p for n, p in unet.named_parameters() if p.requires_grad]
+    params = [p for n, p in unet.named_parameters() if p.requires_grad and 'logit_head' not in n]
     trainable_params.append({'params': params, 'lr': config.opt_cfg.learning_rate})
+    if do_attn_distill:
+        logit_head_params = [p for n, p in unet.named_parameters() if p.requires_grad and 'logit_head' in n]
+        trainable_params.append({'params': logit_head_params, 'lr': config.distill_config.get("learning_rate", 1e-4)})
 
     optimizer = torch.optim.AdamW(
         trainable_params,

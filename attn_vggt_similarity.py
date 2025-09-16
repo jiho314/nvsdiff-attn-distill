@@ -78,7 +78,7 @@ def main(nframe, cond_num, inference_view_range,
         tok = einops.rearrange(tok, '(B Head F) C H W -> B Head (F H W) C',  B=B, Head=Head, F=F, H=target_size, W=target_size, C=C)
         return tok
     
-    def get_costmap(gt_query, gt_key, x_coord, y_coord, mode):
+    def get_costmap(gt_query, gt_key, mode, H):
         '''
         gt_query: query in shape # torch.Size([B, 1, VHW, C])
         gt_key: key in shape # torch.Size([B, 1, VHW, C])
@@ -87,12 +87,12 @@ def main(nframe, cond_num, inference_view_range,
         mode: three options, "tracking", "attention", "point"
         return: score in shape [HW, VHW]
         '''
-        H, W = 32, 32
+        H, W = int(math.sqrt(H)), int(math.sqrt(H))
         HW = H * W
         # Convert pixel coords -> feature map index
-        y_feat_cost = int((y_coord / 512) * H)
-        x_feat_cost = int((x_coord / 512) * H)
-        query_token_idx_cost = y_feat_cost * H + x_feat_cost
+        # y_feat_cost = int((y_coord / 512) * H)
+        # x_feat_cost = int((x_coord / 512) * H)
+        # query_token_idx_cost = y_feat_cost * H + x_feat_cost
         
         query_idx = [-1]
         if config.cross_only: 
@@ -105,14 +105,14 @@ def main(nframe, cond_num, inference_view_range,
             gt_attn_logit = query @ key.transpose(-1, -2)
             gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx=query_idx, key_idx=key_idx)
             attn_maps = gt_attn_logit.squeeze()
-            all_scores = torch.softmax(attn_maps[query_token_idx_cost] / 8, dim=-1)
+            all_scores = torch.softmax(attn_maps / 8, dim=-1)
         elif mode == "attention":
             query, key = resize_tok(gt_query, target_size=H), resize_tok(gt_key, target_size=W),
             gt_attn_logit = query @ key.transpose(-1, -2)
             gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx=query_idx, key_idx=key_idx)
             attn_maps = gt_attn_logit.mean(dim=1) # average over head
             attn_maps = attn_maps.squeeze()
-            all_scores = torch.softmax(attn_maps[query_token_idx_cost] / 8, dim=-1)
+            all_scores = torch.softmax(attn_maps / 8, dim=-1)
         elif mode == "pointmap":
             def distance_softmax(query_points, ref_points, temperature=1.0, cross_only=True):
                 """
@@ -158,12 +158,12 @@ def main(nframe, cond_num, inference_view_range,
             # stack along V dimension → (1, V, 3, H, W)
             ref_imgs = torch.stack(ref_imgs, dim=1)
             attn_maps = distance_softmax(query, ref_imgs)
-            all_scores = attn_maps[query_token_idx_cost]
+            all_scores = attn_maps
         
-        tokens_per_img = H * W
-        scores_split = all_scores.split(tokens_per_img)
-        score = torch.cat([s.reshape(H, W) for s in scores_split], dim=-1)
-        return score
+        # tokens_per_img = H * W
+        # scores_split = all_scores.split(tokens_per_img)
+        # score = torch.cat([s.reshape(H, W) for s in scores_split], dim=-1)
+        return all_scores
     # args, _, cfg = parse_args()
     
     vggt_model = VGGT.from_pretrained("facebook/VGGT-1B", **vggt_distill_config).eval()
@@ -327,58 +327,72 @@ def main(nframe, cond_num, inference_view_range,
     
     ## visualization 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
+    similarity_score = {}
+    mode = config.mode[0]
+    parent_name = os.path.basename(os.path.dirname(resume_checkpoint))   # lr1_cosine_noema
+    ckpt_name = os.path.basename(resume_checkpoint)                     # checkpoint-30000
+    outdir = os.path.join("outputs_comparison", timestamp, parent_name, ckpt_name, f"{noise_timestep}")
+    os.makedirs(outdir, exist_ok=True)
+    
     # minkyung TODO: 여러 idx에 대해서 viz
     for idx, batch in enumerate(val_dataloader):
-        parent_name = os.path.basename(os.path.dirname(resume_checkpoint))   # lr1_cosine_noema
-        ckpt_name = os.path.basename(resume_checkpoint)                     # checkpoint-30000
-        outdir = os.path.join("outputs_comparison", timestamp, parent_name, ckpt_name, f"{noise_timestep}", f"sample{idx}")
-        os.makedirs(outdir, exist_ok=True)
-        
+        if idx == config.nsample: 
+            averaged_score = {}
+            for k, vals in similarity_score.items():
+                # convert list of tensors -> stacked tensor -> mean -> float
+                vals_tensor = torch.tensor([v.item() if torch.is_tensor(v) else v for v in vals])
+                averaged_score[k] = float(vals_tensor.mean().item())
+
+            # Save to JSON
+            with open(os.path.join(outdir, "similarity_score_avg.json"), "w") as f:
+                json.dump(averaged_score, f, indent=4)
+            print("successfully saved the .json")
+            break
+        print(f"processing sample {idx}")
         images = batch['image'].to(device)  # B V C H W
-        tgt_image = images.squeeze()[0]      # [C, H, W]
+        #tgt_image = images.squeeze()[0]      # [C, H, W]
 
         # --- visualize with grid before input ---
         
-        if config.view_select:
-            overlay_grid_and_save(tgt_image, spacing=64, out_path="VIS_OVERLAY.png")
-            save_image(images.squeeze()[1:], "VIS_REFERENCE.png")
-            while True:
-                answer = input("Do you want to visualize? (yes/no): ").strip().lower()
-                if answer == "yes":
-                    # run visualization code
-                    counter_out = False
-                    break
-                elif answer == "no":
-                    # skip this batch
-                    counter_out = True
-                    break  # goes back to your for-loop
-                else:
-                    print("Invalid input. Please type 'yes' or 'no'.")
+        # if config.view_select:
+        #     overlay_grid_and_save(tgt_image, spacing=64, out_path="VIS_OVERLAY.png")
+        #     save_image(images.squeeze()[1:], "VIS_REFERENCE.png")
+        #     while True:
+        #         answer = input("Do you want to visualize? (yes/no): ").strip().lower()
+        #         if answer == "yes":
+        #             # run visualization code
+        #             counter_out = False
+        #             break
+        #         elif answer == "no":
+        #             # skip this batch
+        #             counter_out = True
+        #             break  # goes back to your for-loop
+        #         else:
+        #             print("Invalid input. Please type 'yes' or 'no'.")
                     
-            if counter_out:
-                continue
+        #     if counter_out:
+        #         continue
         
-        if config.coord_select:
-            if config.view_select is False:
-                overlay_grid_and_save(tgt_image, spacing=64, out_path="VIS_OVERLAY.png")
-                save_image(images.squeeze()[1:], "VIS_REFERENCE.png")
-            # Ask user for coordinates
-            while True: 
-                x_coord = int(input("Enter x coordinate (0–512): "))
-                y_coord = int(input("Enter y coordinate (0–512): "))
-                if 0 < x_coord < 512 and 0 < y_coord < 512: 
-                    break
-                else: 
-                    print("Invalid input. Please type valid values. ")
-        else:
-            # Random selection
-            x_coord = random.randint(0, 511)
-            y_coord = random.randint(0, 511)
-        coords = {"x": x_coord, "y": y_coord}
-        json_path = os.path.join(outdir, "coords.json")
-        with open(json_path, "w") as f:
-            json.dump(coords, f, indent=4) 
+        # if config.coord_select:
+        #     if config.view_select is False:
+        #         overlay_grid_and_save(tgt_image, spacing=64, out_path="VIS_OVERLAY.png")
+        #         save_image(images.squeeze()[1:], "VIS_REFERENCE.png")
+        #     # Ask user for coordinates
+        #     while True: 
+        #         x_coord = int(input("Enter x coordinate (0–512): "))
+        #         y_coord = int(input("Enter y coordinate (0–512): "))
+        #         if 0 < x_coord < 512 and 0 < y_coord < 512: 
+        #             break
+        #         else: 
+        #             print("Invalid input. Please type valid values. ")
+        # else:
+        #     # Random selection
+        #     x_coord = random.randint(0, 511)
+        #     y_coord = random.randint(0, 511)
+        # coords = {"x": x_coord, "y": y_coord}
+        # json_path = os.path.join(outdir, "coords.json")
+        # with open(json_path, "w") as f:
+        #     json.dump(coords, f, indent=4) 
 
         # batch: always order by seq idx
         # uniform_push_batch: set condition (uniform sampling, no randomness) to front, tgt to last
@@ -387,64 +401,60 @@ def main(nframe, cond_num, inference_view_range,
         ''' unet_attn_cache(dict): {layer_id(str): attnmap tensor(B, head, Q(VHW), K(VHW)}
         '''
         for unet_layer in caching_unet_attn_layers:
-            print(f"layer: {unet_layer} shape : {unet_attn_cache[str(unet_layer)].shape}")
+            #print(f"layer: {unet_layer} shape : {unet_attn_cache[str(unet_layer)].shape}")
             unet_attn_logit = unet_attn_cache[str(unet_layer)] # [B, H, Q, K]
             B, H, Q, K = unet_attn_logit.shape
-            if B == 3 : # self attention
-                query_size = int(math.sqrt(Q))
-                # Convert pixel coords -> feature map index
-                y_feat_cost = int((y_coord / 512) * query_size)
-                x_feat_cost = int((x_coord / 512) * query_size)
-                query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
-                attn_maps = unet_attn_logit.mean(dim=1) # [3, Q, K]
-                all_scores = torch.softmax(attn_maps[:, query_token_idx_cost], dim=-1)
-                score1 = all_scores[0].reshape(query_size, query_size)
-                score2 = all_scores[1].reshape(query_size, query_size)
-                score = torch.cat([score1, score2], dim=-1)
-            else: 
-                query_idx = [nframe-1]
-                if config.cross_only: 
-                    key_idx = list(range(nframe-1))
-                else:
-                    key_idx = list(range(nframe))
-                unet_attn_logit = slice_attnmap(unet_attn_logit, query_idx=query_idx, key_idx=key_idx) # [B, H, Q, K]
-                # average over head
-                attn_maps = unet_attn_logit.mean(dim=1)   # [B, Q, K]
-                attn_maps = attn_maps[0]                  # take batch 0 → [Q, K]
-                
-                B, H, Q, K = unet_attn_logit.shape
-                query_size = int(math.sqrt(Q))
-                # Convert pixel coords -> feature map index
-                y_feat_cost = int((y_coord / 512) * query_size)
-                x_feat_cost = int((x_coord / 512) * query_size)
-                query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
-                
-                # attention for chosen query token
-                all_scores = torch.softmax(attn_maps[query_token_idx_cost], dim=-1)
-                tokens_per_img = query_size * query_size
-                scores_split = all_scores.split(tokens_per_img)
-                score = torch.cat([s.reshape(query_size, query_size) for s in scores_split], dim=-1)
-
+            # if B == 3 : # self attention
+            #     query_size = int(math.sqrt(Q))
+            #     # Convert pixel coords -> feature map index
+            #     y_feat_cost = int((y_coord / 512) * query_size)
+            #     x_feat_cost = int((x_coord / 512) * query_size)
+            #     query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
+            #     attn_maps = unet_attn_logit.mean(dim=1) # [3, Q, K]
+            #     all_scores = torch.softmax(attn_maps[:, query_token_idx_cost], dim=-1)
+            #     score1 = all_scores[0].reshape(query_size, query_size)
+            #     score2 = all_scores[1].reshape(query_size, query_size)
+            #     score = torch.cat([score1, score2], dim=-1)
+            # else: 
+            query_idx = [nframe-1]
+            if config.cross_only: 
+                key_idx = list(range(nframe-1))
+            else:
+                key_idx = list(range(nframe))
+            unet_attn_logit = slice_attnmap(unet_attn_logit, query_idx=query_idx, key_idx=key_idx) # [B, H, Q, K]
+            # average over head
+            unet_attn_logit = unet_attn_logit.mean(dim=1)   # [B, Q, K]
+            unet_attn_logit = unet_attn_logit[0]                  # take batch 0 → [Q, K]
+            # query_size = int(math.sqrt(Q))
+            # Convert pixel coords -> feature map index
+            # y_feat_cost = int((y_coord / 512) * query_size)
+            # x_feat_cost = int((x_coord / 512) * query_size)
+            # query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
+            
+            # attention for chosen query token
+            all_scores = torch.softmax(unet_attn_logit, dim=-1)
+            del unet_attn_logit
+            H, W = all_scores.shape
             vggt_pred = vggt_model(images)
             if "track_head" in config.mode:
                 gt_query, gt_key = vggt_pred['attn_cache']['track_head']['query'], vggt_pred['attn_cache']['track_head']['key'] # torch.Size([1, 1, 2668324, 128])
-                score_vggt = get_costmap(gt_query, gt_key, x_coord, y_coord, "tracking") # 32, 3*32
+                score_vggt = get_costmap(gt_query, gt_key, "tracking", H) # 32, 3*32
                 # combined_img = save_image_total(images, x_coord, y_coord, score)
                 # combined_img.save(f"{outdir}/tracking.png")
                 # save_individuals(combined_img, f"{outdir}/tracking")  
             if "attention" in config.mode:
                 for layer in config.attn_idx:
                     gt_query, gt_key = vggt_pred['attn_cache'][f'{layer}']['query'], vggt_pred['attn_cache'][f'{layer}']['key'] # torch.Size([1, 16, 5476, 64])
-                    score_vggt = get_costmap(gt_query, gt_key, x_coord, y_coord, "attention") # 32, 3*32
-                    combined_img = save_image_total(images, x_coord, y_coord, score)
-                    combined_img.save(f"{outdir}/attn{layer}.png")
+                    score_vggt = get_costmap(gt_query, gt_key, "attention", H) # 32, 3*32
+                    # combined_img = save_image_total(images, x_coord, y_coord, score)
+                    # combined_img.save(f"{outdir}/attn{layer}.png")
                     # if cfg.save_individuals: 
                     #     save_individuals(combined_img, f"{outdir}/attn{layer}")  
             if "pointmap" in config.mode:
                 pointmap = batch['point_map'] # [1, V, 3, 512, 512]
                 gt_query = pointmap.permute(0,1,3,4,2).reshape(1, 1, -1, 3) # [1, 4, 512, 512, 3]
                 gt_key = gt_query
-                score_vggt = get_costmap(gt_query, gt_key, x_coord, y_coord, "pointmap") 
+                score_vggt = get_costmap(gt_query, gt_key, "pointmap", H) 
                 # combined_img = save_image_total(images, x_coord, y_coord, score)
                 # combined_img.save(f"{outdir}/pointmap.png")
                 
@@ -453,18 +463,25 @@ def main(nframe, cond_num, inference_view_range,
             
             # combined_img = save_image_total(images, x_coord, y_coord, score)
             # combined_img.save(f"{outdir}/attn{unet_layer}.png")
-        import pdb; pdb.set_trace()
-        if config.save_originals:
-            save_image(tgt_image, f"{outdir}/TARGET.png")
-            tgt_image_marked = mark_point_on_img(tgt_image, x_coord, y_coord)
-            target_marked = torch.from_numpy(tgt_image_marked).permute(2, 0, 1).float() / 255.0
-            save_image(target_marked, f"{outdir}/TARGET_MARKED.png")
 
-            ref_imgs = images.squeeze()[:-1]
-            ref_concat = torch.cat([img for img in ref_imgs], dim=-1)  # shape [C, H, W*3] # save as one single image save_image(ref_concat, f"{outdir}/REFERENCE.png")
-            save_image(ref_concat, f"{outdir}/REFERENCE.png")
-            print(f"Saved visualization to outputs.png")
-        if idx == 200: break
+            score_vggt = score_vggt.to(device)
+            eps = 1e-12
+            cross_entropy = -(score_vggt * torch.log(all_scores + eps)).sum(axis=1)
+            cross_entropy_mean = cross_entropy.mean()
+            if f'{unet_layer}' not in similarity_score.keys():
+                similarity_score[f'{unet_layer}'] = [] 
+            similarity_score[f'{unet_layer}'].append(cross_entropy_mean.item())
+        # if config.save_originals:
+        #     save_image(tgt_image, f"{outdir}/TARGET.png")
+        #     tgt_image_marked = mark_point_on_img(tgt_image, x_coord, y_coord)
+        #     target_marked = torch.from_numpy(tgt_image_marked).permute(2, 0, 1).float() / 255.0
+        #     save_image(target_marked, f"{outdir}/TARGET_MARKED.png")
+
+        #     ref_imgs = images.squeeze()[:-1]
+        #     ref_concat = torch.cat([img for img in ref_imgs], dim=-1)  # shape [C, H, W*3] # save as one single image save_image(ref_concat, f"{outdir}/REFERENCE.png")
+        #     save_image(ref_concat, f"{outdir}/REFERENCE.png")
+        #     print(f"Saved visualization to outputs.png")
+
         
 
 if __name__ == "__main__":
@@ -476,12 +493,12 @@ if __name__ == "__main__":
     config_file_path = 'attn_vggt_similarity.yaml'
     config = EasyDict(OmegaConf.load(config_file_path))
     # noise
-    noise_timestep = config.noise_timestep
+    noise_timestep = config.unet_visualize.noise_timestep
     # data
     nframe = config.nframes # View length
-    cond_num = config.cond_num # Condition among nframe
+    cond_num = config.unet_visualize.cond_num # Condition among nframe
     inference_view_range = config.inference_view_range # change if you want 
-    caching_unet_attn_layers = config.caching_unet_attn_layers
+    caching_unet_attn_layers = config.unet_visualize.caching_unet_attn_layers
     #caching_unet_attn_layers = range(15)
 
-    main(nframe, cond_num, inference_view_range, caching_unet_attn_layers, noise_timestep=noise_timestep, resume_checkpoint=config.resume_checkpoint, config=config)
+    main(nframe, cond_num, inference_view_range, caching_unet_attn_layers, noise_timestep=noise_timestep, resume_checkpoint=config.unet_visualize.resume_checkpoint, config=config)
