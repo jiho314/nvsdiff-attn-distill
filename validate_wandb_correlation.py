@@ -7,6 +7,8 @@ import pandas as pd
 import numpy as np
 import math
 import wandb
+from scipy.stats import pearsonr, norm
+from datetime import datetime
 
 
 def fetch_run_metrics(run_path):
@@ -181,13 +183,26 @@ def compute_and_save_correlation(history_df, out_path):
             # if this column already represented in aggregated_df, skip
             if c in aggregated_df:
                 continue
-            # parse name and create standardized column name
+            # robust parsing: support trailing '/P{fn}' suffix and varied path segments
+            parts = c.split('/')
+            fn = None
+            base_part = parts[-1]
+            if base_part.startswith('P') and len(parts) >= 2:
+                # pattern like .../<base_part_prev>/P<fn>
+                fn = base_part[1:]
+                base_part = parts[-2]
+
+            # parse layer/step from the full column name
             layer, head, step = _parse_attn_name(c)
-            short = c.split('/')[-1]
+
+            short = base_part
             t = short
             if layer is not None and layer != -1:
                 t = re.sub(rf'unet{layer}_?', '', short)
-            col_name = f"attn_step{step if step is not None else -1}_unet{layer if layer is not None else -1}_{t}"
+
+            # append fn suffix to standardized col name if present
+            fn_suffix = f"_P{fn}" if fn is not None else ""
+            col_name = f"attn_step{step if step is not None else -1}_unet{layer if layer is not None else -1}_{t}{fn_suffix}"
             if col_name not in numeric.columns:
                 try:
                     numeric[col_name] = numeric[c].astype(float)
@@ -255,27 +270,60 @@ def compute_and_save_correlation(history_df, out_path):
     # Keep only the good columns
     numeric = numeric[good_metrics + good_attn]
 
-    # Compute pairwise Pearson correlation between each metric and each attention column.
-    # Require at least 2 paired samples and non-constant arrays to compute correlation.
+    # Compute pairwise Pearson correlation, p-value, and 95% CI between each metric and each attention column.
+    # Require at least 2 paired samples and non-constant arrays to compute correlation; CI needs n > 3.
     corr_df = pd.DataFrame(index=good_metrics, columns=good_attn, dtype=float)
+    p_df = pd.DataFrame(index=good_metrics, columns=good_attn, dtype=float)
+    ci_lower_df = pd.DataFrame(index=good_metrics, columns=good_attn, dtype=float)
+    ci_upper_df = pd.DataFrame(index=good_metrics, columns=good_attn, dtype=float)
     for mcol in good_metrics:
         for acol in good_attn:
             a = numeric[acol]
             b = numeric[mcol]
             mask = a.notna() & b.notna()
-            if int(mask.sum()) < 2:
-                corr = np.nan
+            n_paired = int(mask.sum())
+            if n_paired < 2:
+                r_val = np.nan
+                p_val = np.nan
+                lo = np.nan
+                hi = np.nan
             else:
                 aa = a[mask].astype(float).to_numpy()
                 bb = b[mask].astype(float).to_numpy()
                 if np.nanstd(aa) == 0 or np.nanstd(bb) == 0:
-                    corr = np.nan
+                    r_val = np.nan
+                    p_val = np.nan
+                    lo = np.nan
+                    hi = np.nan
                 else:
                     try:
-                        corr = float(np.corrcoef(aa, bb)[0, 1])
+                        r_val, p_val = pearsonr(aa, bb)
                     except Exception:
-                        corr = np.nan
-            corr_df.at[mcol, acol] = corr
+                        # fallback to numpy-based estimate if pearsonr fails
+                        try:
+                            r_val = float(np.corrcoef(aa, bb)[0, 1])
+                            p_val = np.nan
+                        except Exception:
+                            r_val = np.nan
+                            p_val = np.nan
+                    # 95% CI using Fisher z-transform when enough samples
+                    if n_paired > 3 and (not np.isnan(r_val)) and abs(r_val) < 0.9999999:
+                        try:
+                            fisher_z = np.arctanh(r_val)
+                            se = 1.0 / math.sqrt(n_paired - 3)
+                            z_crit = norm.ppf(0.975)
+                            lo = np.tanh(fisher_z - z_crit * se)
+                            hi = np.tanh(fisher_z + z_crit * se)
+                        except Exception:
+                            lo = np.nan
+                            hi = np.nan
+                    else:
+                        lo = np.nan
+                        hi = np.nan
+            corr_df.at[mcol, acol] = float(r_val) if not (isinstance(r_val, float) and np.isnan(r_val)) else np.nan
+            p_df.at[mcol, acol] = float(p_val) if not (isinstance(p_val, float) and np.isnan(p_val)) else np.nan
+            ci_lower_df.at[mcol, acol] = float(lo) if not (isinstance(lo, float) and np.isnan(lo)) else np.nan
+            ci_upper_df.at[mcol, acol] = float(hi) if not (isinstance(hi, float) and np.isnan(hi)) else np.nan
 
     # Prepare plotting: heatmap with rows=metrics, cols=attention columns
     metric_list = good_metrics
@@ -286,10 +334,13 @@ def compute_and_save_correlation(history_df, out_path):
     # Also compute mean attention loss per attn column for diagnostics
     attn_means = {acol: float(numeric[acol].mean()) if int(numeric[acol].notna().sum()) > 0 else np.nan for acol in attn_list}
 
-    # Ensure output directory exists for diagnostic CSVs and images
-    base, ext = os.path.splitext(out_path)
-    out_dir = base + '_per_metric'
+    # Ensure output directory exists under `validation_metrics_correlation_wandb_per_metric/<timestamp>`
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    out_root = 'validation_metrics_correlation_wandb_per_metric'
+    os.makedirs(out_root, exist_ok=True)
+    out_dir = os.path.join(out_root, ts)
     os.makedirs(out_dir, exist_ok=True)
+    base, ext = os.path.splitext(out_path)
 
     # Build metadata for attention columns (layer, step, and short name)
     attn_meta = []
@@ -307,7 +358,7 @@ def compute_and_save_correlation(history_df, out_path):
     if not steps_present:
         steps_present = [-1]
 
-    # For each step produce two image-like subplots: track_head and point_map
+    # For each step produce plots per variation/type (e.g., 'pointmap', 'pointmap_Psoftargmax_l2', 'track_head', ...)
     metric_display = {m: m if not m.endswith('_inv') else m for m in metric_list}
     for step in steps_present:
         cols_in_step = [m['col'] for m in attn_meta if m['step'] == step]
@@ -318,20 +369,31 @@ def compute_and_save_correlation(history_df, out_path):
         # map col -> meta for this step
         meta_map = {m['col']: m for m in attn_meta if m['col'] in cols_in_step}
 
-        def build_group_df(filter_fn):
+        # collect unique types for this step
+        types = sorted({m['type'] for m in meta_map.values()})
+        if not types:
+            continue
+
+        cmap = 'RdBu_r'
+        vmin, vmax = -1.0, 1.0
+
+        for t in types:
+            # build grouped dataframe for this specific type
             groups = {}
             for col, meta in meta_map.items():
-                if not filter_fn(meta):
+                if meta['type'] != t:
                     continue
                 key = f"Unet {meta['layer']} - {meta['type']}"
                 groups.setdefault(key, []).append(col)
             if not groups:
-                return None
+                continue
+
             # order rows by unet layer descending when possible
             def _layer_key(k):
                 m = re.search(r'Unet\s+(-?\d+)', k)
                 return -int(m.group(1)) if m else 0
             ordered = sorted(groups.items(), key=lambda kv: _layer_key(kv[0]))
+
             rows = []
             row_labels = []
             for key, cols_for_key in ordered:
@@ -340,62 +402,104 @@ def compute_and_save_correlation(history_df, out_path):
                 row_labels.append(key)
             heat = np.vstack(rows) if rows else np.empty((0, len(metric_list)))
             df = pd.DataFrame(heat, index=row_labels, columns=metric_list)
-            return df
 
-        df_track = build_group_df(lambda m: 'track' in m['type'])
-        df_point = build_group_df(lambda m: 'point' in m['type'] or 'map' in m['type'])
+            # plot a single heatmap for this type
+            nrows = max(1, df.shape[0])
+            fig, ax = plt.subplots(1, 1, figsize=(6, max(2.5, 0.35 * nrows)))
+            if df.empty:
+                ax.text(0.5, 0.5, 'no data', ha='center', va='center')
+                ax.axis('off')
+            else:
+                # annotate heatmap with correlation coefficients and p-values if available
+                annot_df = df.copy()
+                # build annotation strings: r (p)
+                annot_str = annot_df.copy().astype(object)
+                for i in range(annot_df.shape[0]):
+                    for j in range(annot_df.shape[1]):
+                        r_val = annot_df.iat[i, j]
+                        try:
+                            p_val = p_df.iloc[j, groups[list(groups.keys())[i]].index(cols_for_key)[0]] if False else None
+                        except Exception:
+                            p_val = None
+                        # fallback: use p_df lookup by metric(row), attn(col)
+                        metric_name = annot_df.index.name if annot_df.index.name else None
+                        # simpler: use mapping by row label -> group cols mean; we'll annotate with p from p_df using metric_list and corresponding attn columns
+                        # assemble p for mean across cols_for_key per metric
+                        # For simplicity annotate with mean p across the group's attn cols
+                        # compute mean p across attn cols for this group and metric
+                        try:
+                            metric_row = annot_df.columns[j]
+                            # this will not always be correct for labeling; instead compute mean p from p_df for the metric and group's cols
+                            pass
+                        except Exception:
+                            pass
+                # Instead of complex per-cell p lookups, build heatmap with r-values and later save p/CI CSVs for downstream inspection
+                sns.heatmap(df, annot=True, fmt='.3f', cmap=cmap, vmin=vmin, vmax=vmax, cbar=True, ax=ax)
+                ax.set_ylabel('')
+                ax.set_xlabel('')
+                ax.set_title(f'{t}')
 
-        # prepare figure with two subplots side-by-side
-        nrows = max((len(df_track.index) if df_track is not None else 0), (len(df_point.index) if df_point is not None else 0))
-        if nrows == 0:
-            continue
-        fig, axes = plt.subplots(1, 2, figsize=(10, max(3, 0.35 * nrows)), sharey=False)
-        if not isinstance(axes, (list, np.ndarray)):
-            axes = [axes]
+            step_label = f'step{step}' if step != -1 else 'global'
+            # sanitize type string for filename
+            t_fname = re.sub(r'[^0-9A-Za-z_\-]', '_', t)
+            out_file = os.path.join(out_dir, f"{os.path.basename(base)}_{step_label}_{t_fname}.png")
+            fig.suptitle(f'Correlation per-layer ({step_label}) - {t}')
+            fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+            fig.savefig(out_file, dpi=150)
+            plt.close(fig)
 
-        cmap = 'RdBu_r'
-        vmin, vmax = -1.0, 1.0
+            # save csv for this type
+            df.to_csv(os.path.join(out_dir, f"{os.path.basename(base)}_{step_label}_{t_fname}.csv"))
 
-        # left: track
-        ax = axes[0]
-        if df_track is None or df_track.empty:
-            ax.text(0.5, 0.5, 'no track data', ha='center', va='center')
-            ax.axis('off')
-        else:
-            sns.heatmap(df_track, annot=True, fmt='.3f', cmap=cmap, vmin=vmin, vmax=vmax, cbar=False, ax=ax)
-            ax.set_ylabel('')
-            ax.set_xlabel('')
-            ax.set_title('track head')
+            # Also save p-values and 95% CI for the metric x attn columns used to build this grouped df
+            # Build p/ci DataFrame restricted to the attn cols in this step/type
+            # p_df, ci_lower_df, ci_upper_df are full matrices indexed by metric x attn
+            try:
+                p_sub = p_df.loc[metric_list, cols_for_key]
+                ci_lo_sub = ci_lower_df.loc[metric_list, cols_for_key]
+                ci_hi_sub = ci_upper_df.loc[metric_list, cols_for_key]
+                p_sub.to_csv(os.path.join(out_dir, f"{os.path.basename(base)}_{step_label}_{t_fname}_pvalues.csv"))
+                ci_lo_sub.to_csv(os.path.join(out_dir, f"{os.path.basename(base)}_{step_label}_{t_fname}_ci_lower.csv"))
+                ci_hi_sub.to_csv(os.path.join(out_dir, f"{os.path.basename(base)}_{step_label}_{t_fname}_ci_upper.csv"))
+            except Exception:
+                # skip saving subgroup p/ci if indexing fails
+                pass
 
-        # right: pointmap
-        ax = axes[1]
-        if df_point is None or df_point.empty:
-            ax.text(0.5, 0.5, 'no pointmap data', ha='center', va='center')
-            ax.axis('off')
-        else:
-            sns.heatmap(df_point, annot=True, fmt='.3f', cmap=cmap, vmin=vmin, vmax=vmax, cbar=True, ax=ax)
-            ax.set_ylabel('')
-            ax.set_xlabel('')
-            ax.set_title('point map')
-
-        step_label = f'step{step}' if step != -1 else 'global'
-        fig.suptitle(f'Correlation per-layer ({step_label})')
-        fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-        out_file = os.path.join(out_dir, f"{os.path.basename(base)}_{step_label}_attn_metric_heatmap.png")
-        fig.savefig(out_file, dpi=150)
-        plt.close(fig)
-
-        # save csvs
-        if df_track is not None:
-            df_track.to_csv(os.path.join(out_dir, f"{os.path.basename(base)}_{step_label}_track.csv"))
-        if df_point is not None:
-            df_point.to_csv(os.path.join(out_dir, f"{os.path.basename(base)}_{step_label}_pointmap.csv"))
-
-    # Save overall corr and means as diagnostics
+    # Save overall corr, p-values, CI and means as diagnostics
     corr_csv = os.path.join(out_dir, f"{os.path.basename(base)}_attn_metric_corr.csv")
     corr_df.to_csv(corr_csv)
+    p_csv = os.path.join(out_dir, f"{os.path.basename(base)}_attn_metric_pvalues.csv")
+    p_df.to_csv(p_csv)
+    ci_lo_csv = os.path.join(out_dir, f"{os.path.basename(base)}_attn_metric_ci_lower.csv")
+    ci_lower_df.to_csv(ci_lo_csv)
+    ci_hi_csv = os.path.join(out_dir, f"{os.path.basename(base)}_attn_metric_ci_upper.csv")
+    ci_upper_df.to_csv(ci_hi_csv)
     means_csv = os.path.join(out_dir, f"{os.path.basename(base)}_attn_means.csv")
     pd.DataFrame.from_dict(attn_means, orient='index', columns=['mean']).to_csv(means_csv)
+
+    # Also save a combined long-form CSV with r, p, ci, and attn metadata per (metric, attn_col)
+    rows = []
+    for m in good_metrics:
+        for a in good_attn:
+            meta = next((it for it in attn_meta if it['col'] == a), None)
+            layer = meta['layer'] if meta is not None else -1
+            step = meta['step'] if meta is not None else -1
+            short = meta['short'] if meta is not None else a.split('/')[-1]
+            rows.append({
+                'metric': m,
+                'attn_col': a,
+                'attn_short': short,
+                'unet_layer': layer,
+                'step': step,
+                'r': corr_df.at[m, a],
+                'p_value': p_df.at[m, a],
+                'ci_lower': ci_lower_df.at[m, a],
+                'ci_upper': ci_upper_df.at[m, a],
+                'attn_mean': attn_means.get(a, np.nan),
+                'n_samples': int(numeric[a].notna().sum()),
+            })
+    combined = pd.DataFrame(rows)
+    combined.to_csv(os.path.join(out_dir, f"{os.path.basename(base)}_attn_metric_combined.csv"), index=False)
 
     # finished: return used columns and numeric dataframe
     good_cols = good_metrics + good_attn
@@ -414,7 +518,7 @@ def main():
     os.environ['WANDB_API_KEY'] = "5e4d6a67a9287ff9ad9b05ccc97582fcb1d48dfe"
     # args.run_id = "jsh0423_/nvs-vggt-distill/kkprdt1l" # 2000
     # args.run_id = "jsh0423_/nvs-vggt-distill/96m4i9kp" # 6000
-    args.run_id = "jsh0423_/nvs-vggt-distill/ezqao5jc"
+    args.run_id = "jsh0423_/nvs-vggt-distill/8p7ouayu"
     
     history = fetch_run_metrics(args.run_id)
 

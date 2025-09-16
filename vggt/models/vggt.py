@@ -283,11 +283,11 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             with torch.cuda.amp.autocast(dtype = torch.float32):
                 track_feat = self.track_head.feature_extractor(aggregated_tokens_list, images_vggt, patch_start_idx) # B S C H W
                 coord_preds, vis_e, track_feats, query_track_feat, conf_e = self.track_head.tracker(query_points=query_points, fmaps=track_feat, iters=4, return_feat=True)
-            attn_cache["track_head"] = {
-                'query': query_track_feat.unsqueeze(1), # B Head(1) HW 128
-                "key" : track_feats.unsqueeze(1) # B Head(1) S HW 128
+            
+            attn_cache["refine_track_head"] = {
+                'query': track_feats.reshape(B, -1, 128).unsqueeze(1), # B 1 SHW 128
+                "key" : track_feats.reshape(B, -1, 128).unsqueeze(1) # B S HW 128
             }
-            import pdb; pdb.set_trace()
 
         predictions['attn_cache'] = attn_cache
 

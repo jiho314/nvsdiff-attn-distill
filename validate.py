@@ -765,9 +765,9 @@ def main():
         # 'costmap_metric': 'neg_log_l2',
 
         'vggt_logit_head': "softmax_headmean",
-        'vggt_logit_head_kwargs': {"softmax_temp": 0.01},
+        'vggt_logit_head_kwargs': {"softmax_temp": 0.001},
         'unet_logit_head': "softmax_headmean",
-        'unet_logit_head_kwargs': {"softmax_temp": 1.0},
+        'unet_logit_head_kwargs': {"softmax_temp": 1},
         # 'costmap_metric': 'dot_product',
         
         # Loss 계산용 설정 (train과 동일하게)
@@ -775,8 +775,8 @@ def main():
         'loss_key': "reference",     # loss 계산 시 사용할 key
         # Visualization용 설정 (시각화에서만 사용)
         'viz_query': "target",       # 시각화 시 사용할 query
-        'viz_key': "all",            # 시각화 시 사용할 key (self attention 포함)
-        'student_unet_attn_layers': list((2,4,6,8,10,12)),
+        'viz_key': "reference",            # 시각화 시 사용할 key (self attention 포함)
+        'student_unet_attn_layers': list((0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)),
         
         
         # 시각화 설정 추가
@@ -792,12 +792,12 @@ def main():
         # pairs: list of dicts defining per-pair settings
         # format: {'unet_layer': int, 'vggt_layer': str_or_int, 'costmap_metric': str, 'loss_fn': str}
         "softargmax_num_key_views": 2,
+        # debug options: enable detailed softargmax vs argmax dumps
+        # 'debug_softargmax': True,
+        # 'debug_save_dir': 'debug_attn_maps',
         'pairs': [
-            {'unet_layer': l, 'vggt_layer': 'point_map', 'costmap_metric': 'inverse_l2', 'loss_fn': 'softargmax_l2'}
-            for l in (2, 4, 6, 8, 10, 12)
-        ] + [
-            {'unet_layer': l, 'vggt_layer': 'point_map', 'costmap_metric': 'inverse_l2', 'loss_fn': 'argmax_l2'}
-            for l in (2, 4, 6, 8, 10, 12)
+            {'unet_layer': l, 'vggt_layer': 'point_map', 'costmap_metric': 'neg_l2', 'loss_fn': 'cross_entropy'}
+            for l in list((0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15))
         ],
     }
     # costmap metric 설정: 'neg_log_l2', 'neg_l2', 'inverse_l2', 'dot_product'
@@ -934,7 +934,7 @@ def main():
     from src.datasets.re10k_wds import build_re10k_wds
 
     val_wds_dataset_config = {'url_paths': [ "/mnt/data2/minseop/realestate_val_wds", ],
-        'dataset_length': 53,
+        'dataset_length': 200,
         'resampled': False,
         'shardshuffle': False,
         'num_viewpoints': 3,

@@ -1190,7 +1190,7 @@ def main():
 
                 # DEBUG for NaN loss
                 if torch.isnan(loss).item():
-                    accelerator.log({"train/nan/diff_loss": train_loss}, step=global_step)
+                    accelerator.log({"train/nan/diff_loss": diff_loss}, step=global_step)
                     if do_attn_distill:
                         accelerator.log({"train/nan/distill_loss": distill_loss.item()}, step=global_step)
                         accelerator.log({k.replace("train", "train/nan"):v.item() for k,v in distill_loss_dict.items() })
@@ -1234,6 +1234,15 @@ def main():
                     if do_attn_distill:  
                         accelerator.log({"train/distill_loss": distill_loss.item()}, step=global_step)
                         accelerator.log(distill_loss_dict, step=global_step)
+                        # softmax temperature info
+                        for unet_layer, vggt_layer in config.distill_config.distill_pairs:
+                            unet_layer_logit_head = unet.unet_logit_head[str(unet_layer)]
+                            if hasattr(unet_layer_logit_head, 'softmax_temp'):
+                                accelerator.log({f"train/distill/unet{unet_layer}_temp": unet_layer_logit_head.softmax_temp}, step=global_step)
+                            vggt_layer_logit_head = unet.vggt_logit_head[str(vggt_layer)]
+                            if hasattr(vggt_layer_logit_head, 'softmax_temp'):
+                                accelerator.log({f"train/distill/vggt{vggt_layer}_temp": vggt_layer_logit_head.softmax_temp}, step=global_step)
+
                     # logger.info(f"Loss: {train_loss}")
 
                 if (global_step % args.train_log_interval == 0 or first_batch) and accelerator.is_main_process:

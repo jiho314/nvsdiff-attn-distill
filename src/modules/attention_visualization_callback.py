@@ -624,114 +624,157 @@ class AttentionVisualizationCallback(PipelineCallback):
             num_key_views: int,
             step_index: int,
             layer_key: str,
+            chosen_fn: Optional[str] = None,
     ) -> None:
-        """디버그용: pred/gt에 대해 softargmax vs argmax 좌표를 계산해 npz로 저장하고 요약 로그를 출력함."""
+        """디버그용 시각화: pred/gt heatmap에 argmax(빨강)와 softargmax(파랑) 좌표를 오버레이한 PNG를 저장하고
+        callback 내부 이미지 캐시에 추가합니다. 저장은 `visualize_config['debug_save_dir']`로 이루어집니다.
+        """
         if not self.visualize_config.get('debug_softargmax', False):
             return
 
         save_dir = self.visualize_config.get('debug_save_dir', None)
         if save_dir is None:
-            # 기본 디렉토리
             save_dir = os.path.join(os.getcwd(), "debug_attn")
         os.makedirs(save_dir, exist_ok=True)
 
-        # 기대하는 입력 shape: [B, Head, Q, K]
-        pred = pred_prob.detach().to(dtype=torch.float32, device='cpu')
-        gt = gt_prob.detach().to(dtype=torch.float32, device='cpu')
+        # Keep a copy of original inputs to detect whether they already look like probabilities
+        inp_pred = pred_prob.detach().to(dtype=torch.float32, device='cpu')
+        inp_gt = gt_prob.detach().to(dtype=torch.float32, device='cpu')
+
+        # Heuristic: if sums along K ~ 1 -> already probabilities
+        try:
+            pred_sums = inp_pred.sum(dim=-1)
+            gt_sums = inp_gt.sum(dim=-1)
+            pred_is_prob = bool(torch.allclose(pred_sums, torch.ones_like(pred_sums), atol=1e-3))
+            gt_is_prob = bool(torch.allclose(gt_sums, torch.ones_like(gt_sums), atol=1e-3))
+        except Exception:
+            pred_is_prob = False
+            gt_is_prob = False
+
+        # ensure probabilities for visualization
+        pred = inp_pred.softmax(dim=-1) if not pred_is_prob else inp_pred
+        gt = inp_gt.softmax(dim=-1) if not gt_is_prob else inp_gt
 
         B, Hh, Q, K = pred.shape
         num_k = int(num_key_views)
         other = K // num_k
         kp = int(round(math.sqrt(other)))
 
-        # 샘플 소량만 저장 (첫 배치, 첫 헤드들, 최대 4 쿼리)
+        # choose single representative query to visualize (middle of Q)
         b = 0
-        max_q = min(Q, 4)
-        heads_to_check = min(Hh, 2)
+        h = 0
+        q_to_show = min(Q - 1, max(0, Q // 2))
 
-        out = {
-            'meta': {
-                'step': int(step_index),
-                'layer': layer_key,
-                'num_key_views': num_k,
-                'kp': kp,
-                'K': K,
-                'Q': Q,
-            },
-            'entries': []
+        vec_pred = pred[b, h, q_to_show]
+        vec_gt = gt[b, h, q_to_show]
+        p_pred = vec_pred.view(num_k, kp, kp).numpy()
+        p_gt = vec_gt.view(num_k, kp, kp).numpy()
+
+        tiles = []
+        diffs = []
+        tile_px = 128
+        for v in range(num_k):
+            tile_p = p_pred[v]
+            tile_g = p_gt[v]
+
+            # normalize for visualization
+            mp = float(tile_p.min()); Mp = float(tile_p.max())
+            if Mp > mp:
+                p_vis = (tile_p - mp) / (Mp - mp)
+            else:
+                p_vis = np.zeros_like(tile_p)
+            mg = float(tile_g.min()); Mg = float(tile_g.max())
+            if Mg > mg:
+                g_vis = (tile_g - mg) / (Mg - mg)
+            else:
+                g_vis = np.zeros_like(tile_g)
+
+            # argmax (hard)
+            pred_idx = int(tile_p.reshape(-1).argmax())
+            gt_idx = int(tile_g.reshape(-1).argmax())
+            pred_y = pred_idx // kp; pred_x = pred_idx % kp
+            gt_y = gt_idx // kp; gt_x = gt_idx % kp
+
+            # softargmax (expectation)
+            xs = np.arange(kp)
+            pred_sx = (tile_p * xs.reshape(1, kp)).sum(axis=(0,1)) / (tile_p.sum() + 1e-12)
+            pred_sy = (tile_p * xs.reshape(kp, 1)).sum(axis=(0,1)) / (tile_p.sum() + 1e-12)
+            gt_sx = (tile_g * xs.reshape(1, kp)).sum(axis=(0,1)) / (tile_g.sum() + 1e-12)
+            gt_sy = (tile_g * xs.reshape(kp, 1)).sum(axis=(0,1)) / (tile_g.sum() + 1e-12)
+
+            diffs.append(float(np.sqrt((pred_sx - pred_x)**2 + (pred_sy - pred_y)**2)))
+
+            p_rgb = self._attn_gray_to_rgb(p_vis)
+            g_rgb = self._attn_gray_to_rgb(g_vis)
+            p_img = _PILImage.fromarray(p_rgb).resize((tile_px, tile_px), _PILImage.NEAREST)
+            g_img = _PILImage.fromarray(g_rgb).resize((tile_px, tile_px), _PILImage.NEAREST)
+
+            draw_p = _PILDraw.Draw(p_img)
+            draw_g = _PILDraw.Draw(g_img)
+            sx = tile_px / float(kp)
+            sy = tile_px / float(kp)
+            r = max(2, tile_px // 32)
+
+            # pred markers: argmax red, softargmax blue
+            cx_pred_hard = int((pred_x + 0.5) * sx)
+            cy_pred_hard = int((pred_y + 0.5) * sy)
+            # draw argmax (red) with white border for visibility
+            draw_p.ellipse((cx_pred_hard - (r+2), cy_pred_hard - (r+2), cx_pred_hard + (r+2), cy_pred_hard + (r+2)), fill=(255,255,255))
+            draw_p.ellipse((cx_pred_hard - r, cy_pred_hard - r, cx_pred_hard + r, cy_pred_hard + r), fill=(255,0,0))
+            cx_pred_soft = int((pred_sx + 0.5) * sx)
+            cy_pred_soft = int((pred_sy + 0.5) * sy)
+            # draw softargmax (yellow) with black border for contrast on blue bg
+            draw_p.ellipse((cx_pred_soft - (r+2), cy_pred_soft - (r+2), cx_pred_soft + (r+2), cy_pred_soft + (r+2)), fill=(0,0,0))
+            draw_p.ellipse((cx_pred_soft - r, cy_pred_soft - r, cx_pred_soft + r, cy_pred_soft + r), fill=(255,255,0))
+
+            # gt markers
+            cx_gt_hard = int((gt_x + 0.5) * sx)
+            cy_gt_hard = int((gt_y + 0.5) * sy)
+            draw_g.ellipse((cx_gt_hard - (r+2), cy_gt_hard - (r+2), cx_gt_hard + (r+2), cy_gt_hard + (r+2)), fill=(255,255,255))
+            draw_g.ellipse((cx_gt_hard - r, cy_gt_hard - r, cx_gt_hard + r, cy_gt_hard + r), fill=(255,0,0))
+            cx_gt_soft = int((gt_sx + 0.5) * sx)
+            cy_gt_soft = int((gt_sy + 0.5) * sy)
+            draw_g.ellipse((cx_gt_soft - (r+2), cy_gt_soft - (r+2), cx_gt_soft + (r+2), cy_gt_soft + (r+2)), fill=(0,0,0))
+            draw_g.ellipse((cx_gt_soft - r, cy_gt_soft - r, cx_gt_soft + r, cy_gt_soft + r), fill=(255,255,0))
+
+            combined = _PILImage.new('RGB', (tile_px * 2 + 6, tile_px), color=(0,0,0))
+            combined.paste(p_img, (0,0))
+            combined.paste(g_img, (tile_px + 6, 0))
+            d = _PILDraw.Draw(combined)
+            d.text((4,4), f"v{v} diff={diffs[-1]:.3f}", fill=(255,255,255))
+            tiles.append(combined)
+
+        W = max([t.width for t in tiles]) if tiles else tile_px * 2 + 6
+        H = sum([t.height for t in tiles]) if tiles else tile_px
+        canvas = _PILImage.new('RGB', (W, H), color=(0,0,0))
+        y = 0
+        for t in tiles:
+            canvas.paste(t, (0, y))
+            y += t.height
+
+        seq = self.visualize_config.get('viz_seq_name', None)
+        if seq is None and isinstance(self.batch, dict) and ('sequence_name' in self.batch):
+            seq = self.batch['sequence_name']
+            if isinstance(seq, (list, tuple)):
+                seq = seq[0]
+        if seq is None:
+            seq = 'sample'
+
+        # annotate chosen loss type and whether inputs looked like probs or logits
+        chosen_txt = chosen_fn if chosen_fn is not None else 'unknown'
+        inp_txt = f"pred={'prob' if pred_is_prob else 'logit'}|gt={'prob' if gt_is_prob else 'logit'}"
+
+        out_fname = os.path.join(save_dir, f"debug_softargmax_step{int(step_index)}_{layer_key}_q{int(q_to_show)}_{chosen_txt}_{uuid.uuid4().hex[:6]}.png")
+        canvas.save(out_fname)
+        print(f"Saved softargmax visualization PNG: {out_fname}")
+
+        key = f"debug/{seq}/step{int(step_index)}/{layer_key}"
+        if not hasattr(self, 'attention_images'):
+            self.attention_images = {}
+        self.attention_images[key] = {
+            'image': canvas,
+            'caption': f"{seq} | {layer_key} | step {int(step_index)} | loss={chosen_txt} | {inp_txt} | diffs={[round(d,3) for d in diffs]}"
         }
-
-        # coordinate grids for softargmax
-        xs = torch.arange(0, kp, dtype=pred.dtype)
-        ys = torch.arange(0, kp, dtype=pred.dtype)
-        # build grids with shape (num_k, kp, kp)
-        gx = xs.view(1, 1, 1, kp).expand(1, 1, kp, kp)
-        gy = ys.view(1, 1, kp, 1).expand(1, 1, kp, kp)
-
-        for h in range(heads_to_check):
-            for q in range(max_q):
-                vec_pred = pred[b, h, q]  # [K]
-                vec_gt = gt[b, h, q]
-
-                # reshape into (num_k, kp, kp)
-                p_pred = vec_pred.view(num_k, kp, kp)
-                p_gt = vec_gt.view(num_k, kp, kp)
-
-                # argmax coords
-                p_pred_flat = p_pred.reshape(num_k, -1)
-                p_gt_flat = p_gt.reshape(num_k, -1)
-                pred_idx = p_pred_flat.argmax(dim=-1).to(dtype=torch.int32).numpy()
-                gt_idx = p_gt_flat.argmax(dim=-1).to(dtype=torch.int32).numpy()
-                pred_y = (pred_idx // kp).astype(np.int32)
-                pred_x = (pred_idx % kp).astype(np.int32)
-                gt_y = (gt_idx // kp).astype(np.int32)
-                gt_x = (gt_idx % kp).astype(np.int32)
-
-                # softargmax coords (expectation)
-                # compute sums over kp dims
-                p_pred_np = p_pred.numpy()
-                p_gt_np = p_gt.numpy()
-                pred_sx = (p_pred_np * np.arange(kp).reshape(1, 1, kp)).sum(axis=(1,2)) / (p_pred_np.sum(axis=(1,2)) + 1e-12)
-                pred_sy = (p_pred_np * np.arange(kp).reshape(1, kp, 1)).sum(axis=(1,2)) / (p_pred_np.sum(axis=(1,2)) + 1e-12)
-                gt_sx = (p_gt_np * np.arange(kp).reshape(1, 1, kp)).sum(axis=(1,2)) / (p_gt_np.sum(axis=(1,2)) + 1e-12)
-                gt_sy = (p_gt_np * np.arange(kp).reshape(1, kp, 1)).sum(axis=(1,2)) / (p_gt_np.sum(axis=(1,2)) + 1e-12)
-
-                # per-view differences between softargmax and argmax
-                per_view_diff = np.sqrt((pred_sx - pred_x)**2 + (pred_sy - pred_y)**2)
-
-                entry = {
-                    'batch': b,
-                    'head': h,
-                    'query': q,
-                    'pred_argmax_x': pred_x.tolist(),
-                    'pred_argmax_y': pred_y.tolist(),
-                    'pred_softargmax_x': pred_sx.tolist(),
-                    'pred_softargmax_y': pred_sy.tolist(),
-                    'gt_argmax_x': gt_x.tolist(),
-                    'gt_argmax_y': gt_y.tolist(),
-                    'gt_softargmax_x': gt_sx.tolist(),
-                    'gt_softargmax_y': gt_sy.tolist(),
-                    'per_view_diff': per_view_diff.tolist(),
-                    'pred_vec': p_pred_np.tolist(),
-                    'gt_vec': p_gt_np.tolist(),
-                }
-                out['entries'].append(entry)
-
-        fname = os.path.join(save_dir, f"debug_softargmax_step{int(step_index)}_{layer_key}_{int(time.time())}_{uuid.uuid4().hex[:6]}.npz")
-        try:
-            # save as npz
-            np.savez_compressed(fname, data=out)
-            print(f"Saved softargmax debug NPZ: {fname}")
-
-            # print concise summary: max difference
-            max_diff = 0.0
-            for e in out['entries']:
-                d = np.array(e['per_view_diff'], dtype=np.float32)
-                if d.size:
-                    max_diff = max(max_diff, float(d.max()))
-            print(f"[debug_softargmax] step={step_index} layer={layer_key} max_soft_vs_hard_pixel_diff={max_diff:.4f}")
-        except Exception as e:
-            print(f"Failed saving softargmax debug file {fname}: {e}")
 
     def __call__(
         self,
@@ -954,6 +997,12 @@ class AttentionVisualizationCallback(PipelineCallback):
                                 softargmax_num_key_views = self.visualize_config.get('softargmax_num_key_views', None)
                             if softargmax_num_key_views is None:
                                 raise ValueError(f"{chosen_fn} requires softargmax_num_key_views set in pair or visualize_config")
+                            # Debug: save numeric comparison between softargmax and argmax if enabled
+                            try:
+                                self._debug_save_argmax_softargmax(pred_prob, gt_prob, softargmax_num_key_views, step_index, layer_key, chosen_fn=chosen_fn)
+                            except Exception:
+                                # intentionally do not crash validation loop on debug failure
+                                print(f"Warning: debug softargmax save failed for step {step_index}, layer {layer_key}")
                             # call appropriate implementation (hard argmax or soft argmax)
                             loss_value = self.ATTN_LOSS_FN[chosen_fn](pred_prob, gt_prob, softargmax_num_key_views)
                         else:
@@ -982,13 +1031,17 @@ class AttentionVisualizationCallback(PipelineCallback):
                     viz_query_idx, viz_key_idx = self._extract_viz_view_indices(F)
                     pred_attn_logit_viz = self._slice_attention_map(pred_attn_logit, viz_query_idx, viz_key_idx, F)
                     gt_attn_logit_viz = self._slice_attention_map(gt_attn_logit, viz_query_idx, viz_key_idx, F)
-                    
-                    print(f"Calling _maybe_save_attn_overlay for step {step_index}, layer {layer_key}")
+
+                    # Process through configured logit heads so visualization respects softmax_temp / head processing
+                    pred_processed_viz = pipeline.unet.unet_logit_head(pred_attn_logit_viz)
+                    gt_processed_viz = pipeline.unet.vggt_logit_head(gt_attn_logit_viz)
+
+                    print(f"Calling _maybe_save_attn_overlay for step {step_index}, layer {layer_key} (using processed logits)")
                     self._maybe_save_attn_overlay(
                         step_index=step_index,
                         layer_key=layer_key,
-                        pred_logits=pred_attn_logit_viz,
-                        gt_logits=gt_attn_logit_viz,
+                        pred_logits=pred_processed_viz,
+                        gt_logits=gt_processed_viz,
                         F=F,
                         query_idx_list=viz_query_idx,
                         key_idx_list=viz_key_idx,

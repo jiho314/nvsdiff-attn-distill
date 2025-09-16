@@ -155,9 +155,9 @@ unet_visualize:
   coord_select: false # select coordinate
   nframe: 4
   cross_only: true
-  noise_timestep: 900 #(0, 1000)
+  noise_timestep: 999 #(0, 1000)
   inference_view_range: 20
   cond_num: 3 #reference num
-  resume_checkpoint: 'check_points/lr1_cosine_noema/checkpoint-30000'
+  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/naive_0915/checkpoint-2000'
   save_originals: true
 
