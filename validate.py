@@ -765,7 +765,7 @@ def main():
         # 'costmap_metric': 'neg_log_l2',
 
         'vggt_logit_head': "softmax_headmean",
-        'vggt_logit_head_kwargs': {"softmax_temp": 0.001},
+        'vggt_logit_head_kwargs': {"softmax_temp": 0.01},
         'unet_logit_head': "softmax_headmean",
         'unet_logit_head_kwargs': {"softmax_temp": 1},
         # 'costmap_metric': 'dot_product',
@@ -792,12 +792,13 @@ def main():
         # pairs: list of dicts defining per-pair settings
         # format: {'unet_layer': int, 'vggt_layer': str_or_int, 'costmap_metric': str, 'loss_fn': str}
         "softargmax_num_key_views": 2,
+        "roll_gt_map" : 1,
         # debug options: enable detailed softargmax vs argmax dumps
         # 'debug_softargmax': True,
         # 'debug_save_dir': 'debug_attn_maps',
         'pairs': [
-            {'unet_layer': l, 'vggt_layer': 'point_map', 'costmap_metric': 'neg_l2', 'loss_fn': 'cross_entropy'}
-            for l in list((0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15))
+            {'unet_layer': l, 'vggt_layer': 'point_map', 'costmap_metric': 'neg_log_l2', 'loss_fn': 'cross_entropy'}
+            for l in list((2,4,6,8,10,12))
         ],
     }
     # costmap metric 설정: 'neg_log_l2', 'neg_l2', 'inverse_l2', 'dot_product'

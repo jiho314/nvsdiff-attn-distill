@@ -617,6 +617,28 @@ class AttentionVisualizationCallback(PipelineCallback):
                 'caption': f"{seq} | {layer_key} | step {int(step_index)}"
             }
 
+    def _roll_gt_map(self, gt_tensor: torch.Tensor) -> torch.Tensor:
+        """Circularly roll the GT map along the last dimension if configured.
+
+        Minimal, dtype/device-preserving implementation. If `visualize_config['roll_gt_map']`
+        is missing or zero, returns the input unchanged.
+        """
+        shift = self.visualize_config.get('roll_gt_map', 0)
+        if not shift:
+            return gt_tensor
+
+        try:
+            shift_int = int(shift)
+        except Exception:
+            print(f"Warning: invalid roll_gt_map value: {shift}; skipping roll")
+            return gt_tensor
+
+        try:
+            return torch.roll(gt_tensor, shifts=shift_int, dims=-1)
+        except Exception as e:
+            print(f"Warning: roll_gt_map failed: {e}")
+            return gt_tensor
+
     def _debug_save_argmax_softargmax(
             self,
             pred_prob: torch.Tensor,
@@ -1004,15 +1026,20 @@ class AttentionVisualizationCallback(PipelineCallback):
                                 # intentionally do not crash validation loop on debug failure
                                 print(f"Warning: debug softargmax save failed for step {step_index}, layer {layer_key}")
                             # call appropriate implementation (hard argmax or soft argmax)
+                            # allow optional GT rolling for ablation (applies to all losses)
+                            gt_prob = self._roll_gt_map(gt_prob)
+                            pred_prob = pred_prob
                             loss_value = self.ATTN_LOSS_FN[chosen_fn](pred_prob, gt_prob, softargmax_num_key_views)
                         else:
                             # non-argmax losses expect (pred, gt)
                             local_loss_fn = self.ATTN_LOSS_FN.get(chosen_fn, None) if chosen_fn is not None else None
+                            # apply roll to gt for all non-argmax losses as well
+                            gt_proc = self._roll_gt_map(gt_processed)
                             if local_loss_fn is None:
                                 # fallback to previously-resolved callable self.loss_fn
-                                loss_value = self.loss_fn(pred_processed, gt_processed)
+                                loss_value = self.loss_fn(pred_processed, gt_proc)
                             else:
-                                loss_value = local_loss_fn(pred_processed, gt_processed)
+                                loss_value = local_loss_fn(pred_processed, gt_proc)
 
                         # include chosen loss function name in the step-level key
                         chosen_fn_str = chosen_fn if chosen_fn is not None else 'default_callable'

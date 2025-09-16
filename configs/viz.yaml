@@ -158,6 +158,6 @@ unet_visualize:
   noise_timestep: 999 #(0, 1000)
   inference_view_range: 20
   cond_num: 3 #reference num
-  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/naive_0915/checkpoint-2000'
+  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/naive_0915/checkpoint-4000'
   save_originals: true
 

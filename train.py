@@ -1238,9 +1238,13 @@ def main():
                         for unet_layer, vggt_layer in config.distill_config.distill_pairs:
                             unet_layer_logit_head = unet.unet_logit_head[str(unet_layer)]
                             if hasattr(unet_layer_logit_head, 'softmax_temp'):
-                                accelerator.log({f"train/distill/unet{unet_layer}_temp": unet_layer_logit_head.softmax_temp}, step=global_step)
+                                t = unet_layer_logit_head.softmax_temp
+                                t = t.detach().cpu().item() if torch.is_tensor(t) else t
+                                accelerator.log({f"train/distill/unet{unet_layer}_temp": t}, step=global_step)
                             vggt_layer_logit_head = unet.vggt_logit_head[str(vggt_layer)]
                             if hasattr(vggt_layer_logit_head, 'softmax_temp'):
+                                t = vggt_layer_logit_head.softmax_temp
+                                t = t.detach().cpu().item() if torch.is_tensor(t) else t
                                 accelerator.log({f"train/distill/vggt{vggt_layer}_temp": vggt_layer_logit_head.softmax_temp}, step=global_step)
 
                     # logger.info(f"Loss: {train_loss}")

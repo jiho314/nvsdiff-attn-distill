@@ -209,8 +209,9 @@ def main(nframe, cond_num, inference_view_range,
 
     # minkyung TODO: 여러 idx에 대해서 viz
     for idx, batch in enumerate(val_dataloader):
-        ckpt_name = os.path.basename(resume_checkpoint)
-        outdir = os.path.join("outputs_unet_attn", timestamp, ckpt_name, f"{noise_timestep}", f"sample{idx}")
+        parent_name = os.path.basename(os.path.dirname(resume_checkpoint))   # lr1_cosine_noema
+        ckpt_name = os.path.basename(resume_checkpoint)                     # checkpoint-30000
+        outdir = os.path.join("outputs_unet_attn", timestamp, parent_name, ckpt_name, f"{noise_timestep}", f"sample{idx}")
         os.makedirs(outdir, exist_ok=True)
         
         images = batch['image'].to(device)  # B V C H W
