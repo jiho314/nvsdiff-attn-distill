@@ -1256,6 +1256,7 @@ def main():
                         accelerator.log({"train/ema_decay": ema_unet.cur_decay_value}, step=global_step)
                     if do_attn_distill:  
                         accelerator.log({"train/distill_loss": distill_loss.item()}, step=global_step)
+                        accelerator.log({"train/distill_loss_weighted": (distill_loss_weight * distill_loss).item()}, step=global_step)
                         accelerator.log(distill_loss_dict, step=global_step)
                         # softmax temperature info
                         for unet_layer, vggt_layer in config.distill_config.distill_pairs:

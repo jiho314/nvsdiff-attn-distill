@@ -116,6 +116,7 @@ def get_camera_embedding(intrinsic, extrinsic, b, f, h, w, config):
     rays_o, rays_d = batch_sample_rays(intrinsic, extrinsic, image_h=h, image_w=w,
                                        normalize_extrinsic=config.get("normalize_extrinsic", True),
                                        normalize_t=config.get("normalize_t", True),
+                                       normalize_extrinsic_tgt = config.get("normalize_extrinsic_tgt", -1),
                                        nframe=f)
     camera_embedding = embed_rays(rays_o, rays_d, nframe=f,
                                   fourier_embedding=config.get("fourier_embedding", False),

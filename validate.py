@@ -221,6 +221,10 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
     show_images = []
     # show_save_dict = collections.defaultdict(int)
     val_iter = 0
+    # per-sample summary metrics (one entry per sample)
+    sample_psnr_means = []
+    sample_ssim_means = []
+    sample_lpips_means = []
 
     cond_num = config.fix_cond_num
 
@@ -372,6 +376,17 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                 
                 # attention 이미지 데이터 준비
                 attention_images_data = attention_images
+                # normalize attention_images_data to list form if callback provided list
+                if isinstance(attention_images_data, dict):
+                    # original dict-style: keys -> {'image', 'caption'}
+                    attention_images_list = []
+                    for k, v in attention_images_data.items():
+                        attention_images_list.append({
+                            'key': k,
+                            'image': v.get('image'),
+                            'caption': v.get('caption')
+                        })
+                    attention_images_data = attention_images_list
                     
             # if batch['tag'][0] not in show_save_dict or show_save_dict[batch['tag'][0]] < 10:  # 每个dataset显示10个
                 # show_save_dict[batch['tag'][0]] += 1
@@ -416,6 +431,10 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
             sample_psnr_mean = float(np.mean(sample_frame_psnr)) if len(sample_frame_psnr) > 0 else 0.0
             sample_ssim_mean = float(np.mean(sample_frame_ssim)) if len(sample_frame_ssim) > 0 else 0.0
             sample_lpips_mean = float(np.mean(sample_frame_lpips)) if len(sample_frame_lpips) > 0 else 0.0
+            # store per-sample summary for later correlation analysis
+            sample_psnr_means.append(sample_psnr_mean)
+            sample_ssim_means.append(sample_ssim_mean)
+            sample_lpips_means.append(sample_lpips_mean)
 
             # wandb 로깅 (메인 프로세스에서만) - 각 샘플별로 개별 global step 사용
             if accelerator.is_main_process:
@@ -451,8 +470,14 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                 
                 # attention 이미지들이 있으면 추가 (callback에서 키에 step 포함됨)
                 if attention_images_data:
-                    for key, img_data in attention_images_data.items():
-                        log_data[key] = wandb.Image(img_data['image'], caption=img_data['caption'])
+                    # attention_images_data is a list of dicts with keys: 'key','image','caption'
+                    for img_entry in attention_images_data:
+                        try:
+                            k = img_entry.get('key')
+                            log_data[k] = wandb.Image(img_entry['image'], caption=img_entry.get('caption'))
+                        except Exception:
+                            # ignore malformed entries
+                            continue
 
                 # callback의 step-level loss들도 wandb에 업로드
                 if do_attn_visualize and attention_callback is not None:
@@ -467,8 +492,26 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                         except Exception:
                             # fallback: store as-is if conversion fails
                             log_data[loss_key] = loss_val
-                
                 print(f"[DEBUG] log_data keys: {list(log_data.keys())}")
+                # build a small preview table from detailed rows if available
+                try:
+                    detailed = attention_callback.get_detailed_rows()
+                    if detailed:
+                        import pandas as _pd
+                        df_preview = _pd.DataFrame(detailed)
+                        # pick top-k by value + random sample
+                        topk = df_preview.nlargest(10, 'value') if 'value' in df_preview.columns else df_preview.head(10)
+                        randk = df_preview.sample(min(10, len(df_preview)))
+                        preview_df = _pd.concat([topk, randk]).drop_duplicates().reset_index(drop=True)
+                        from wandb import Table as _WTable
+                        try:
+                            table = _WTable(dataframe=preview_df)
+                            log_data['val/attn_preview_table'] = table
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
                 # 모든 데이터를 한 번에 로깅
                 accelerator.log(log_data, step=val_iter)
                 
@@ -538,6 +581,39 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                 summary_log_data[f"summary/attention_loss/{clean_layer_name}_std"] = np.std(layer_scores)
                 summary_log_data[f"summary/attention_loss/{clean_layer_name}_min"] = np.min(layer_scores)
                 summary_log_data[f"summary/attention_loss/{clean_layer_name}_max"] = np.max(layer_scores)
+
+        # Correlations between per-sample attention metrics and PSNR/SSIM/LPIPS
+        try:
+            from scipy.stats import pearsonr
+            for layer_key, layer_scores in attention_loss_scores.items():
+                # ensure lengths match
+                try:
+                    arr = np.array(layer_scores)
+                    n = len(arr)
+                    if n <= 1:
+                        continue
+                    # align lengths with sample lists
+                    m_psnr = np.array(sample_psnr_means[:n])
+                    m_ssim = np.array(sample_ssim_means[:n])
+                    m_lpips = np.array(sample_lpips_means[:n])
+
+                    r_psnr, p_psnr = pearsonr(arr, m_psnr)
+                    r_ssim, p_ssim = pearsonr(arr, m_ssim)
+                    r_lpips, p_lpips = pearsonr(arr, m_lpips)
+
+                    clean_layer_name = layer_key.replace('_', '')[:10]
+                    summary_log_data[f"corr/psnr/{clean_layer_name}_r"] = float(r_psnr)
+                    summary_log_data[f"corr/psnr/{clean_layer_name}_p"] = float(p_psnr)
+                    summary_log_data[f"corr/ssim/{clean_layer_name}_r"] = float(r_ssim)
+                    summary_log_data[f"corr/ssim/{clean_layer_name}_p"] = float(p_ssim)
+                    summary_log_data[f"corr/lpips/{clean_layer_name}_r"] = float(r_lpips)
+                    summary_log_data[f"corr/lpips/{clean_layer_name}_p"] = float(p_lpips)
+                except Exception:
+                    # skip correlation for this layer if any error
+                    continue
+        except Exception:
+            # pearsonr not available or other error; skip correlations
+            pass
         
         accelerator.log(summary_log_data, step=summary_step)
 
@@ -707,12 +783,16 @@ def main():
             {
                 'unet_layer': l,
                 
+                # vggt Layer: "track_head", "point_head", any int
                 'vggt_layer': 'point_map',
+                
+                # Costmap metric for vggt: "neg_log_l2", "neg_l2", "inverse_l2", "dot_product"
                 'costmap_metric': 'neg_log_l2',
                 
                 # format: {'unet_layer': int, 'vggt_layer': str_or_int, 'costmap_metric': str, 'loss_fn': str or dict}
                 # `loss_fn` may be either a string (base name) or a dict: {'fn': '<base>', 'head_mean': 'pre'|'post'|None}
-                'loss_fn': {'fn': 'cross_entropy', 'head_mean': 'pre'},
+                # IF YOU WANT PER-HEAD LOSS, SET 'head_mean' TO NONE
+                'loss_fn': {'fn': 'cross_entropy', 'head_mean': None},
                 
                 # if 
                 'unet_logit_head_kwargs': {'softmax_temp': 1.0, 'num_view_for_per_view': 2},

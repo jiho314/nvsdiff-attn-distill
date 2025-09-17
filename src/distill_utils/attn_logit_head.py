@@ -192,16 +192,14 @@ class HeadMean_SoftArgmax(Softmax_HeadMean):
     '''
     def __init__(self, 
         compute_entropy= False,
-        entropy_temp =1.0,         
         **kwargs
     ):
         super().__init__(**kwargs)
         assert self.per_view == True, "SoftArgmax requires per_view computation"
         self.compute_entropy = compute_entropy
-        self.entropy_temp = entropy_temp
         self.entropy_val =  None
     def forward(self, x, num_view=None, **kwargs):
-        assert num_view is not None, "softargmax must provide num_view"
+        assert num_view is not None, "softargmax requires num_view"
         x = super().forward(x, num_view) # per_view prob: B 1 Q K(VHW)
         if self.compute_entropy:
             K = x.shape[-1]
@@ -216,13 +214,11 @@ class HeadMean_SoftArgmax(Softmax_HeadMean):
 class HeadMlp_SoftArgmax(HeadMlp_Softmax):
     def __init__(self,
         compute_entropy= False,
-        entropy_temp =1.0,   
         **kwargs
     ):
         super().__init__(**kwargs)
         assert self.per_view == True, "SoftArgmax requires per_view computation"
         self.compute_entropy = compute_entropy
-        self.entropy_temp = entropy_temp
         self.entropy_val =  None
 
     def forward(self, x, num_view=None, **kwargs):

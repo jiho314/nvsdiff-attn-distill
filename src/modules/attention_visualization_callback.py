@@ -46,6 +46,7 @@ import torch.nn.functional as FNN
 import time
 import uuid
 from PIL import Image as _PILImage, ImageDraw as _PILDraw
+import pandas as pd
 
 
 
@@ -91,6 +92,8 @@ class AttentionVisualizationCallback(PipelineCallback):
         self.step_losses = []
         self.step_layer_losses = {}  # step별 layer별 loss 저장
         self.layer_losses = {}  # layer별 누적 loss 저장
+        # detailed per-(sample,step,layer,head,loss_fn) rows for export
+        self._detailed_rows = []
         
         # VGGT attention cache 미리 계산
         if self.do_attn_visualize and self.vggt_model is not None:
@@ -256,6 +259,8 @@ class AttentionVisualizationCallback(PipelineCallback):
 
                     if mode == 'per_view':
                         B, H, Q, V, HW = P.shape
+                        print(f"[DEBUG] P.shape: {P.shape}")
+                        print(f"[DEBUG] G.shape: {G.shape}")
                         P_coll = P.permute(0, 1, 3, 2, 4).contiguous().view(B * H * V, Q, HW)
                         G_coll = G.permute(0, 1, 3, 2, 4).contiguous().view(B * H * V, Q, HW)
                         per_sample = per_sample_fn(P_coll, G_coll)
@@ -437,6 +442,7 @@ class AttentionVisualizationCallback(PipelineCallback):
     def _slice_attention_map(self, attnmap: torch.Tensor, query_idx: List[int], 
                            key_idx: List[int], F: int) -> torch.Tensor:
         """attention map을 query/key index에 따라 슬라이싱"""
+        # import pdb; pdb.set_trace()
         B, Head, Q, K = attnmap.shape
         HW = Q // F
         attnmap = einops.rearrange(attnmap, 'B Head (F1 HW1) (F2 HW2) -> B Head F1 HW1 F2 HW2', 
@@ -773,13 +779,15 @@ class AttentionVisualizationCallback(PipelineCallback):
             # attention 이미지를 callback 내부에 저장 (wandb 로깅은 메인에서)
             # include step in the key so multiple viz steps don't overwrite each other
             key = f"attn/{seq}/step{int(step_index)}/{layer_key}"
-            if not hasattr(self, 'attention_images'):
-                self.attention_images = {}
+            # store as a list of entries (preserve history and avoid key collisions)
+            if not hasattr(self, 'attention_images_list'):
+                self.attention_images_list = []
 
-            self.attention_images[key] = {
+            self.attention_images_list.append({
+                'key': key,
                 'image': canvas,
-                'caption': f"{seq} | {layer_key} | step {int(step_index)}"
-            }
+                'caption': f"{seq} | {layer_key} | step {int(step_index)}",
+            })
 
     def _roll_gt_map(self, gt_tensor: torch.Tensor) -> torch.Tensor:
         """Circularly roll the GT map along the last dimension if configured.
@@ -898,17 +906,18 @@ class AttentionVisualizationCallback(PipelineCallback):
         if metric_fn is None:
             raise ValueError(f"Unknown costmap metric {pair_metric}, falling back to neg_log_l2")
         
+        
+        pred_head = num_head
+        gt_query_resized = gt_query_resized.repeat(1, pred_head, 1, 1, 1).contiguous()
+        gt_key_resized = gt_key_resized.repeat(1, pred_head, 1, 1, 1).contiguous()
+        
         # gt_attn_logit: (B, Head, pred_query_size, pred_key_size)
-        gt_attn_logit = metric_fn(gt_query_resized, gt_key_resized)
+        gt_attn_logit = metric_fn(gt_query_resized, gt_key_resized).squeeze(2)
         
         # Head expansion for GT
         # gt_query_resized : (B, 1, pred_query_size, pred_query_size, C) -> (B, Head, pred_query_size, pred_query_size, C)
         # gt_key_resized : (B, 1, pred_key_size, pred_key_size, C) -> (B, Head, pred_key_size, pred_key_size, C)
-        pred_head = num_head
-        head_gt = gt_query_resized.shape[1] if gt_query_resized.dim() == 4 else 1
-        if head_gt == 1 and pred_head > 1:
-            gt_query_resized = gt_query_resized.expand(-1, pred_head, -1, -1).contiguous()
-            gt_key_resized = gt_key_resized.expand(-1, pred_head, -1, -1).contiguous()
+        
         return gt_attn_logit
     
     
@@ -928,16 +937,20 @@ class AttentionVisualizationCallback(PipelineCallback):
                 if hm in ('none', 'null', 'no'):
                     # treat as no head-mean
                     key = f"{key}_pre"
-                    is_head_mean = False
+                    is_head_mean = True
                 elif hm in ('pre', 'post'):
                     key = f"{key}_{hm}"
                     is_head_mean = True
                 else:
                     raise ValueError(f"Unsupported head_mean value: {head_mean}")
+            else:
+                key = f"{key}"
+                is_head_mean = False
         else:
             # default; pre-headmean
             is_head_mean = True
-            key = f"{str(pair_loss_fn).lower()}_pre"
+            key = f"{key}_pre"
+                
         loss_fn = self.ATTN_LOSS_FN.get(key, None)
         
         if loss_fn is None:
@@ -1046,6 +1059,9 @@ class AttentionVisualizationCallback(PipelineCallback):
                     gt_attn_logit = self._get_gt_costmap(gt_query_resized, gt_key_resized, pair_metric, num_head=pred_attn_logit.shape[1])
                     gt_attn_logit_sliced = self._slice_attention_map(gt_attn_logit, loss_query_idx, loss_key_idx, F)
 
+                    print(f"[DEBUG] pred_attn_logit_sliced.shape: {pred_attn_logit_sliced.shape}")
+                    print(f"[DEBUG] gt_attn_logit_sliced.shape: {gt_attn_logit_sliced.shape}")
+                    
                     # Instantiate logit-heads for UNet and VGGT outputs.
                     # Preference order: 1) per-pair explicit head class, 2) global visualize_config
                     # if per-view => (View, Head, HW, View, HW)
@@ -1055,19 +1071,50 @@ class AttentionVisualizationCallback(PipelineCallback):
                     
                     # aggregated loss 계산
                     loss_fn, chosen_fn_str, is_head_mean = self._get_loss_fn(pair_loss_fn)
+                    import pdb; pdb.set_trace()
                     loss_value = loss_fn(pred_processed_viz, gt_processed_viz)
 
                     # include chosen loss function name in the step-level key
                     chosen_fn_str = str(chosen_fn_str).replace('/', '_')
                     
-                    # store average for backwards compatibility
-                    per_head_list = [float(x) for x in loss_value.detach().cpu().view(-1).tolist()]
-                    loss_scalar = float(sum(per_head_list) / len(per_head_list))
-                    step_loss_dict[f"val/step{step_index}/{layer_key}/{chosen_fn_str}"] = loss_scalar
+                    # compute per-head tensor and reshape to (B, H) when possible
+                    per_head_tensor = loss_value.detach().cpu().view(-1)
+                    B = int(pred_attn_logit_sliced.shape[0])
+                    H = int(pred_attn_logit_sliced.shape[1])
+                    if per_head_tensor.numel() == B * H:
+                        per_head_2d = per_head_tensor.view(B, H)
+                    else:
+                        # fallback: keep flattened as single-batch
+                        per_head_2d = per_head_tensor.view(1, -1)
 
-                    # store per-head entries under head indices so logging can read head-wise metrics
-                    for hid, hv in enumerate(per_head_list):
-                        step_loss_dict[f"val/step{step_index}/{layer_key}/{chosen_fn_str}/head{hid}"] = hv
+                    per_head_list = per_head_2d.view(-1).tolist()
+                    loss_scalar = float(sum(per_head_list) / len(per_head_list)) if per_head_list else 0.0
+
+                    # Use pair+loss_fn(+head) keys for metrics (avoid exploding metric names with denoise step)
+                    step_loss_dict[f"val/{layer_key}/{chosen_fn_str}"] = loss_scalar
+
+                    # aggregate per-head across batch for metric display
+                    for hid in range(per_head_2d.shape[1]):
+                        head_vals = [float(per_head_2d[b, hid].item()) for b in range(per_head_2d.shape[0])]
+                        step_loss_dict[f"val/{layer_key}/{chosen_fn_str}/head{hid}"] = sum(head_vals) / len(head_vals)
+
+                    # collect detailed raw rows for export (one row per sample x head)
+                    seq = self.visualize_config.get('viz_seq_name', None)
+                    sample_idx = self.visualize_config.get('viz_wandb_step_base', None)
+                    if not hasattr(self, '_detailed_rows'):
+                        self._detailed_rows = []
+                    for b in range(per_head_2d.shape[0]):
+                        for hid in range(per_head_2d.shape[1]):
+                            self._detailed_rows.append({
+                                "sample_idx": sample_idx,
+                                "sequence_name": seq,
+                                "denoise_step_index": int(step_index),
+                                "timestep": int(timestep),
+                                "pair_id": layer_key,
+                                "loss_fn": chosen_fn_str,
+                                "head": int(hid),
+                                "value": float(per_head_2d[b, hid].item())
+                            })
 
                     print(f"[DEBUG] Calculated loss for {layer_key} (fn={chosen_fn_str}): avg={loss_scalar}, per_head={per_head_list}")
 
@@ -1230,9 +1277,10 @@ class AttentionVisualizationCallback(PipelineCallback):
     
     def get_attention_images(self) -> Dict[str, Dict[str, Any]]:
         """저장된 attention 이미지들 반환 (wandb 로깅용)"""
-        if hasattr(self, 'attention_images'):
-            return self.attention_images.copy()
-        return {}
+        # return list-form images for downstream logging
+        if hasattr(self, 'attention_images_list'):
+            return list(self.attention_images_list)
+        return []
     
     def clear_vggt_cache(self):
         """VGGT attention cache 정리 (pipeline 완료 후 호출)"""
@@ -1252,9 +1300,73 @@ class AttentionVisualizationCallback(PipelineCallback):
     
     def reset(self):
         """callback 상태 초기화"""
+        # flush detailed rows to disk/artifact before clearing
+        try:
+            self.flush_detailed_rows()
+        except Exception:
+            # do not raise from reset; best-effort flush
+            pass
+
         self.visualize_loss_dict.clear()
         self.step_losses.clear()
         self.step_layer_losses.clear()
         self.layer_losses.clear()
         if hasattr(self, 'attention_images'):
             self.attention_images.clear()
+        # clear collected detailed rows
+        if hasattr(self, '_detailed_rows'):
+            self._detailed_rows.clear()
+
+    def get_detailed_rows(self) -> List[Dict[str, Any]]:
+        """Return a copy of collected detailed rows (one row per sample x head)."""
+        if not hasattr(self, '_detailed_rows'):
+            return []
+        return list(self._detailed_rows)
+
+    def flush_detailed_rows(self, filename: Optional[str] = None, upload_wandb: bool = True) -> Optional[str]:
+        """
+        Flush collected detailed rows to a parquet file. If `upload_wandb` is True and
+        wandb is available and `viz_log_wandb` is set, an artifact is uploaded.
+
+        Returns the written filename or None if nothing was written.
+        """
+        if not hasattr(self, '_detailed_rows') or len(self._detailed_rows) == 0:
+            return None
+
+        out_dir = self.visualize_config.get('viz_save_dir', None)
+        if out_dir is None:
+            out_dir = os.getcwd()
+        os.makedirs(out_dir, exist_ok=True)
+
+        if filename is None:
+            ts = int(time.time())
+            seq = self.visualize_config.get('viz_seq_name', 'sample')
+            filename = os.path.join(out_dir, f"attn_details_{seq}_{ts}.parquet")
+
+        try:
+            df = pd.DataFrame(self._detailed_rows)
+            # prefer parquet (snappy) but fallback to csv if pyarrow not installed
+            try:
+                df.to_parquet(filename, compression='snappy', index=False)
+            except Exception:
+                csv_fn = filename.replace('.parquet', '.csv')
+                df.to_csv(csv_fn, index=False)
+                filename = csv_fn
+
+            # optionally upload as wandb artifact
+            # always attempt wandb upload when wandb is importable and viz_log_wandb is True
+            if self.visualize_config.get('viz_log_wandb', False):
+                try:
+                    import wandb
+                    art_name = f"attn-details-{self.visualize_config.get('viz_seq_name', 'sample')}-{ts}"
+                    artifact = wandb.Artifact(art_name, type="attn-details")
+                    artifact.add_file(filename)
+                    wandb.log_artifact(artifact)
+                except Exception:
+                    # non-fatal: ignore upload errors
+                    pass
+
+            return filename
+        finally:
+            # do not clear rows here; caller may want to keep in-memory until reset
+            pass
