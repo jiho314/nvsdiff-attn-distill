@@ -147,7 +147,7 @@ def per_view_softargmax2d(prob, num_view=1):
         np.linspace(-1, 1, w),
         np.linspace(-1, 1, h),
         indexing='xy'
-    ).to(prob.device, dtype=prob.dtype)
+    )
 
     indices_r = torch.tensor(np.reshape(indices_r, (-1, h * w))).to(prob.device, dtype=prob.dtype)
     indices_c = torch.tensor(np.reshape(indices_c, (-1, h * w))).to(prob.device, dtype=prob.dtype)
