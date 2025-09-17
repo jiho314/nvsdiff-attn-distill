@@ -1017,7 +1017,25 @@ class AttentionVisualizationCallback(PipelineCallback):
             gt_key = layer_cache['key'].detach()
             return gt_query.shape, gt_query, gt_key
     
-
+    def _get_gt_costmap(self, vggt_layer: str, pair_metric: str, head):
+        metric_fn = COST_METRIC_FN.get(pair_metric, None)
+        print(f"[DEBUG] Using costmap metric: {pair_metric}")
+        if metric_fn is None:
+            raise ValueError(f"Unknown costmap metric {pair_metric}, falling back to neg_log_l2")
+        
+        # gt_attn_logit: (B, Head, pred_query_size, pred_key_size)
+        gt_attn_logit = metric_fn(gt_query_resized, gt_key_resized)
+        
+        # Head expansion for GT
+        # gt_query_resized : (B, 1, pred_query_size, pred_query_size, C) -> (B, Head, pred_query_size, pred_query_size, C)
+        # gt_key_resized : (B, 1, pred_key_size, pred_key_size, C) -> (B, Head, pred_key_size, pred_key_size, C)
+        pred_head = pred_attn_logit.shape[1]
+        head_gt = gt_query_resized.shape[1] if gt_query_resized.dim() == 4 else 1
+        if head_gt == 1 and pred_head > 1:
+            gt_query_resized = gt_query_resized.expand(-1, pred_head, -1, -1).contiguous()
+            gt_key_resized = gt_key_resized.expand(-1, pred_head, -1, -1).contiguous()
+        return gt_attn_logit
+    
     def __call__(
         self,
         pipeline,
@@ -1112,23 +1130,11 @@ class AttentionVisualizationCallback(PipelineCallback):
                     print(f"Calculating loss for step {step_index}, layer {layer_key}")
                     loss_query_idx, loss_key_idx = self._extract_loss_view_indices(F)
                     
-                    # pred_attn_logit_sliced: (B, Head, pred_query_size, pred_key_size)
+                    # pred_attn_logit_sliced: (B, Head, pred_query_size, pred_key_size) / (2,10,1024,2048)
                     pred_attn_logit_sliced = self._slice_attention_map(pred_attn_logit, loss_query_idx, loss_key_idx, F)
-
-                    # pred_head = pred_attn_logit.shape[1]
-                    # head_gt = gt_query_resized.shape[1] if gt_query_resized.dim() == 4 else 1
-                    # if head_gt == 1 and pred_head > 1:
-                    #     gt_query_resized = gt_query_resized.expand(-1, pred_head, -1, -1).contiguous()
-                    #     gt_key_resized = gt_key_resized.expand(-1, pred_head, -1, -1).contiguous()
-
-                    metric_name = pair_metric if pair_metric is not None else self.visualize_config.get('costmap_metric', 'neg_log_l2')
-                    metric_fn = COST_METRIC_FN.get(metric_name, None)
                     
-                    if metric_fn is None:
-                        print(f"Unknown costmap metric {metric_name}, falling back to neg_log_l2")
-                        metric_fn = COST_METRIC_FN['neg_log_l2']
+                    gt_attn_logit = self._get_gt_costmap(vggt_layer, pair_metric)
                         
-                    gt_attn_logit = metric_fn(gt_query_resized, gt_key_resized)
                     gt_attn_logit_sliced = self._slice_attention_map(gt_attn_logit, loss_query_idx, loss_key_idx, F)
 
                     # Instantiate logit-heads for UNet and VGGT outputs.

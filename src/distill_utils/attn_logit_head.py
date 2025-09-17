@@ -50,12 +50,11 @@ class Softmax_HeadMean(Softmax):
 
 class Softmax_HeadMlp(Softmax):
     def __init__(self, 
-                 in_head_num = 24, out_head_num = 1,
-                 mlp_ratio = 4.0, mlp_depth = 1,
-                 softmax_temp=1.0, learnable_temp = False, 
-                 final_activation = None,
-        **kwargs):
-        super(Softmax_HeadMlp, self).__init__(softmax_temp, learnable_temp, **kwargs)
+            in_head_num = 24, out_head_num = 1,
+            mlp_ratio = 4.0, mlp_depth = 1,
+            **kwargs
+        ):
+        super(Softmax_HeadMlp, self).__init__(**kwargs)
         self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, mlp_depth)
         if final_activation == "sigmoid":
             self.final_activation = nn.Sigmoid()
@@ -76,10 +75,11 @@ class Softmax_HeadMlp(Softmax):
 
 class HeadMlp_Softmax(Softmax):
     def __init__(self, 
-                 in_head_num = 24, out_head_num = 1,
-                 mlp_ratio = 4.0, mlp_depth = 1,
-                 softmax_temp=1.0, learnable_temp = False, **kwargs):
-        super(HeadMlp_Softmax, self).__init__(softmax_temp, learnable_temp, **kwargs)
+            in_head_num = 24, out_head_num = 1,
+            mlp_ratio = 4.0, mlp_depth = 1,
+            **kwargs
+        ):
+        super(HeadMlp_Softmax, self).__init__(**kwargs)
         self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, mlp_depth)
 
     def forward(self, x, num_view=None,**kwargs):
@@ -193,18 +193,12 @@ class SoftArgmax(nn.Module):
 
 class HeadMlp_SoftArgmax(SoftArgmax):
     def __init__(self,
-        # softargmax
-        beta,
-        learnable_beta = False,
-        per_view = False,
-        entropy_temp = 1.0,
-        compute_entropy = True,
         # mlp
         in_head_num = 24, out_head_num = 1,
         mlp_ratio = 4.0, mlp_depth = 1, final_activation = None,
         **kwargs
     ):
-        super().__init__(beta, learnable_beta, per_view, entropy_temp, compute_entropy)
+        super().__init__(**kwargs)
         self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, mlp_depth)
 
     def forward(self, x, num_view=None, **kwargs):
@@ -216,17 +210,6 @@ class HeadMlp_SoftArgmax(SoftArgmax):
         return super().forward(x, num_view, **kwargs)
 
 class HeadMean_SoftArgmax(SoftArgmax):
-    def __init__(self,
-        # softargmax
-        beta,
-        learnable_beta = False,
-        per_view = False,
-        entropy_temp = 1.0,
-        compute_entropy = True,
-        **kwargs
-    ):
-      super().__init__(beta, learnable_beta, per_view, entropy_temp, compute_entropy)  
-    
     def forward(self, x, num_view=None, **kwargs):
         ''' x : B Head Q K(num_view*hw) 
             return: B Head(1) Q 1 2 or  B Head(1) Q key_num_view 2 (per view)
