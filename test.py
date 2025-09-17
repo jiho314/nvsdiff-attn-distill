@@ -8,7 +8,7 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 @torch.no_grad()
-def log_test(accelerator, config, args, pipeline, dataloader, step, device, gen_num,
+def log_test(accelerator, config, args, pipeline, dataloader, step, device,
              process_batch_fn = lambda x: x,
              eval_size = 512,
              **kwargs):

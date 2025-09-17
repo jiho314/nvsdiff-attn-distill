@@ -7,8 +7,8 @@ re10k_wds_test:
     resampled: False
     shardshuffle: False
     inference: true
-    num_viewpoints: 3
-    inference_view_range: 6
+    num_viewpoints: 4
+    inference_view_range: 15
     process_kwargs:
       get_square_extrinsic: true
 

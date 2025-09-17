@@ -35,8 +35,6 @@ from transformers.utils import ContextManagers
 from my_diffusers.models import UNet2DConditionModel
 from my_diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_multiview import StableDiffusionMultiViewPipeline
 from my_diffusers.training_utils import EMAModel
-from src.datasets.global_datasets import load_global_dataset
-from src.datasets.global_sampler import GlobalConcatSampler
 from src.modules.camera import get_camera_embedding
 from src.modules.position_encoding import depth_freq_encoding, global_position_encoding_3d, get_3d_priors
 from src.modules.schedulers import get_diffusion_scheduler
@@ -800,7 +798,22 @@ def main():
         # 'debug_softargmax': True,
         # 'debug_save_dir': 'debug_attn_maps',
         'pairs': [
-            {'unet_layer': l, 'vggt_layer': 'point_map', 'costmap_metric': 'neg_log_l2', 'loss_fn': 'softargmax_l2', 'loss_num_key_views': 2, 'softmax_mode': 'per_view'}
+            {
+                'unet_layer': l,
+                'vggt_layer': 'point_map',
+                'costmap_metric': 'neg_log_l2',
+                'loss_fn': 'cross_entropy',
+                'loss_num_key_views': 2,
+                'loss_softmax_mode': 'per_view',
+                # per-pair logit heads required by the visualization callback
+                'unet_logit_head': 'softmax_headmean',
+                'unet_logit_head_kwargs': {'softmax_temp': 1.0},
+                'vggt_logit_head': 'softmax_headmean',
+                'vggt_logit_head_kwargs': {'softmax_temp': 0.01},
+                # visualization-specific softmax/viz key settings
+                'viz_softmax_mode': 'per_view',
+                'viz_num_key_views': 2,
+            }
             for l in list((2,4,6,8,10,12))
         ],
     }

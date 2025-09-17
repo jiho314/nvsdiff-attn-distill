@@ -176,12 +176,13 @@ def main(cfg):
 
                 # Pairwise distances (B, HW, VHW)
                 diff = query_points.unsqueeze(2) - ref_points.unsqueeze(1)
-                dist = torch.norm(diff, dim=-1)
+                dist = torch.norm(diff, dim=-1) 
 
                 # Convert to probabilities (smaller distance = higher prob)
-                logits = -torch.log(dist + 1e-6) / temperature
+                logits = -dist / temperature
+                #logits = - torch.log(dist + 1e-6) / temperature
                 probs = torch.softmax(logits, dim=-1)
-
+                #import pdb; pdb.set_trace()
                 return probs.squeeze()
             query, key = resize_tok(gt_query, target_size=H), resize_tok(gt_key, target_size=W)  # B Head (FHW) C
             query, key = query.permute(0, 1, 3, 2), key.permute(0, 1, 3, 2)  # B Head C (FHW)
@@ -198,7 +199,7 @@ def main(cfg):
 
             # stack along V dimension → (1, V, 3, H, W)
             ref_imgs = torch.stack(ref_imgs, dim=1)
-            attn_maps = distance_softmax(query, ref_imgs)
+            attn_maps = distance_softmax(query, ref_imgs, temperature=cfg.point_temperature)
             all_scores = attn_maps[query_token_idx_cost]
         
         tokens_per_img = H * W

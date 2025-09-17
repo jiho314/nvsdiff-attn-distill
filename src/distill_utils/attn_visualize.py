@@ -62,8 +62,11 @@ def get_attn_map_whole(attn_layer: torch.Tensor, background: np.ndarray) -> np.n
     Overlay an attention heatmap on a background image and mark the highest attention point.
 
     Args:
-        attn_layer (torch.Tensor): 2D attention map, shape (H_small, W_small).
+        attn_layer (torch.Tensor): 2D attention map, shape (H_small, W_small), usually values in [0,1].
         background (np.ndarray): Background image, shape (H_large, W_large, 3).
+        normalize (bool): 
+            - If True, normalize attn_layer to [0,1] using min/max (per-heatmap contrast).
+            - If False, assume attn_layer already in [0,1] (absolute scale preserved).
 
     Returns:
         np.ndarray: Visualization with heatmap and marked point.
@@ -77,32 +80,36 @@ def get_attn_map_whole(attn_layer: torch.Tensor, background: np.ndarray) -> np.n
         interpolation=T.InterpolationMode.BILINEAR,
         antialias=True
     )
-    attn_layer_resized = resize_transform(attn_layer.unsqueeze(0).unsqueeze(0))  # [1,1,H,W]
-    attn_layer_resized = attn_layer_resized.squeeze().cpu().detach().numpy()     # [H, W]
+    attn_resized = resize_transform(attn_layer.unsqueeze(0).unsqueeze(0))  # [1,1,H,W]
+    attn_resized = attn_resized.squeeze().cpu().detach().numpy()           # [H, W]
 
-    # 2. Create heatmap
-    normalizer = mpl.colors.Normalize(vmin=attn_layer_resized.min(), vmax=attn_layer_resized.max())
-    mapper = cm.ScalarMappable(norm=normalizer, cmap="viridis")
-    heatmap = (mapper.to_rgba(attn_layer_resized)[:, :, :3] * 255).astype(np.uint8)
+    # 2. Optionally normalize
+    min_val, max_val = attn_resized.min(), attn_resized.max()
+    if max_val > min_val:  # avoid divide-by-zero
+        attn_resized = (attn_resized - min_val) / (max_val - min_val)
+    else:
+        attn_resized = np.zeros_like(attn_resized)
 
-    # 3. Blend with background
+    # 3. Map values to colormap (viridis by default)
+    heatmap = (cm.viridis(attn_resized)[:, :, :3] * 255).astype(np.uint8)
+
+    # 4. Blend with background
     background_uint8 = background.astype(np.uint8).copy()
     blended_map = cv2.addWeighted(background_uint8, 0.3, heatmap, 0.7, 0)
 
-    # 4. Find the max attention location in the small map
-    attn_layer_small_np = attn_layer.cpu().detach().numpy()
-    max_idx_y, max_idx_x = np.unravel_index(np.argmax(attn_layer_small_np), attn_layer_small_np.shape)
+    # 5. Find the max attention location in the original small map
+    attn_small = attn_layer.cpu().detach().numpy()
+    max_idx_y, max_idx_x = np.unravel_index(np.argmax(attn_small), attn_small.shape)
 
-    # 5. Scale to large dimensions
+    # 6. Scale coordinates to background size
     max_x = int((max_idx_x + 0.5) * (W_large / W_small))
     max_y = int((max_idx_y + 0.5) * (H_large / H_small))
 
-    # 6. Draw a circle at the max point
+    # 7. Draw a circle at the max point
     final_map = cv2.circle(blended_map, (max_x, max_y), 10, (255, 255, 255), -1)
     final_map = cv2.circle(final_map, (max_x, max_y), 6, (255, 0, 0), -1)
 
     return final_map
-
 
 def mark_point_on_img(tgt_img, x, y, radius=6):
     """
@@ -159,7 +166,7 @@ def save_image_total(images, x_coord, y_coord, score):
     background = torch.stack(background, dim=1).reshape(512, -1, 3).numpy()
     background = np.clip(background * 255.0, 0, 255).astype(np.uint8)
     
-    attn_heatmap_img = get_attn_map_whole(score, background)
+    attn_heatmap_img = get_attn_map_whole(score, background,)
     vis_list.append(Image.fromarray(attn_heatmap_img.astype(np.uint8)))
     combined_img = stitch_side_by_side_whole(vis_list)
 

@@ -564,6 +564,7 @@ def main():
         from src.distill_utils.attn_distill_loss import ATTN_LOSS_FN
         distill_loss_fn = ATTN_LOSS_FN[distill_config.distill_loss_fn.lower()]
         distill_loss_weight = config.distill_config.distill_loss_weight
+        distill_loss_fn_config = config.distill_config.get('distill_loss_fn_config', {})
 
         # logit heads: input: [B, Head, Q, K]
         from src.distill_utils.attn_logit_head import LOGIT_HEAD_CLS # JIHO TODO: save/load params
@@ -589,6 +590,7 @@ def main():
         distill_cost_fn = None
         distill_loss_fn = None
         distill_loss_weight = 0.0
+        distill_loss_fn_config = {}
         
     # set feat cache for repa distill # JIHO TODO: repa     
 
@@ -1138,7 +1140,6 @@ def main():
                                 # qk -> logit map
                                 gt_attn_logit = distill_cost_fn(gt_query, gt_key)
 
-
                             # 2) Extract Distill Views
                             ''' View idx order: [Reference, Target]
                             '''
@@ -1170,24 +1171,35 @@ def main():
                             gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx, key_idx) # B head f1HW f2HW
 
                             # 4) Prob Map
-                            pred, gt = unet.unet_logit_head[str(unet_layer)](pred_attn_logit), unet.vggt_logit_head[str(vggt_layer)](gt_attn_logit) # [B head f1HW f2HW]
+                            logit_head_kwargs = {"num_view": len(key_idx)}
+                            pred, gt = unet.unet_logit_head[str(unet_layer)](pred_attn_logit, **logit_head_kwargs), unet.vggt_logit_head[str(vggt_layer)](gt_attn_logit, **logit_head_kwargs) # [B head f1HW f2HW]
 
                             if config.distill_config.get("consistency_check", False):
                                 assert config.distill_config.distill_query == "target", "consistency check only support distill_query to target"
                                 B, Head, F1HW, F2HW = gt_attn_logit.shape  
+                                # assert Head == 1, "costmap should have only one head, while consistency checking?"
                                 F1, F2, HW = len(query_idx), len(key_idx), F1HW // len(query_idx)
-                                gt_attn_logit_HW = einops.rearrange(gt_attn_logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1) HW1 (F2 HW2)', B=B,Head=Head, F1=F1, F2=F2, HW1=HW, HW2=HW)
-                                consistency_mask = cycle_consistency_checker(gt_attn_logit_HW, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1) HW1 (F2 HW2)
-                                consistency_mask = einops.rearrange(consistency_mask, '(B Head F1) HW 1 -> B Head (F1 HW) 1', B=B, Head=Head, F1=F1, HW=HW)
-                                assert Head == 1, "Track Head costmap should have only one head"
-                                consistency_mask = consistency_mask.reshape(B, Head, F1HW)
-                                pred, gt = pred[consistency_mask.bool()], gt[consistency_mask.bool()]
+
+                                if config.distill_config.get("consistency_check_per_view", False):
+                                    assert unet.unet_logit_head[str(unet_layer)].per_view == True and unet.vggt_logit_head[str(vggt_layer)].per_view == True
+                                    gt_attn_logit_HW = einops.rearrange(gt_attn_logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1 F2) HW1 HW2', B=B,Head=Head, F1=F1, F2=F2, HW1=HW, HW2=HW)
+                                    consistency_mask = cycle_consistency_checker(gt_attn_logit_HW, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1 F2) HW1 HW2
+                                    consistency_mask = einops.rearrange(consistency_mask, '(B Head F1 F2) HW 1 -> B Head (F1 HW) F2 1', B=B, Head=Head, F1=F1, F2=F2, HW=HW)
+                                    consistency_mask = consistency_mask.reshape(B, Head, F1HW, F2)
+                                    pred, gt = pred.reshape(B,Head,F1HW,F2, -1), gt.reshape(B,Head,F1HW,F2, -1)
+                                    pred, gt = pred[consistency_mask.bool()], gt[consistency_mask.bool()]
+                                else:
+                                    gt_attn_logit_HW = einops.rearrange(gt_attn_logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1) HW1 (F2 HW2)', B=B,Head=Head, F1=F1, F2=F2, HW1=HW, HW2=HW)
+                                    consistency_mask = cycle_consistency_checker(gt_attn_logit_HW, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1) HW1 (F2 HW2)
+                                    consistency_mask = einops.rearrange(consistency_mask, '(B Head F1) HW 1 -> B Head (F1 HW) 1', B=B, Head=Head, F1=F1, HW=HW)
+                                    consistency_mask = consistency_mask.reshape(B, Head, F1HW)
+                                    pred, gt = pred[consistency_mask.bool()], gt[consistency_mask.bool()]
 
                             # 5) distill loss 
                             if torch.isnan(gt).any().item():
                                 accelerator.print("NaN in gt attn, skip this layer distill...")
                                 continue
-                            distill_loss_dict[f"train/distill/unet{unet_layer}_vggt{vggt_layer}"] = distill_loss_fn(pred.float(), gt.float())
+                            distill_loss_dict[f"train/distill/unet{unet_layer}_vggt{vggt_layer}"] = distill_loss_fn(pred.float(), gt.float(), **distill_loss_fn_config)
                         distill_loss = sum(distill_loss_dict.values()) / len(distill_loss_dict.values()) if len(distill_loss_dict) > 0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
                     loss = diff_loss + distill_loss * distill_loss_weight
                 else:

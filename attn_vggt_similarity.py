@@ -57,6 +57,20 @@ def main(nframe, cond_num, inference_view_range,
         "cache_attn_layer_ids": config.attn_idx if "attention" in config.mode else [],
         "cache_costmap_types": config.mode
     }
+    def slice_softmax(attnmap):
+        '''
+        attnmap: [fH*fW, nfrmaes*fH*fW]
+        nframes: # of frames
+        '''
+        feature_size, nfeature_size = attnmap.shape
+        nframes = nfeature_size // feature_size
+        total_attn_map = []
+        for i in range(nframes):
+            tmp = attnmap[:, i*feature_size:(i+1)*feature_size]
+            tmp = torch.softmax(tmp, dim=-1)
+            total_attn_map.append(tmp)
+        
+        return torch.cat(total_attn_map, dim=1)
     
     def slice_attnmap(attnmap, query_idx, key_idx):
         B, Head, Q, K = attnmap.shape
@@ -105,14 +119,15 @@ def main(nframe, cond_num, inference_view_range,
             gt_attn_logit = query @ key.transpose(-1, -2)
             gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx=query_idx, key_idx=key_idx)
             attn_maps = gt_attn_logit.squeeze()
-            all_scores = torch.softmax(attn_maps / 8, dim=-1)
+            all_scores = slice_softmax(attn_maps / 8) if config.split else torch.softmax(attn_maps / 8, dim=-1)
+            #all_scores = torch.softmax(attn_maps / 8, dim=-1)
         elif mode == "attention":
             query, key = resize_tok(gt_query, target_size=H), resize_tok(gt_key, target_size=W),
             gt_attn_logit = query @ key.transpose(-1, -2)
             gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx=query_idx, key_idx=key_idx)
             attn_maps = gt_attn_logit.mean(dim=1) # average over head
             attn_maps = attn_maps.squeeze()
-            all_scores = torch.softmax(attn_maps / 8, dim=-1)
+            all_scores = slice_softmax(attn_maps / 8) if config.split else torch.softmax(attn_maps / 8, dim=-1)
         elif mode == "pointmap":
             def distance_softmax(query_points, ref_points, temperature=1.0, cross_only=True):
                 """
@@ -138,8 +153,9 @@ def main(nframe, cond_num, inference_view_range,
                 dist = torch.norm(diff, dim=-1)
 
                 # Convert to probabilities (smaller distance = higher prob)
-                logits = -torch.log(dist + 1e-6) / temperature
-                probs = torch.softmax(logits, dim=-1)
+                #logits = -torch.log(dist + 1e-6) / temperature
+                logits = -dist / temperature
+                probs = slice_softmax(logits) if config.split else torch.softmax(logits, dim=-1)
 
                 return probs.squeeze()
             query, key = resize_tok(gt_query, target_size=H), resize_tok(gt_key, target_size=W)  # B Head (FHW) C
@@ -157,7 +173,7 @@ def main(nframe, cond_num, inference_view_range,
 
             # stack along V dimension → (1, V, 3, H, W)
             ref_imgs = torch.stack(ref_imgs, dim=1)
-            attn_maps = distance_softmax(query, ref_imgs)
+            attn_maps = distance_softmax(query, ref_imgs, config.point_temperature)
             all_scores = attn_maps
         
         # tokens_per_img = H * W
@@ -331,7 +347,7 @@ def main(nframe, cond_num, inference_view_range,
     mode = config.mode[0]
     parent_name = os.path.basename(os.path.dirname(resume_checkpoint))   # lr1_cosine_noema
     ckpt_name = os.path.basename(resume_checkpoint)                     # checkpoint-30000
-    outdir = os.path.join("outputs_comparison", timestamp, parent_name, ckpt_name, f"{noise_timestep}")
+    outdir = os.path.join("outputs_comparison", timestamp, parent_name, ckpt_name, f"{noise_timestep}, {config.mode[0]}, {config.similarity_measure}")
     os.makedirs(outdir, exist_ok=True)
     
     # minkyung TODO: 여러 idx에 대해서 viz
@@ -342,9 +358,9 @@ def main(nframe, cond_num, inference_view_range,
                 # convert list of tensors -> stacked tensor -> mean -> float
                 vals_tensor = torch.tensor([v.item() if torch.is_tensor(v) else v for v in vals])
                 averaged_score[k] = float(vals_tensor.mean().item())
-
+            print(averaged_score)
             # Save to JSON
-            with open(os.path.join(outdir, "similarity_score_avg.json"), "w") as f:
+            with open(os.path.join(outdir,"similarity_score_avg.json"), "w") as f:
                 json.dump(averaged_score, f, indent=4)
             print("successfully saved the .json")
             break
@@ -432,7 +448,7 @@ def main(nframe, cond_num, inference_view_range,
             # query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
             
             # attention for chosen query token
-            all_scores = torch.softmax(unet_attn_logit, dim=-1)
+            all_scores = slice_softmax(unet_attn_logit) if config.split else torch.softmax(unet_attn_logit, dim=-1)
             del unet_attn_logit
             H, W = all_scores.shape
             vggt_pred = vggt_model(images)
@@ -465,12 +481,31 @@ def main(nframe, cond_num, inference_view_range,
             # combined_img.save(f"{outdir}/attn{unet_layer}.png")
 
             score_vggt = score_vggt.to(device)
-            eps = 1e-12
-            cross_entropy = -(score_vggt * torch.log(all_scores + eps)).sum(axis=1)
-            cross_entropy_mean = cross_entropy.mean()
+            if config.split: 
+                pass
+                if config.similarity_measure == "cross_entropy":
+                    eps = 1e-12
+                    cross_entropy = -(score_vggt * torch.log(all_scores + eps)).sum(axis=1)
+                    cross_entropy_mean = cross_entropy.mean()
+                    measure = cross_entropy_mean
+                elif config.similarity_measure == "l1":
+                    l1_loss = torch.abs(score_vggt - all_scores).sum(axis=1)  # sum over features
+                    l1_loss_mean = l1_loss.mean()  # average over rows
+                    measure = l1_loss_mean
+            else:
+                if config.similarity_measure == "cross_entropy":
+                    eps = 1e-12
+                    cross_entropy = -(score_vggt * torch.log(all_scores + eps)).sum(axis=1)
+                    cross_entropy_mean = cross_entropy.mean()
+                    measure = cross_entropy_mean
+                elif config.similarity_measure == "l1":
+                    l1_loss = torch.abs(score_vggt - all_scores).sum(axis=1)  # sum over features
+                    l1_loss_mean = l1_loss.mean()  # average over rows
+                    measure = l1_loss_mean
+              
             if f'{unet_layer}' not in similarity_score.keys():
                 similarity_score[f'{unet_layer}'] = [] 
-            similarity_score[f'{unet_layer}'].append(cross_entropy_mean.item())
+            similarity_score[f'{unet_layer}'].append(measure.item())
         # if config.save_originals:
         #     save_image(tgt_image, f"{outdir}/TARGET.png")
         #     tgt_image_marked = mark_point_on_img(tgt_image, x_coord, y_coord)

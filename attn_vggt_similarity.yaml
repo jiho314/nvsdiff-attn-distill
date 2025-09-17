@@ -4,16 +4,19 @@ view_select: false # select scene
 coord_select: false # select coordinate
 nframes: 3 # total num of frames
 cross_only: true # self attention too if false
-inference_view_range: 25
+inference_view_range: 8
 save_individuals: false
 save_originals: false
 nsample: 100
+point_temperature: 0.001
+similarity_measure: "cross_entropy" # "l1", "cross_entropy"
+split: false
 
 unet_visualize:
   caching_unet_attn_layers: [2,3,4,5,6,7,8,9,10,11,12] # [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
   noise_timestep: 999 #(0, 1000)
   cond_num: 2 #reference num
-  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/naive_0915/checkpoint-20000'
+  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/naive_0915/checkpoint-2000'
   save_originals: true
 
 # for unet
