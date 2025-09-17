@@ -39,14 +39,17 @@ class Softmax(nn.Module):
             HW = K // num_view
             x = x.reshape(*x.shape[:-1], num_view, HW)
         x = x / self.softmax_temp
-        return x.softmax(dim=-1)
-
-class Softmax_HeadMean(Softmax):
-    def forward(self, x, **kwargs):
-        x = x / self.softmax_temp
         x = x.softmax(dim=-1)
+        if self.per_view:
+            x = x.reshape(*x.shape[:-2], num_view*HW)
+        return x
+ 
+class Softmax_HeadMean(Softmax):
+    def forward(self, x, num_view=None, **kwargs):
+        ''' x : B Head Q K(num_view HW)
+        '''
+        x = super().forward(x, num_view, **kwargs)
         return x.mean(dim=1, keepdim=True)
-
 
 class Softmax_HeadMlp(Softmax):
     def __init__(self, 
@@ -63,12 +66,7 @@ class Softmax_HeadMlp(Softmax):
             self.final_activation = nn.Identity()
 
     def forward(self, x, num_view= None, **kwargs):
-        if self.per_view:
-            K = x.shape[-1]
-            HW = K // num_view
-            x = x.reshape(*x.shape[:-1], num_view, HW)
-        x = x / self.softmax_temp
-        x = x.softmax(dim=-1)
+        x = super().forward(x, num_view, **kwargs)
         x = x.permute(0,2,3,1) # B Q K Head
         x = self.mlp(x).permute(0,3,1,2) # B Out_head Q K
         x = self.final_activation(x)
@@ -86,12 +84,8 @@ class HeadMlp_Softmax(Softmax):
     def forward(self, x, num_view=None,**kwargs):
         x = x.permute(0,2,3,1) # B Q K Head
         x = self.mlp(x).permute(0,3,1,2) # B Out_head Q K
-        if self.per_view:
-            K = x.shape[-1]
-            HW = K // num_view
-            x = x.reshape(*x.shape[:-1], num_view, HW)
-        x = x / self.softmax_temp
-        return x.softmax(dim=-1)
+        x = super().forward(x, num_view, **kwargs)
+        return x
 
 # class HeadMlp(nn.Module):
 #     def __init__(self, 
@@ -111,112 +105,140 @@ class HeadMlp_Softmax(Softmax):
 #         x = self.final_activation(x)
 #         return x
 
-def softargmax2d(logit, beta=100, num_view=1):
-    ''' logit: ... num_view*hw
-    '''
-    h = int((logit.shape[-1] / num_view) ** 0.5)
-    w = num_view * h
-    assert h * w == logit.shape[-1], f"input size does not match, {h} * {w} != {logit.shape[-1]}"
+# def softargmax2d(logit, beta=100, num_view=1):
+#     ''' https://github.com/david-wb/softargmax
+#         - logit: ... num_view*hw
+#     '''
+#     h = int((logit.shape[-1] / num_view) ** 0.5)
+#     w = num_view * h # width 로 쌓으면(h V*w) 기존 VHW와 dim 순서 다름 issue? 
+#     assert h * w == logit.shape[-1], f"input size does not match, {h} * {w} != {logit.shape[-1]}"
 
-    prob = nn.functional.softmax(beta * logit, dim=-1)
+#     prob = nn.functional.softmax(beta * logit, dim=-1)
+
+#     indices_c, indices_r = np.meshgrid(
+#         np.linspace(0, 1, w),
+#         np.linspace(0, 1, h),
+#         indexing='xy'
+#     )
+
+#     indices_r = torch.tensor(np.reshape(indices_r, (-1, h * w)))
+#     indices_c = torch.tensor(np.reshape(indices_c, (-1, h * w)))
+
+#     result_r = torch.sum((h - 1) * prob * indices_r, dim=-1) # (h-1) * n/(h-1) = n
+#     result_c = torch.sum((w - 1) * prob * indices_c, dim=-1)
+
+#     result = torch.stack([result_r, result_c], dim=-1)
+
+#     return result
+
+def per_view_softargmax2d(prob, num_view=1):
+    ''' leffa: https://arxiv.org/pdf/2412.08486v2
+        args
+            - prob: [..., vhw]
+        return
+            - indices: [..., v, 2]
+    '''
+    K = prob.shape[-1]
+    hw = K // num_view
+    prob = prob.reshape(*prob.shape[:-1], num_view, hw)
+    h = w = int(hw**0.5)
 
     indices_c, indices_r = np.meshgrid(
-        np.linspace(0, 1, w),
-        np.linspace(0, 1, h),
+        np.linspace(-1, 1, w),
+        np.linspace(-1, 1, h),
         indexing='xy'
     )
 
     indices_r = torch.tensor(np.reshape(indices_r, (-1, h * w)))
     indices_c = torch.tensor(np.reshape(indices_c, (-1, h * w)))
 
-    result_r = torch.sum((h - 1) * prob * indices_r, dim=-1) # (h-1) * n/(h-1) = n
-    result_c = torch.sum((w - 1) * prob * indices_c, dim=-1)
+    result_r = torch.sum(prob * indices_r, dim=-1)
+    result_c = torch.sum(prob * indices_c, dim=-1)
 
     result = torch.stack([result_r, result_c], dim=-1)
 
     return result
 
-class SoftArgmax(nn.Module):
-    def __init__(self,
-        beta,
-        learnable_beta = False,
-        per_view = False,
-        entropy_temp = 1.0,
-        compute_entropy = True,
-    ):
-        self.beta = nn.Parameter(torch.tensor(beta)) if learnable_beta else beta
-        self.per_view=per_view
-        self.entropy_temp = entropy_temp
-        self.compute_entropy = compute_entropy
-        self.entropy_val =  None
+# class Argmax(nn.Module):
+#     def __init__(self,
+#         per_view = True,
+#         compute_entropy = True,
+#         entropy_temp = 1.0,
+#     ):
+#         self.per_view=per_view
+#         assert per_view == True
+#         self.compute_entropy = compute_entropy
+#         self.entropy_temp = entropy_temp
+#         self.entropy_val =  None
 
-    def forward(self, x, num_view, **kwargs):
-        ''' x : ... K(VHW)
-        '''
-        logit = x
-        num_k = num_view
+#     def forward(self, x, num_view, **kwargs):
+#         ''' x : ... K(VHW)
+#         '''
+#         prob = x
+#         if self.per_view:
+#             K = prob.shape[-1]
+#             hw = K // num_view
+#             prob = prob.reshape(prob.shape[:-1], num_view, hw)
+#             argmax_indices = per_view_softargmax2d(prob) # [... V 2]
+#             if self.compute_entropy:
+#                 eps = 1e-8
+#                 self.entropy_val = - (prob * (prob + eps).log()).sum(dim=-1) # [... V]
+#             return argmax_indices
+#         else:
+#             raise NotImplementedError
 
-        if self.per_view:
-            K = logit.shape[-1]
-            if K % num_k != 0:
-                raise ValueError(f"num_key_views={num_k} is not a valid divisor of K={K}")
-            other = K // num_k
-            kp = int(round((other) ** 0.5))
-            if kp * kp != other:
-                raise ValueError(f"Given num_key_views={num_k} does not yield a square kp for K={K}")
-
-            argmax_idx_list = []
-            logit = logit.view(*logit.shape[:-1], num_k, kp**2)
-
-            for i in range(num_k):
-                l = logit[..., i, :]
-                argmax_idx = softargmax2d(l, beta=self.beta, num_view=1) # [..., hw, 2]
-                argmax_idx_list.append(argmax_idx)
-            argmax_indices = torch.stack(argmax_idx_list, dim=-2) # [..., hw, view, 2]
-            
-            if self.compute_entropy:
-                ent = []
-                for i in range(num_k):
-                    l = logit[..., i, :]
-                    prob = torch.nn.functional.softmax(l / self.entropy_temp, dim=-1)
-                    ent += [- (prob * (prob + eps).log()).sum(dim=-1).mean()]
-                self.entropy_val = sum(ent) / len(ent)
-            return argmax_indices
-        else:
-            argmax_indices = softargmax2d(logit, beta=self.beta, num_view=num_k) # [..., hw, 2]
-            argmax_indices = argmax_indices.unsqueeze(1).unsqueeze(3) # [..., 1, hw, 1, 2]
-            eps = 1e-8
-            if self.compute_entropy:
-                prob = torch.nn.functional.softmax(logit / self.entropy_temp, dim=-1)
-                self.entropy_val = - (prob * (prob + eps).log()).sum(dim=-1).mean()
-            return argmax_indices
-
-
-class HeadMlp_SoftArgmax(SoftArgmax):
-    def __init__(self,
-        # mlp
-        in_head_num = 24, out_head_num = 1,
-        mlp_ratio = 4.0, mlp_depth = 1, final_activation = None,
+class HeadMean_SoftArgmax(Softmax_HeadMean):
+    ''' Softmax -> HeadMean -> Prob * idx
+    '''
+    def __init__(self, 
+        compute_entropy= False,
+        entropy_temp =1.0,         
         **kwargs
     ):
         super().__init__(**kwargs)
-        self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, mlp_depth)
+        assert self.per_view == True, "SoftArgmax requires per_view computation"
+        self.compute_entropy = compute_entropy
+        self.entropy_temp = entropy_temp
+        self.entropy_val =  None
+    def forward(self, x, num_view=None, **kwargs):
+        assert num_view is not None, "softargmax must provide num_view"
+        x = super().forward(x, num_view) # per_view prob: B 1 Q K(VHW)
+        if self.compute_entropy:
+            K = x.shape[-1]
+            HW = K // num_view
+            per_view_prob = x.reshape(*x.shape[-1], num_view, HW)
+            eps = 1e-8
+            self.entropy_val = - (per_view_prob * (per_view_prob + eps).log()).sum(dim=-1) # B 1 Q V
+        x = per_view_softargmax2d(x, num_view) # B 1 Q V 2
+        return x.flatten(-2,-1) # B 1 Q V*2
+
+
+class HeadMlp_SoftArgmax(HeadMlp_Softmax):
+    def __init__(self,
+        compute_entropy= False,
+        entropy_temp =1.0,   
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        assert self.per_view == True, "SoftArgmax requires per_view computation"
+        self.compute_entropy = compute_entropy
+        self.entropy_temp = entropy_temp
+        self.entropy_val =  None
 
     def forward(self, x, num_view=None, **kwargs):
         ''' x: B Head Q K
             return: B Head Q 1 2 or  B Head Q key_num_view 2 (per view)
         '''
-        x = x.permute(0,2,3,1) # B Q K Head
-        x = self.mlp(x).permute(0,3,1,2) # B Out_head Q K
-        return super().forward(x, num_view, **kwargs)
-
-class HeadMean_SoftArgmax(SoftArgmax):
-    def forward(self, x, num_view=None, **kwargs):
-        ''' x : B Head Q K(num_view*hw) 
-            return: B Head(1) Q 1 2 or  B Head(1) Q key_num_view 2 (per view)
-        '''
-        x = x.mean(dim=1, keepdim=True)
-        return super().forward(x, num_view, **kwargs)
+        assert num_view is not None, "softargmax must provide num_view"
+        x = super().forward(x, num_view, **kwargs) # per_view prob: B 1 Q K(VHW)
+        if self.compute_entropy:
+            K = x.shape[-1]
+            HW = K // num_view
+            per_view_prob = x.reshape(*x.shape[-1], num_view, HW)
+            eps = 1e-8
+            self.entropy_val = - (per_view_prob * (per_view_prob + eps).log()).sum(dim=-1) # B 1 Q V
+        x = per_view_softargmax2d(x, num_view) # B 1 Q V 2
+        return x.flatten(-2,-1) # B 1 Q V*2
 
 
 LOGIT_HEAD_CLS = {

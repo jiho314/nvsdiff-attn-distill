@@ -5,7 +5,37 @@ from typing import Dict, List, Tuple, Optional, Any
 from my_diffusers.callbacks import PipelineCallback
 from src.distill_utils.attn_processor_cache import pop_cached_attn, clear_attn_cache
 from src.distill_utils.query_key_cost_metric import COST_METRIC_FN
-from src.distill_utils.attn_logit_head import LOGIT_HEAD_CLS
+from torch import nn
+
+
+class Softmax(nn.Module):
+    def __init__(self, 
+                 softmax_temp=1.0, num_view_for_per_view=None, **kwargs):
+        super(Softmax, self).__init__()
+        self.num_view = num_view_for_per_view
+        if num_view_for_per_view is not None:
+            self.per_view = True
+        else:
+            self.per_view = False
+        self.softmax_temp = softmax_temp
+    
+    def forward(self, x, **kwargs):
+        if self.per_view:
+            K = x.shape[-1]
+            HW = K // self.num_view
+            x = x.reshape(*x.shape[:-1], self.num_view, HW)
+        x = x / self.softmax_temp
+        return x.softmax(dim=-1)
+    
+class Softmax_HeadMean(Softmax):
+    def forward(self, x, **kwargs):
+        if self.per_view:
+            K = x.shape[-1]
+            HW = K // self.num_view
+            x = x.reshape(*x.shape[:-1], self.num_view, HW)
+        x = x / self.softmax_temp
+        x = x.softmax(dim=-1)
+        return x.mean(dim=1, keepdim=True)
 
 
 import os
@@ -16,6 +46,7 @@ import torch.nn.functional as FNN
 import time
 import uuid
 from PIL import Image as _PILImage, ImageDraw as _PILDraw
+
 
 
 class AttentionVisualizationCallback(PipelineCallback):
@@ -67,400 +98,218 @@ class AttentionVisualizationCallback(PipelineCallback):
     
     def _setup_loss_function(self):
         """Loss function을 문자열에서 실제 함수로 변환"""
-        loss_fn = self.visualize_config.get('loss_fn', 'cross_entropy')
-
         # define canonical loss functions and store mapping for per-pair overrides
-        def cross_entropy(prob, prob_gt):
-            """Cross entropy loss for attention probabilities.
-
-            Expects inputs to already be probabilities over last dim.
+        # Helper: normalize inputs and perform head/view collapsing
+        def _prepare_for_loss(pred: torch.Tensor, gt: torch.Tensor):
             """
-            eps = 1e-8
-            return - (prob_gt * (prob + eps).log()).sum(dim=-1).mean()
-
-        def kl_divergence(prob, prob_gt):
-            """Kullback-Leibler divergence loss for attention probabilities."""
-            return (prob_gt * (prob_gt.log() - prob.log())).sum(dim=-1).mean()
-
-        def softargmax_l2_from_prob(prob_pred, prob_gt, num_key_views: int):
-            """Compute L2 between 2D soft-argmax coordinates from probability inputs.
-
-            Simplified strict version: requires `num_key_views` (int). Assumes inputs are
-            probabilities shaped [..., Q, K] and sum to 1 along the last dim. K must equal
-            num_key_views * (kp**2) where kp is integer spatial side.
-
-            This function returns L2 computed on *pixel/index coordinates* (0..kp-1), not
-            normalized [0,1] coordinates.
-
-            Returns scalar mean L2 averaged over batch, heads, queries and key-views.
+            Accepts pred/gt in either per-view form (B,Head,Q,V,HW) or global form (B,Head,Q,K)
+            and returns a tuple (mode, P, G, meta) where
+              - mode is 'per_view' or 'global'
+              - P, G are tensors already converted to float and on same device
+              - meta contains dict with B, Head, Q, V (if per_view) and K
             """
-            # last-dim K
-            K = int(prob_pred.shape[-1])
-            if K <= 0:
-                raise ValueError(f"Invalid K for softargmax_l2: K={K}")
+            if pred is None or gt is None:
+                raise ValueError("pred and gt must be tensors")
+            # ensure same dtype/device
+            gt = gt.to(dtype=pred.dtype, device=pred.device)
 
-            num_k = int(num_key_views)
-            if num_k <= 0 or K % num_k != 0:
-                raise ValueError(f"num_key_views={num_k} is not a valid divisor of K={K}")
-
-            other = K // num_k
-            kp = int(round(math.sqrt(other)))
-            if kp * kp != other:
-                raise ValueError(f"Given num_key_views={num_k} does not yield a square kp for K={K}")
-
-            # reshape to [..., Q, num_k, kp, kp]
-            p_pred = prob_pred.view(*prob_pred.shape[:-1], num_k, kp, kp)
-            p_gt = prob_gt.view(*prob_gt.shape[:-1], num_k, kp, kp)
-
-            # coordinate grids in pixel/index space: 0..kp-1
-            xs = torch.arange(0, kp, device=p_pred.device, dtype=p_pred.dtype)
-            ys = torch.arange(0, kp, device=p_pred.device, dtype=p_pred.dtype)
-            # build broadcastable grids matching p_pred shape [..., num_k, kp, kp]
-            nd = p_pred.dim()
-            leading = nd - 3  # number of leading dims before (num_k, kp, kp)
-
-            # grid_x should have shape [..., num_k, 1, kp]
-            grid_x = xs
-            for _ in range(leading + 2):
-                grid_x = grid_x.unsqueeze(0)
-            grid_x = grid_x.to(device=p_pred.device, dtype=p_pred.dtype)
-            grid_x = grid_x.expand(*p_pred.shape[:-2], 1, kp)
-
-            # grid_y should have shape [..., num_k, kp, 1]
-            grid_y = ys
-            for _ in range(leading + 1):
-                grid_y = grid_y.unsqueeze(0)
-            grid_y = grid_y.unsqueeze(-1)
-            grid_y = grid_y.to(device=p_pred.device, dtype=p_pred.dtype)
-            grid_y = grid_y.expand(*p_pred.shape[:-2], kp, 1)
-
-            # expected coordinates per-key-view: [..., Q, num_k]
-            pred_x = (p_pred * grid_x).sum(dim=(-2, -1))
-            pred_y = (p_pred * grid_y).sum(dim=(-2, -1))
-            gt_x = (p_gt * grid_x).sum(dim=(-2, -1))
-            gt_y = (p_gt * grid_y).sum(dim=(-2, -1))
-
-            # stack to coords: [..., Q, num_k, 2]
-            pred_coords = torch.stack([pred_x, pred_y], dim=-1)
-            gt_coords = torch.stack([gt_x, gt_y], dim=-1)
-
-            # Euclidean distance (L2) per key-view: sqrt(sum((x-y)^2))
-            diff = pred_coords - gt_coords
-            per_view_sq = diff.pow(2).sum(dim=-1)  # squared L2 [..., Q, num_k]
-            per_view_l2 = per_view_sq.sqrt()  # Euclidean L2 [..., Q, num_k]
-
-            # average L2 over batch, heads, queries and key-views
-            loss = per_view_l2.mean()
-
-            # # Detailed runtime logging to help debug small loss values
-            # print(f"[softargmax_l2] prob_pred.shape={prob_pred.shape}, prob_gt.shape={prob_gt.shape}, K={K}, num_k={num_k}, kp={kp}")
-            # print(f"[softargmax_l2] pred_prob mean/min/max = {float(prob_pred.mean()):.6e}/{float(prob_pred.min()):.6e}/{float(prob_pred.max()):.6e}")
-            # print(f"[softargmax_l2] gt_prob   mean/min/max = {float(prob_gt.mean()):.6e}/{float(prob_gt.min()):.6e}/{float(prob_gt.max()):.6e}")
-            # # sample a few coordinates (first batch/head/query/keyview)
-            # try:
-            #     sample_pred = pred_coords.detach().cpu().numpy()
-            #     sample_gt = gt_coords.detach().cpu().numpy()
-            #     # print first few coords for first query & first key-view
-            #     print(f"[softargmax_l2] sample pred_coords[0,0,0,:5] = {sample_pred.reshape(-1, sample_pred.shape[-1])[0:5,:].tolist()}")
-            #     print(f"[softargmax_l2] sample gt_coords[0,0,0,:5]   = {sample_gt.reshape(-1, sample_gt.shape[-1])[0:5,:].tolist()}")
-            # except Exception:
-            #     pass
-            # try:
-            #     print(f"[softargmax_l2] per_view_l2 stats mean/min/max = {float(per_view_l2.mean()):.6e}/{float(per_view_l2.min()):.6e}/{float(per_view_l2.max()):.6e}")
-            # except Exception:
-            #     pass
-            # print(f"[softargmax_l2] loss = {float(loss):.6e}")
-            # # Save small visualization: overlay pred/gt heatmaps for first sample
-            
-            # save_dir = "batch_viz/"
-            # if save_dir is not None:
-            #     os.makedirs(save_dir, exist_ok=True)
-            #     # take first batch, first head, first query
-            #     p_sample = prob_pred[0, 0, :].view(num_k, kp, kp).detach().cpu().numpy()
-            #     g_sample = prob_gt[0, 0, :].view(num_k, kp, kp).detach().cpu().numpy()
-            #     # build side-by-side image per key-view
-            #     rows = []
-            #     for v in range(num_k):
-            #         p_img = (p_sample[v] - p_sample[v].min()) / (np.ptp(p_sample[v]) + 1e-8)
-            #         g_img = (g_sample[v] - g_sample[v].min()) / (np.ptp(g_sample[v]) + 1e-8)
-            #         p_rgb = (self._attn_gray_to_rgb(p_img) )
-            #         g_rgb = (self._attn_gray_to_rgb(g_img) )
-            #         row = np.concatenate([p_rgb, g_rgb], axis=1)
-            #         rows.append(row)
-            #     comp = np.concatenate(rows, axis=0)
-            #     fname = os.path.join(save_dir, f"softargmax_viz_{int(time.time())}_{uuid.uuid4().hex[:6]}.png")
-            #     _PILImage.fromarray(comp).save(fname)
-            #     print(f"[softargmax_l2] saved viz: {fname}")
-
-            return loss
-
-        def _logits_to_probs(logits: torch.Tensor, num_key_views: int, mode: Optional[str] = None) -> torch.Tensor:
-            """Convert logits to probabilities.
-
-            NOTE: per-view and per_view_batch modes removed. Always apply a global
-            softmax over the last dimension. If inputs already look like
-            probabilities (sum ~1) they are returned unchanged.
-            """
-            if logits is None:
-                return logits
-
-            # quick heuristic: if values along K already sum to ~1, assume probs and return
-            try:
-                sums = logits.sum(dim=-1)
-                if torch.allclose(sums, torch.ones_like(sums), atol=1e-3):
-                    return logits
-            except Exception:
-                pass
-
-            # always use global softmax across last dim
-            return logits.softmax(dim=-1)
-
-        def cross_entropy_per_view(prob_pred, prob_gt, num_key_views: int):
-            """Per-view cross entropy. Expects inputs shaped [..., K] or [B,Head,Q,K].
-
-            This computes cross-entropy per key-view tile and averages.
-            """
-            # unify shapes to [..., K]
-            if prob_pred.dim() == 4:
-                # [B,Head,Q,K] -> [..., K]
-                flat_pred = prob_pred
-                flat_gt = prob_gt
+            if pred.dim() == 5:
+                # (B,Head,Q,V,HW)
+                B, Head, Q, V, HW = pred.shape
+                mode = 'per_view'
+                meta = dict(B=B, Head=Head, Q=Q, V=V, HW=HW)
+                return mode, pred, gt, meta
+            elif pred.dim() == 4:
+                # (B,Head,Q,K)
+                B, Head, Q, K = pred.shape
+                mode = 'global'
+                meta = dict(B=B, Head=Head, Q=Q, K=K)
+                return mode, pred, gt, meta
             else:
-                flat_pred = prob_pred
-                flat_gt = prob_gt
+                raise ValueError(f"Unsupported pred shape for loss: {pred.shape}")
 
-            K = int(flat_pred.shape[-1])
-            num_k = int(num_key_views)
-            if num_k <= 0 or K % num_k != 0:
-                raise ValueError(f"num_key_views must divide K: num_key_views={num_k}, K={K}")
-            per = K // num_k
+        def _collapse_heads_as_batch(x: torch.Tensor):
+            # (B,Head,...) -> (B*Head,...)
+            B, H = x.shape[0], x.shape[1]
+            return x.view(B * H, *x.shape[2:])
 
-            # reshape to [..., num_k, per]
-            p_pred = flat_pred.view(*flat_pred.shape[:-1], num_k, per)
-            p_gt = flat_gt.view(*flat_gt.shape[:-1], num_k, per)
-
-            # ensure each tile is probability distribution
-            # apply softmax per tile if sums not ~1
-            pred_flat = p_pred.view(-1, per)
-            gt_flat = p_gt.view(-1, per)
-            if not torch.allclose(pred_flat.sum(dim=-1), torch.ones_like(pred_flat.sum(dim=-1)), atol=1e-3):
-                pred_flat = pred_flat.softmax(dim=-1)
-            if not torch.allclose(gt_flat.sum(dim=-1), torch.ones_like(gt_flat.sum(dim=-1)), atol=1e-3):
-                gt_flat = gt_flat.softmax(dim=-1)
-
-            # compute cross entropy per tile
+        # Core loss implementations operating on collapsed shapes
+        def _cross_entropy(pred_coll: torch.Tensor, gt_coll: torch.Tensor) -> torch.Tensor:
+            # pred_coll, gt_coll: (N, Q, K) probabilities over last dim
             eps = 1e-8
-            ce = - (gt_flat * (pred_flat + eps).log()).sum(dim=-1)
-            # average across tiles and remaining dims
-            return ce.view(*p_pred.shape[:-2], num_k).mean()
+            qloss = - (gt_coll * (pred_coll + eps).log()).sum(dim=-1)  # (N, Q)
+            per_sample = qloss.mean(dim=1)  # (N,)
+            return per_sample.mean()
 
-        def argmax_l2_from_prob(prob_pred, prob_gt, num_key_views: int):
-            """Compute L2 between argmax coordinates from probability inputs.
+        def _kl_divergence(pred_coll: torch.Tensor, gt_coll: torch.Tensor) -> torch.Tensor:
+            qloss = (gt_coll * (gt_coll.log() - pred_coll.log())).sum(dim=-1)
+            per_sample = qloss.mean(dim=1)
+            return per_sample.mean()
 
-            This is a discrete (hard) argmax variant: for each key-view we take the
-            index of the maximum probability and compute pixel/index coordinates
-            then L2 to the GT argmax. Inputs have same shape/assumptions as
-            `softargmax_l2_from_prob`.
-            """
-            # last-dim K
-            K = int(prob_pred.shape[-1])
-            if K <= 0:
-                raise ValueError(f"Invalid K for argmax_l2: K={K}")
+        def _l1(pred_coll: torch.Tensor, gt_coll: torch.Tensor) -> torch.Tensor:
+            # mean abs diff over Q and K
+            l1 = torch.abs(pred_coll - gt_coll)
+            per_sample = l1.mean(dim=(1, 2))
+            return per_sample.mean()
 
-            num_k = int(num_key_views)
-            if num_k <= 0 or K % num_k != 0:
-                raise ValueError(f"num_key_views={num_k} is not a valid divisor of K={K}")
+        # Using decorator approach to avoid duplicated wrapper logic. Decorator converts a
+        # per-sample (N,Q,K)->(N,) function into a full loss callable accepting pred/gt
+        # in either per-view (B,Head,Q,V,HW) or global (B,Head,Q,K) formats and applying
+        # optional pre/post head-mean semantics.
+        def loss_variant(variant: Optional[str] = None):
+            def decorator(per_sample_fn):
+                def loss_callable(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+                    mode, P, G, meta = _prepare_for_loss(pred, gt)
 
-            other = K // num_k
-            kp = int(round(math.sqrt(other)))
-            if kp * kp != other:
-                raise ValueError(f"Given num_key_views={num_k} does not yield a square kp for K={K}")
+                    # pre-headmean
+                    if variant == 'pre':
+                        P = P.mean(dim=1, keepdim=True)
+                        G = G.mean(dim=1, keepdim=True)
 
-            # reshape to [..., Q, num_k, kp, kp]
-            p_pred = prob_pred.view(*prob_pred.shape[:-1], num_k, kp, kp)
-            p_gt = prob_gt.view(*prob_gt.shape[:-1], num_k, kp, kp)
+                    if mode == 'per_view':
+                        B, H, Q, V, HW = P.shape
+                        P_coll = P.permute(0, 1, 3, 2, 4).contiguous().view(B * H * V, Q, HW)
+                        G_coll = G.permute(0, 1, 3, 2, 4).contiguous().view(B * H * V, Q, HW)
+                        per_sample = per_sample_fn(P_coll, G_coll)  # (N,) where N == B*H*V
 
-            # compute argmax indices per tile -> (..., Q, num_k)
-            # flatten last two dims and argmax
-            p_pred_flat = p_pred.view(*p_pred.shape[:-2], -1)
-            p_gt_flat = p_gt.view(*p_gt.shape[:-2], -1)
-            pred_idx = p_pred_flat.argmax(dim=-1)
-            gt_idx = p_gt_flat.argmax(dim=-1)
+                        # Return per-head values (1D tensor) when no head-mean requested
+                        if variant is None:
+                            per_sample = per_sample.view(B, H, V)
+                            per_head = per_sample.mean(dim=2)  # (B, H)
+                            return per_head.view(-1)
 
-            # convert 1D index to 2D coords (y,x): y = idx // kp, x = idx % kp
-            pred_y = (pred_idx // kp).to(dtype=prob_pred.dtype, device=prob_pred.device)
-            pred_x = (pred_idx % kp).to(dtype=prob_pred.dtype, device=prob_pred.device)
-            gt_y = (gt_idx // kp).to(dtype=prob_gt.dtype, device=prob_gt.device)
-            gt_x = (gt_idx % kp).to(dtype=prob_gt.dtype, device=prob_gt.device)
+                        # For pre/post head-mean variants return a single-value tensor (length 1)
+                        scalar = float(per_sample.mean().item())
+                        return torch.tensor([scalar], device=P.device, dtype=P.dtype)
 
-            pred_coords = torch.stack([pred_x, pred_y], dim=-1)
-            gt_coords = torch.stack([gt_x, gt_y], dim=-1)
+                    else:  # global
+                        B, H, Q, K = P.shape
+                        P_coll = _collapse_heads_as_batch(P)
+                        G_coll = _collapse_heads_as_batch(G)
+                        per_sample = per_sample_fn(P_coll, G_coll)  # (N,) where N == B*H
 
-            diff = pred_coords - gt_coords
-            per_view_sq = diff.pow(2).sum(dim=-1)
-            per_view_l2 = per_view_sq.sqrt()
+                        if variant is None:
+                            per_sample = per_sample.view(B, H)
+                            return per_sample.view(-1)
 
-            loss = per_view_l2.mean()
-            return loss
+                        scalar = float(per_sample.mean().item())
+                        return torch.tensor([scalar], device=P.device, dtype=P.dtype)
 
-        def gaussian_a2b_nll_from_prob(prob_pred, prob_gt, num_key_views: int, sigma: float):
-            """Gaussian NLL interpreted as A->B: -sum_x A(x) log K_sigma(x,y*)
+                return loss_callable
 
-            Here prob_gt is expected to be a one-hot (delta) per tile; we infer y* from argmax of prob_gt.
-            The NLL reduces (up to const) to (1/(2 sigma^2)) * E_x[||x - y*||^2].
-            We compute E[x^2+y^2] - 2 E[x]·y* + ||y*||^2 per tile and average.
-            """
-            # unify shapes [..., K]
-            flat_pred = prob_pred
-            flat_gt = prob_gt
-            K = int(flat_pred.shape[-1])
-            num_k = int(num_key_views)
-            if num_k <= 0 or K % num_k != 0:
-                raise ValueError(f"num_key_views must divide K: num_key_views={num_k}, K={K}")
-            per = K // num_k
+            return decorator
 
-            # reshape to [..., num_k, per]
-            p_pred = flat_pred.view(*flat_pred.shape[:-1], num_k, per)
-            p_gt = flat_gt.view(*flat_gt.shape[:-1], num_k, per)
+        # Per-sample loss implementations (return per-sample vector of shape (N,))
+        def _cross_entropy_per_sample(pred_coll: torch.Tensor, gt_coll: torch.Tensor) -> torch.Tensor:
+            eps = 1e-8
+            # pred_coll, gt_coll: (N, Q, K)
+            qloss = - (gt_coll * (pred_coll + eps).log()).sum(dim=-1)  # (N, Q)
+            per_sample = qloss.mean(dim=1)  # (N,)
+            return per_sample
 
-            # coordinate grids
-            device = p_pred.device
-            dtype = p_pred.dtype
-            xs = torch.arange(0, per, device=device, dtype=dtype)
-            ys = torch.arange(0, per, device=device, dtype=dtype)
-            # build grid coords (x,y) for index idx -> (x=idx%kp, y=idx//kp) where kp = sqrt(per)
-            kp = int(round(math.sqrt(per)))
-            gx = (xs % kp).to(dtype=dtype)
-            gy = (xs // kp).to(dtype=dtype)
+        def _kl_per_sample(pred_coll: torch.Tensor, gt_coll: torch.Tensor) -> torch.Tensor:
+            qloss = (gt_coll * (gt_coll.log() - pred_coll.log())).sum(dim=-1)
+            per_sample = qloss.mean(dim=1)
+            return per_sample
 
-            # compute expectations per tile: E[x], E[y], E[x^2+y^2]
-            # p_pred shape [..., num_k, per]
-            ex = (p_pred * gx.view(*([1] * (p_pred.dim() - 2)), kp).reshape([1]*(p_pred.dim()-2) + [kp]).view(-1)).sum(dim=-1)
-            # above broadcasting is tricky; instead compute with explicit tensors
-            # compute gx,gy as tensors of shape (per,)
-            gx = gx.view(1, 1, 1, -1) if p_pred.dim() == 4 else gx.view(1, -1)
-            gy = gy.view(1, 1, 1, -1) if p_pred.dim() == 4 else gy.view(1, -1)
-            # fallback generic computation using broadcasting with torch
-            # reshape p_pred to (-1, per) to compute easily
-            pred_flat = p_pred.view(-1, per)
-            ex_flat = (pred_flat * (torch.arange(0, per, device=device, dtype=dtype) % kp)).sum(dim=-1)
-            ey_flat = (pred_flat * (torch.arange(0, per, device=device, dtype=dtype) // kp)).sum(dim=-1)
-            ex2_flat = (pred_flat * ((torch.arange(0, per, device=device, dtype=dtype) % kp)**2 + (torch.arange(0, per, device=device, dtype=dtype) // kp)**2)).sum(dim=-1)
+        def _l1_per_sample(pred_coll: torch.Tensor, gt_coll: torch.Tensor) -> torch.Tensor:
+            l1 = torch.abs(pred_coll - gt_coll)
+            per_sample = l1.mean(dim=(1, 2))
+            return per_sample
 
-            # get gt hard coords per tile from p_gt argmax
-            gt_flat = p_gt.view(-1, per)
-            gt_idx = gt_flat.argmax(dim=-1)
-            gt_x = (gt_idx % kp).to(dtype=dtype)
-            gt_y = (gt_idx // kp).to(dtype=dtype)
-
-            # Align counts between pred tiles and gt tiles if broadcasting occurred
-            pred_flat = p_pred.view(-1, per)
-            Np = pred_flat.shape[0]
-            Ng = gt_flat.shape[0]
-            if Np != Ng:
-                if Np % Ng == 0:
-                    factor = Np // Ng
-                    gt_x = gt_x.repeat_interleave(factor)
-                    gt_y = gt_y.repeat_interleave(factor)
-                elif Ng % Np == 0:
-                    factor = Ng // Np
-                    # replicate pred expectations to match gt (rare); do by repeating rows
-                    ex_flat = ex_flat.repeat_interleave(factor)
-                    ey_flat = ey_flat.repeat_interleave(factor)
-                    ex2_flat = ex2_flat.repeat_interleave(factor)
-                else:
-                    raise ValueError(f"Incompatible pred/gt tile counts for gaussian_a2b: pred_tiles={Np}, gt_tiles={Ng}")
-
-            # compute expected squared dist per tile
-            # E||x - y*||^2 = E[x^2+y^2] - 2(E[x]*y_x + E[y]*y_y) + (y_x^2 + y_y^2)
-            term = ex2_flat - 2.0 * (ex_flat * gt_x + ey_flat * gt_y) + (gt_x * gt_x + gt_y * gt_y)
-
-            # reshape back to [..., num_k]
-            out = term.view(*p_pred.shape[:-2], num_k)
-            # mean over tiles and remaining dims, scale by 1/(2 sigma^2)
-            loss = out.mean() / (2.0 * (sigma**2))
-            return loss
-
-        def gaussian_b2a_nll_from_prob(prob_pred, prob_gt, num_key_views: int, sigma: float, eps: float = 1e-8):
-            """Compute -log( (K_sigma * A)(y*) ) where y* is GT argmax per tile.
-
-            This computes for each tile: -log( sum_x A(x) * exp(-||x-y*||^2/(2 sigma^2)) ).
-            """
-            flat_pred = prob_pred
-            flat_gt = prob_gt
-            K = int(flat_pred.shape[-1])
-            num_k = int(num_key_views)
-            if num_k <= 0 or K % num_k != 0:
-                raise ValueError(f"num_key_views must divide K: num_key_views={num_k}, K={K}")
-            per = K // num_k
-
-            p_pred = flat_pred.view(-1, num_k, per)
-            p_gt = flat_gt.view(-1, num_k, per)
-
-            kp = int(round(math.sqrt(per)))
-            # create coordinate grid indices 0..per-1
-            idx = torch.arange(0, per, device=flat_pred.device, dtype=flat_pred.dtype)
-            gx = (idx % kp).to(dtype=flat_pred.dtype)
-            gy = (idx // kp).to(dtype=flat_pred.dtype)
-
-            # gt indices
-            gt_flat = p_gt.view(-1, per)
-            gt_idx = gt_flat.argmax(dim=-1)
-            gt_x = (gt_idx % kp).to(dtype=flat_pred.dtype).unsqueeze(-1)
-            gt_y = (gt_idx // kp).to(dtype=flat_pred.dtype).unsqueeze(-1)
-
-            # compute squared distances (per gt tile vs all x)
-            dx2 = (gx.unsqueeze(0) - gt_x)**2
-            dy2 = (gy.unsqueeze(0) - gt_y)**2
-            dist2 = dx2 + dy2  # shape (Ntiles, per)
-
-            # gaussian kernel weights (unnormalized)
-            weights = torch.exp(-dist2 / (2.0 * sigma**2))
-
-            pred_flat = p_pred.view(-1, per)
-
-            # Align counts: if pred_flat rows != weights rows, try broadcasting by repeating gt rows
-            Np = pred_flat.shape[0]
-            Nw = weights.shape[0]
-            if Np != Nw:
-                if Np % Nw == 0:
-                    factor = Np // Nw
-                    weights = weights.repeat_interleave(factor, dim=0)
-                elif Nw % Np == 0:
-                    factor = Nw // Np
-                    pred_flat = pred_flat.repeat_interleave(factor, dim=0)
-                else:
-                    raise ValueError(f"Incompatible pred/gt tile counts for gaussian_b2a: pred_tiles={Np}, weight_tiles={Nw}")
-
-            numer = (pred_flat * weights).sum(dim=-1)
-            vals = -torch.log(numer + eps)
-            loss = vals.mean()
-            return loss
-
-        ATTN_LOSS_FN = {
-            "l1": torch.nn.functional.l1_loss,
-            "cross_entropy": cross_entropy,
-            "softargmax_l2": softargmax_l2_from_prob,
-            "argmax_l2": argmax_l2_from_prob,
-            "kl_divergence": kl_divergence,
-            "gauss_a2b": lambda pred, gt, num_k: gaussian_a2b_nll_from_prob(pred, gt, num_k, sigma=2.0),
-            "gauss_b2a": lambda pred, gt, num_k: gaussian_b2a_nll_from_prob(pred, gt, num_k, sigma=2.0),
-            "gauss_both": lambda pred, gt, num_k: 0.5 * (gaussian_a2b_nll_from_prob(pred, gt, num_k, sigma=2.0) + gaussian_b2a_nll_from_prob(pred, gt, num_k, sigma=2.0))
+        # Base per-sample loss functions mapping.
+        #
+        # Helper for adding custom loss functions:
+        # - Implement a per-sample function with signature:
+        #       def fn(pred_coll: torch.Tensor, gt_coll: torch.Tensor) -> torch.Tensor
+        #   where the inputs are "collapsed" tensors as described below and the
+        #   output is a 1D tensor of per-sample losses (length N):
+        #     * Global mode: pred_coll / gt_coll shape = (N, Q, K)
+        #         - N == B * Head (batch times head)
+        #     * Per-view mode: the callback will collapse to
+        #         pred_coll / gt_coll shape = (N, Q, K') where
+        #         - N == B * Head * V (batch * head * num_views)
+        #         - K' == HW (flattened per-view spatial keys)
+        #   The per-sample fn must return a 1D tensor of length N (per-sample losses).
+        #
+        # To register an external per-sample fn, pass a dict into
+        # `visualize_config['loss_fn_map']` mapping base name -> callable.
+        base_per_sample = {
+            'cross_entropy': _cross_entropy_per_sample,
+            'kl_divergence': _kl_per_sample,
+            'l1': _l1_per_sample,
         }
-        # always expose mapping attribute
-        self.ATTN_LOSS_FN = ATTN_LOSS_FN
 
-        # set default loss_fn
-        if callable(loss_fn):
-            self.loss_fn = loss_fn
-        elif isinstance(loss_fn, str):
-            key = loss_fn.lower()
-            if key not in ATTN_LOSS_FN:
-                raise ValueError(f"Unsupported loss_fn string: {loss_fn}")
-            self.loss_fn = ATTN_LOSS_FN[key]
-            print(f"Using loss_fn: {key}")
-        else:
-            raise ValueError(f"Unsupported loss_fn type: {type(loss_fn)}")
+        # Allow validate.py to pass an external mapping via visualize_config['loss_fn_map']
+        external_map = self.visualize_config.get('loss_fn_map', None)
+
+        # decorator factory
+        def loss_variant(variant: Optional[str] = None):
+            def decorator(per_sample_fn):
+                def loss_callable(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+                    mode, P, G, meta = _prepare_for_loss(pred, gt)
+
+                    # pre-headmean
+                    if variant == 'pre':
+                        P = P.mean(dim=1, keepdim=True)
+                        G = G.mean(dim=1, keepdim=True)
+
+                    if mode == 'per_view':
+                        B, H, Q, V, HW = P.shape
+                        P_coll = P.permute(0, 1, 3, 2, 4).contiguous().view(B * H * V, Q, HW)
+                        G_coll = G.permute(0, 1, 3, 2, 4).contiguous().view(B * H * V, Q, HW)
+                        per_sample = per_sample_fn(P_coll, G_coll)
+
+                        if variant == 'post':
+                            per_sample = per_sample.view(B, H, V).mean(dim=1).mean()
+                            return per_sample
+                        return per_sample.mean()
+
+                    else:  # global
+                        B, H, Q, K = P.shape
+                        P_coll = _collapse_heads_as_batch(P)
+                        G_coll = _collapse_heads_as_batch(G)
+                        per_sample = per_sample_fn(P_coll, G_coll)
+
+                        if variant == 'post':
+                            per_sample = per_sample.view(B, H).mean(dim=1).mean()
+                            return per_sample
+                        return per_sample.mean()
+
+                return loss_callable
+
+            return decorator
+
+        # Store base per-sample functions (may be overridden by external_map).
+        # expose base per-sample map (possibly overridden by external_map)
+        base_map = {}
+        for base_name, per_sample_fn in base_per_sample.items():
+            if external_map is not None and base_name in external_map:
+                per_sample_fn = external_map[base_name]
+            base_map[base_name] = per_sample_fn
+
+        # also expose ready-to-call wrapped variants for convenience (so callers can request 'cross_entropy_pre' etc.)
+        wrapped_map = {}
+        for base_name, per_sample_fn in base_map.items():
+            wrapped_map[base_name] = loss_variant(None)(per_sample_fn)
+            wrapped_map[f"{base_name}_pre"] = loss_variant('pre')(per_sample_fn)
+            wrapped_map[f"{base_name}_post"] = loss_variant('post')(per_sample_fn)
+
+        # store both
+        self._ATTN_LOSS_BASE = base_map
+        self.ATTN_LOSS_FN = wrapped_map
+
+        # # set default loss_fn
+        # if callable(loss_fn):
+        #     self.loss_fn = loss_fn
+        # elif isinstance(loss_fn, str):
+        #     key = loss_fn.lower()
+        #     if key not in ATTN_LOSS_FN:
+        #         raise ValueError(f"Unsupported loss_fn string: {loss_fn}")
+        #     self.loss_fn = ATTN_LOSS_FN[key]
+        #     print(f"Using loss_fn: {key}")
+        # else:
+        #     raise ValueError(f"Unsupported loss_fn type: {type(loss_fn)}")
     
     def _prepare_vggt_cache(self):
         """VGGT attention cache를 미리 계산"""
@@ -520,6 +369,42 @@ class AttentionVisualizationCallback(PipelineCallback):
 
         raise ValueError(f"Unsupported softmax mode: {mode}")
     
+
+
+    def _resolve_heads(self, pair: Dict[str, Any]):
+        """
+        Return a (unet_head, vggt_head) tuple by instantiating from per-pair
+        overrides or falling back to the global `visualize_config` settings.
+        """
+        # Always use the unified head class `softmax` for both UNet and VGGT.
+        # Allow per-pair or global kwargs to configure temperatures and per_view.
+        logit_head_cls = Softmax
+        viz_head_cls = Softmax_HeadMean
+        
+        if logit_head_cls is None:
+            raise RuntimeError("Unified logit head class 'softmax' not found")
+        if viz_head_cls is None:
+            raise RuntimeError("Unified viz head class 'softmax_headmean' not found")
+
+        # kwargs resolution: prefer per-pair kwargs, then global visualize_config
+        unet_kwargs = pair.get('unet_logit_head_kwargs', None) if isinstance(pair, dict) else None
+        vggt_kwargs = pair.get('vggt_logit_head_kwargs', None) if isinstance(pair, dict) else None
+
+        mode_loss = str(pair.get('loss_softmax_mode', 'global')).lower()
+        mode_viz = str(pair.get('viz_softmax_mode', 'global')).lower()
+        # dict + dict 연산 오류 수정: dict.update() 또는 {**dict1, **dict2} 사용
+        unet_loss_kwargs = {**(unet_kwargs or {}), 'per_view': mode_loss == 'per_view'}
+        vggt_loss_kwargs = {**(vggt_kwargs or {}), 'per_view': mode_loss == 'per_view'}
+        unet_viz_kwargs = {**(unet_kwargs or {}), 'per_view': mode_viz == 'per_view'}
+        vggt_viz_kwargs = {**(vggt_kwargs or {}), 'per_view': mode_viz == 'per_view'}
+        
+        unet_loss_head = logit_head_cls(**unet_loss_kwargs)
+        vggt_loss_head = logit_head_cls(**vggt_loss_kwargs)
+        unet_viz_head = viz_head_cls(**unet_viz_kwargs)
+        vggt_viz_head = viz_head_cls(**vggt_viz_kwargs)
+        return unet_loss_head, vggt_loss_head, unet_viz_head, vggt_viz_head
+
+
     def _resize_token(self, tok: torch.Tensor, target_size: int, F: int) -> torch.Tensor:
         """토큰을 target_size로 리사이즈"""
         # Support inputs with and without explicit Head dimension.
@@ -561,46 +446,28 @@ class AttentionVisualizationCallback(PipelineCallback):
                                   B=B, Head=Head, f1=len(query_idx), f2=len(key_idx), HW1=HW, HW2=HW)
         return attnmap
     
-    def _extract_loss_view_indices(self, F: int) -> Tuple[List[int], List[int]]:
+    def _extract_view_indices(self, F: int, mode: str) -> Tuple[List[int], List[int]]:
         """Loss 계산용 query와 key의 view index 추출"""
         # Loss Query index 추출
-        if self.visualize_config['loss_query'] == "target":
+        if self.visualize_config[f'{mode}_query'] == "target":
             query_idx = list(range(self.cond_num, F))
-        elif self.visualize_config['loss_query'] == "all":
+        elif self.visualize_config[f'{mode}_query'] == "all":
             query_idx = list(range(0, F))
         else:
             raise NotImplementedError(f"visualize_config['loss_query'] {self.visualize_config['loss_query']} not implemented")
         
         # Loss Key index 추출
-        if self.visualize_config['loss_key'] == "reference":
+        if self.visualize_config[f'{mode}_key'] == "reference":
             key_idx = list(range(0, self.cond_num))
-        elif self.visualize_config['loss_key'] == "all":
+        elif self.visualize_config[f'{mode}_key'] == "all":
             key_idx = list(range(0, F))
         else:
             raise NotImplementedError(f"visualize_config['loss_key'] {self.visualize_config['loss_key']} not implemented")
         
         return query_idx, key_idx
 
-    def _extract_viz_view_indices(self, F: int) -> Tuple[List[int], List[int]]:
-        """Visualization용 query와 key의 view index 추출"""
-        # Viz Query index 추출
-        if self.visualize_config['viz_query'] == "target":
-            query_idx = list(range(self.cond_num, F))
-        elif self.visualize_config['viz_query'] == "all":
-            query_idx = list(range(0, F))
-        else:
-            raise NotImplementedError(f"visualize_config['viz_query'] {self.visualize_config['viz_query']} not implemented")
-        
-        # Viz Key index 추출
-        if self.visualize_config['viz_key'] == "reference":
-            key_idx = list(range(0, self.cond_num))
-        elif self.visualize_config['viz_key'] == "all":
-            key_idx = list(range(0, F))
-        else:
-            raise NotImplementedError(f"visualize_config['viz_key'] {self.visualize_config['viz_key']} not implemented")
-        
-        return query_idx, key_idx
     
+    ##### VISUALIZATION UTILS #####
     def _attn_gray_to_rgb(self, gray: np.ndarray) -> np.ndarray:
         """Map normalized [0,1] gray heatmap to RGB uint8 (simple HSV-like colormap)."""
         h = (1.0 - gray) * (2.0 / 3.0)
@@ -716,8 +583,7 @@ class AttentionVisualizationCallback(PipelineCallback):
             F: int,
             query_idx_list: List[int],
             key_idx_list: List[int],
-            viz_mode: str,
-            viz_num_k: int,
+
     ) -> None:
         """Save attention overlay image similar to example, if configured.
 
@@ -738,11 +604,14 @@ class AttentionVisualizationCallback(PipelineCallback):
         gt = gt_logits.detach().to(dtype=torch.float32, device='cpu')
 
         B, Hh, Q, K = pred.shape
+        
         # token geometry
         num_q_views = max(1, len(query_idx_list))
+        
         q_hw = Q // num_q_views
         q_side = int(math.sqrt(q_hw))
         assert q_side * q_side == q_hw, f"Q per-view must be square, got {q_hw}"
+        
         num_k_views = max(1, len(key_idx_list))
         k_hw = K // num_k_views
         k_side = int(math.sqrt(k_hw))
@@ -751,6 +620,8 @@ class AttentionVisualizationCallback(PipelineCallback):
         # choose query token inside target view (F-1)
         assert (F - 1) in query_idx_list, "Target view (last) must be included in query indices."
         tgt_q_view_pos = query_idx_list.index(F - 1)
+        
+        # query point 선택
         qxy = self.visualize_config.get('viz_query_xy', None)
         qindex = self.visualize_config.get('viz_query_index', None)
         if qxy is not None:
@@ -764,11 +635,11 @@ class AttentionVisualizationCallback(PipelineCallback):
             qy, qx = divmod(q_in_view, q_side)
         q_idx = tgt_q_view_pos * q_hw + q_in_view
 
-        # convert logits to probabilities using pair-provided viz_mode and viz_num_k
-        pred_p = self._logits_to_probs(pred, int(viz_num_k), mode=viz_mode)
-        gt_p = self._logits_to_probs(gt, int(viz_num_k), mode=viz_mode)
-        pred_prob = pred_p.mean(dim=1)[0]  # [Q,K]
-        gt_prob = gt_p.mean(dim=1)[0]      # [Q,K]
+        # `pred` and `gt` are expected to already be probabilities (softmax applied
+        # by the logit head used upstream). Use them directly and average over heads
+        # for aggregated visualization.
+        pred_prob = pred.mean(dim=1)[0]  # [Q,K]
+        gt_prob = gt.mean(dim=1)[0]      # [Q,K]
 
         # select query row
         pred_vec = pred_prob[q_idx]  # [K]
@@ -828,15 +699,15 @@ class AttentionVisualizationCallback(PipelineCallback):
                 blended_pil = self._draw_max_attention_point(blended_pil, tile, k_side)
                 
                 # self attention 영역 (target view)에 특별한 경계선 추가
-                current_key_view_idx = key_idx_list[view_idx]
-                if current_key_view_idx == F - 1:  # target view (self attention)
-                    # 노란색 경계선으로 self attention 영역 표시
-                    draw = _PILDraw.Draw(blended_pil)
-                    border_width = 3
-                    w, h = blended_pil.size
-                    # 노란색 경계선 그리기
-                    for i in range(border_width):
-                        draw.rectangle([i, i, w-1-i, h-1-i], outline=(255, 255, 0), width=1)
+                # current_key_view_idx = key_idx_list[view_idx]
+                # if current_key_view_idx == F - 1:  # target view (self attention)
+                #     # 노란색 경계선으로 self attention 영역 표시
+                #     draw = _PILDraw.Draw(blended_pil)
+                #     border_width = 3
+                #     w, h = blended_pil.size
+                #     # 노란색 경계선 그리기
+                #     for i in range(border_width):
+                #         draw.rectangle([i, i, w-1-i, h-1-i], outline=(255, 255, 0), width=1)
                 
                 blended = np.array(blended_pil)
                 outs.append(blended)
@@ -993,6 +864,10 @@ class AttentionVisualizationCallback(PipelineCallback):
                         pred_attn_logit = None
                         return None
                     pred_attn_logit = unet_attn_cache[str(current_unet)]
+                    
+                    ## CFG - second batch is conditional branch
+                    if pred_attn_logit.dim() == 4 and pred_attn_logit.shape[1] != 1:
+                        pred_attn_logit = pred_attn_logit[-1].unsqueeze(0)
                     return pred_attn_logit
                     
     def _get_gt_tokens(self, vggt_layer: str):
@@ -1017,7 +892,7 @@ class AttentionVisualizationCallback(PipelineCallback):
             gt_key = layer_cache['key'].detach()
             return gt_query.shape, gt_query, gt_key
     
-    def _get_gt_costmap(self, vggt_layer: str, pair_metric: str, num_head: int):
+    def _get_gt_costmap(self, gt_query_resized, gt_key_resized, pair_metric: str, num_head: int):
         metric_fn = COST_METRIC_FN.get(pair_metric, None)
         print(f"[DEBUG] Using costmap metric: {pair_metric}")
         if metric_fn is None:
@@ -1035,6 +910,40 @@ class AttentionVisualizationCallback(PipelineCallback):
             gt_query_resized = gt_query_resized.expand(-1, pred_head, -1, -1).contiguous()
             gt_key_resized = gt_key_resized.expand(-1, pred_head, -1, -1).contiguous()
         return gt_attn_logit
+    
+    
+    def _get_loss_fn(self, pair_loss_fn: str):
+        # determine chosen loss name (pair override or global)
+        if pair_loss_fn is None:
+            raise ValueError(f"Pair must provide 'loss_fn' entry for loss calculation: pair={pair}")
+        # support passing dict: {'fn': 'cross_entropy', 'head_mean': 'pre'}
+        if isinstance(pair_loss_fn, dict):
+            fn_name = pair_loss_fn.get('fn') or pair_loss_fn.get('name')
+            head_mean = pair_loss_fn.get('head_mean', None)
+            if fn_name is None:
+                raise ValueError(f"loss_fn dict must contain 'fn'/'name' key: {pair_loss_fn}")
+            key = str(fn_name).lower()
+            if head_mean is not None:
+                hm = str(head_mean).lower()
+                if hm in ('none', 'null', 'no'):
+                    # treat as no head-mean
+                    key = f"{key}_pre"
+                    is_head_mean = False
+                elif hm in ('pre', 'post'):
+                    key = f"{key}_{hm}"
+                    is_head_mean = True
+                else:
+                    raise ValueError(f"Unsupported head_mean value: {head_mean}")
+        else:
+            # default; pre-headmean
+            is_head_mean = True
+            key = f"{str(pair_loss_fn).lower()}_pre"
+        loss_fn = self.ATTN_LOSS_FN.get(key, None)
+        
+        if loss_fn is None:
+            raise ValueError(f"Unknown/unsupported loss key requested: {key}. Available: {list(self.ATTN_LOSS_FN.keys())}")
+        print(f"[DEBUG] Using loss_fn: {key}")    
+        return loss_fn, key, is_head_mean
     
     def __call__(
         self,
@@ -1079,16 +988,15 @@ class AttentionVisualizationCallback(PipelineCallback):
             visualize_pairs = self._process_layer_pair()
 
             for pair in visualize_pairs:
-                # support dict entries
+                
                 if isinstance(pair, dict):
                     unet_layer = pair.get('unet_layer')
                     vggt_layer = pair.get('vggt_layer')
                     pair_metric = pair.get('costmap_metric', None)
-                    pair_loss_fn_name = pair.get('loss_fn', None)
+                    pair_loss_fn = pair.get('loss_fn', None)
                 else:
-                    raise ValueError(f"Invalid pair entry: {pair}")
+                    raise ValueError(f"invalid pair entry: {pair}")
 
-                # when encountering a new unet layer, free previous pred and load new one
                 pred_attn_logit = self._get_pred_attn_logit(unet_layer, current_unet, unet_attn_cache)
 
                 print(f"[DEBUG] Processing layer pair: {unet_layer}, {vggt_layer}")
@@ -1096,11 +1004,10 @@ class AttentionVisualizationCallback(PipelineCallback):
                 print(f"[DEBUG] VGGT attention cache keys: {list(self.batch.get('vggt_attn_cache', {}).keys()) if self.batch.get('vggt_attn_cache') else 'None'}")
 
                 gt_query_shape, gt_query, gt_key = self._get_gt_tokens(vggt_layer)
-                Bp, Vp, Cp, Hp, Wp = gt_query_shape
 
                 # Ensure pred exists 
                 if pred_attn_logit is None:
-                    raise RuntimeError(f"[DEBUG] Missing UNet attention logits for unet layer {unet_layer}")
+                    raise RuntimeError(f"[DEBUG] missing UNet attention logits for unet layer {unet_layer}")
                 Q, K = pred_attn_logit.shape[-2], pred_attn_logit.shape[-1]
                 if Q != K:
                     raise ValueError(f"pred attn must have equal Q and K dims, got {pred_attn_logit.shape}")
@@ -1112,223 +1019,84 @@ class AttentionVisualizationCallback(PipelineCallback):
                 target_device = pred_attn_logit.device
                 gt_query = gt_query.to(dtype=target_dtype, device=target_device)
                 gt_key = gt_key.to(dtype=target_dtype, device=target_device)
-
-                
+            
                 pred_query_size = int(math.sqrt(Q // F))
                 pred_key_size = int(math.sqrt(K // F))
-                
                 gt_query_resized = self._resize_token(gt_query, pred_query_size, F)
                 gt_key_resized = self._resize_token(gt_key, pred_key_size, F)
                 
-                ### 정리
+                ### 차원 정리
                 # gt_query_resized: (B, 1, pred_query_size, pred_query_size, C)
                 # gt_key_resized: (B, 1, pred_key_size, pred_key_size, C)
                 # pred_attn_logit: (B, Head, pred_query_size, pred_key_size)
+                
+                unet_softmax_head, vggt_softmax_head, unet_viz_head, vggt_viz_head = self._resolve_heads(pair)
+                if unet_softmax_head is None or vggt_softmax_head is None or unet_viz_head is None or vggt_viz_head is None:
+                    raise RuntimeError(f"Missing unet/vggt logit head for pair: {pair}")
 
                 if loss_enabled:
                     layer_key = f"unet{unet_layer}_vggt{vggt_layer}"
                     print(f"Calculating loss for step {step_index}, layer {layer_key}")
-                    loss_query_idx, loss_key_idx = self._extract_loss_view_indices(F)
+                    loss_query_idx, loss_key_idx = self._extract_view_indices(F, mode="loss")
                     
                     # pred_attn_logit_sliced: (B, Head, pred_query_size, pred_key_size) / (2,10,1024,2048)
                     pred_attn_logit_sliced = self._slice_attention_map(pred_attn_logit, loss_query_idx, loss_key_idx, F)
                     
                     # gt_attn_logit_sliced: (B, Head, pred_query_size, pred_key_size)
-                    gt_attn_logit = self._get_gt_costmap(vggt_layer, pair_metric, num_head=pred_attn_logit.shape[1])
+                    gt_attn_logit = self._get_gt_costmap(gt_query_resized, gt_key_resized, pair_metric, num_head=pred_attn_logit.shape[1])
                     gt_attn_logit_sliced = self._slice_attention_map(gt_attn_logit, loss_query_idx, loss_key_idx, F)
 
                     # Instantiate logit-heads for UNet and VGGT outputs.
-                    # Preference order:
-                    # 1) per-pair explicit head class in pair dict
-                    # 2) global visualize_config head names
-                    def _resolve_head(name_key, kwargs_key, layer_key):
-                        """
-                        Instantiate a logit head for the given keys.
-
-                        NOTE: Do NOT prefer or attempt to use any module already attached
-                        to `pipeline.unet`. Always instantiate from the per-pair override
-                        or fall back to the global `visualize_config` settings.
-                        """
-                        # 1) If pair explicitly provides a head name, instantiate that class
-                        if isinstance(pair, dict) and pair.get(name_key, None) is not None:
-                            name = pair[name_key].lower()
-                            kw = pair.get(kwargs_key, {})
-                            return LOGIT_HEAD_CLS[name](**kw)
-
-                        # 2) Fall back to global visualize_config names (instantiate)
-                        gname = self.visualize_config.get(name_key, None)
-                        gkw = self.visualize_config.get(kwargs_key, {})
-                        if gname is not None:
-                            return LOGIT_HEAD_CLS[gname.lower()](**gkw)
-
-                        return None
-
-                    unet_head = _resolve_head('unet_logit_head', 'unet_logit_head_kwargs', unet_layer)
-                    vggt_head = _resolve_head('vggt_logit_head', 'vggt_logit_head_kwargs', vggt_layer)
-                    if unet_head is None or vggt_head is None:
-                        raise RuntimeError(f"Missing unet/vggt logit head for pair: {pair}")
-
-                    # For loss calculations we keep the raw logits and apply
-                    # deterministic conversion to probabilities below according
-                    # to the global softmax mode. For visualization we process
-                    # through the configured logit heads so viz respects
-                    # head-specific temperature/processing.
-                    pred_processed_loss = pred_attn_logit_sliced
-                    gt_processed_loss = gt_attn_logit_sliced
-                    pred_processed_viz = unet_head(pred_attn_logit_sliced)
-                    gt_processed_viz = vggt_head(gt_attn_logit_sliced)
+                    # Preference order: 1) per-pair explicit head class, 2) global visualize_config
+                    # if per-view => (View, Head, HW, View, HW)
+                    # else global => (view, Head, HW, View*HW)
+                    pred_processed_viz = unet_softmax_head(pred_attn_logit_sliced)
+                    gt_processed_viz = vggt_softmax_head(gt_attn_logit_sliced)
                     
-                    if self.visualize_config.get('per_head_loss', False):
-                        # per-head loss 계산
-                        raise NotImplementedError(f"Not implemented per-head loss")
-                    else:
-                        # aggregated loss 계산
-                        # determine chosen loss name (pair override or global)
-                        if pair_loss_fn_name is not None:
-                            # pair may provide a string name
-                            chosen_fn = pair_loss_fn_name.lower() if isinstance(pair_loss_fn_name, str) else None
-                        else:
-                            # pair MUST provide loss function name
-                            raise ValueError(f"Pair must provide 'loss_fn' entry for loss calculation: pair={pair}")
+                    # aggregated loss 계산
+                    loss_fn, chosen_fn_str, is_head_mean = self._get_loss_fn(pair_loss_fn)
+                    loss_value = loss_fn(pred_processed_viz, gt_processed_viz)
 
-                        # log the chosen function (or note fallback)
-                        print(f"Using loss_fn: {chosen_fn if chosen_fn is not None else 'default_callable'}")
+                    # include chosen loss function name in the step-level key
+                    chosen_fn_str = str(chosen_fn_str).replace('/', '_')
+                    
+                    # store average for backwards compatibility
+                    per_head_list = [float(x) for x in loss_value.detach().cpu().view(-1).tolist()]
+                    loss_scalar = float(sum(per_head_list) / len(per_head_list))
+                    step_loss_dict[f"val/step{step_index}/{layer_key}/{chosen_fn_str}"] = loss_scalar
 
-                        local_loss_fn = self.ATTN_LOSS_FN.get(chosen_fn, None) if chosen_fn is not None else None
-                        # For losses that expect probability inputs (cross_entropy, kl_divergence)
-                        # convert logits -> probs using global softmax settings. Otherwise keep raw.
-                        prob_required = chosen_fn in ('cross_entropy', 'kl_divergence')
-                        if prob_required:
-                            # Use logits -> log_softmax(path) with per-head temperature when available.
-                            # Determine temperatures: prefer head attributes, then per-pair kwargs, then global config.
-                            def _resolve_temp(head_obj, pair_kwargs_key, global_cfg_key):
-                                t = None
-                                try:
-                                    if hasattr(head_obj, 'softmax_temp'):
-                                        t = head_obj.softmax_temp
-                                except Exception:
-                                    t = None
-                                if t is None:
-                                    # pair-level override
-                                    if isinstance(pair, dict) and pair.get(pair_kwargs_key, None) is not None:
-                                        t = pair.get(pair_kwargs_key, {}).get('softmax_temp', None)
-                                if t is None:
-                                    t = self.visualize_config.get(global_cfg_key, {}).get('softmax_temp', 1.0)
-                                # if tensor, convert to float
-                                try:
-                                    if torch.is_tensor(t):
-                                        t = t.detach().cpu().item()
-                                except Exception:
-                                    pass
-                                return float(t)
+                    # store per-head entries under head indices so logging can read head-wise metrics
+                    for hid, hv in enumerate(per_head_list):
+                        step_loss_dict[f"val/step{step_index}/{layer_key}/{chosen_fn_str}/head{hid}"] = hv
 
-                            pred_temp = _resolve_temp(unet_head, 'unet_logit_head_kwargs', 'unet_logit_head_kwargs')
-                            gt_temp = _resolve_temp(vggt_head, 'vggt_logit_head_kwargs', 'vggt_logit_head_kwargs')
+                    print(f"[DEBUG] Calculated loss for {layer_key} (fn={chosen_fn_str}): avg={loss_scalar}, per_head={per_head_list}")
 
-                            # compute log-prob for pred and prob for gt in a numerically stable way
-                            # Support per-view (split) softmax: reshape last dim to (..., num_k, per)
-                            use_per_view = bool(self.visualize_config.get('split', False)) or \
-                                (self.visualize_config.get('softmax_mode', 'global') == 'per_view') or \
-                                (isinstance(pair, dict) and pair.get('loss_softmax_mode', None) == 'per_view')
-                            loss_k = int(self.visualize_config.get('loss_num_key_views', 1))
-
-                            if use_per_view and loss_k > 1:
-                                # Debugging: print shapes to trace reshape failures
-                                try:
-                                    print(f"[DEBUG] pred_processed_loss.shape={getattr(pred_processed_loss, 'shape', None)}, gt_processed_loss.shape={getattr(gt_processed_loss, 'shape', None)}, loss_k={loss_k}, pair={pair}")
-                                    print(f"[DEBUG] pred_processed_loss.numel={pred_processed_loss.numel() if hasattr(pred_processed_loss, 'numel') else 'NA'}, gt_processed_loss.numel={gt_processed_loss.numel() if hasattr(gt_processed_loss, 'numel') else 'NA'}")
-                                except Exception:
-                                    pass
-                                
-                                import pdb; pdb.set_trace()
-
-                                # pred: logits -> log_softmax per tile
-                                K = int(pred_processed_loss.shape[-1])
-                                if K % loss_k != 0:
-                                    raise ValueError(f"loss_num_key_views={loss_k} does not divide K={K}")
-                                per = K // loss_k
-
-                                # use each tensor's leading shape for safe reshape
-                                leading_pred = pred_processed_loss.shape[:-1]
-                                leading_gt = gt_processed_loss.shape[:-1]
-
-                                # reshape pred using its own leading dims
-                                try:
-                                    p_logits = pred_processed_loss.view(*leading_pred, loss_k, per)
-                                    logp = FNN.log_softmax(p_logits / pred_temp, dim=-1).view(*leading_pred, K)
-                                except Exception as e:
-                                    raise RuntimeError(f"Failed to reshape pred_processed_loss for per-view softmax: shape={pred_processed_loss.shape}, attempted (*{leading_pred}, {loss_k}, {per}): {e}")
-
-                                # reshape gt using its own leading dims
-                                try:
-                                    g_logits = gt_processed_loss.view(*leading_gt, loss_k, per)
-                                    prob_gt = FNN.softmax(g_logits / gt_temp, dim=-1).view(*leading_gt, K)
-                                except Exception as e:
-                                    raise RuntimeError(f"Failed to reshape gt_processed_loss for per-view softmax: shape={gt_processed_loss.shape}, attempted (*{leading_gt}, {loss_k}, {per}): {e}")
-
-                                # If leading shapes differ, do NOT implicitly expand GT to match pred.
-                                # Require caller/upstream to produce matching batch sizes to avoid silent incorrect broadcasts.
-                                if leading_gt != leading_pred:
-                                    raise RuntimeError(f"Mismatched leading shapes for pred vs gt in per-view loss: pred_leading={leading_pred}, gt_leading={leading_gt}. Upstream must provide matching batch sizes.")
-                            else:
-                                logp = FNN.log_softmax(pred_processed_loss / pred_temp, dim=-1)
-                                prob_gt = FNN.softmax(gt_processed_loss / gt_temp, dim=-1)
-
-                            # optional GT roll
-                            prob_gt = self._roll_gt_map(prob_gt)
-
-                            # final CE: -sum(q * logp)
-                            loss_value = - (prob_gt * logp).sum(dim=-1).mean()
-                        else:
-                            # non-prob losses use raw logits (or previously-resolved callable)
-                            pred_proc = pred_processed_loss
-                            gt_proc = self._roll_gt_map(gt_processed_loss)
-                            if local_loss_fn is None:
-                                loss_value = self.loss_fn(pred_proc, gt_proc)
-                            else:
-                                loss_value = local_loss_fn(pred_proc, gt_proc)
-
-                        # include chosen loss function name in the step-level key
-                        chosen_fn_str = chosen_fn if chosen_fn is not None else 'default_callable'
-                        # sanitize chosen_fn_str for use in metric key
-                        try:
-                            chosen_fn_str = str(chosen_fn_str).replace('/', '_')
-                        except Exception:
-                            chosen_fn_str = 'default_callable'
-                        step_loss_dict[f"val/step{step_index}/{layer_key}/P{chosen_fn_str}"] = loss_value
-                        print(f"Calculated loss for {layer_key} (fn={chosen_fn_str}): {loss_value.item()}")
-                        if layer_key not in self.layer_losses:
-                            self.layer_losses[layer_key] = []
-                        self.layer_losses[layer_key].append(loss_value.item())
-                        
+                    if layer_key not in self.layer_losses:
+                        self.layer_losses[layer_key] = []
+                    # store the per-head list (not scalar) for later analysis
+                    self.layer_losses[layer_key].append(per_head_list)
+                    
                 if viz_enabled:
-                    viz_query_idx, viz_key_idx = self._extract_viz_view_indices(F)
+                    viz_query_idx, viz_key_idx = self._extract_view_indices(F, mode="viz")
+                    
                     pred_attn_logit_viz = self._slice_attention_map(pred_attn_logit, viz_query_idx, viz_key_idx, F)
                     gt_attn_logit_viz = self._slice_attention_map(gt_attn_logit, viz_query_idx, viz_key_idx, F)
 
-                    # Process through configured logit heads so visualization respects softmax_temp / head processing
-                    # per-pair viz heads
-                    if isinstance(pair, dict) and pair.get('unet_logit_head', None) is not None:
-                        unet_head_name = pair['unet_logit_head'].lower()
-                        unet_head_kwargs = pair.get('unet_logit_head_kwargs', {})
-                        unet_head = LOGIT_HEAD_CLS[unet_head_name](**unet_head_kwargs)
-                    else:
-                        raise ValueError(f"Pair must provide 'unet_logit_head' for visualization: {pair}")
-                    if isinstance(pair, dict) and pair.get('vggt_logit_head', None) is not None:
-                        vggt_head_name = pair['vggt_logit_head'].lower()
-                        vggt_head_kwargs = pair.get('vggt_logit_head_kwargs', {})
-                        vggt_head = LOGIT_HEAD_CLS[vggt_head_name](**vggt_head_kwargs)
-                    else:
-                        raise ValueError(f"Pair must provide 'vggt_logit_head' for visualization: {pair}")
+                    # For visualization, always use Softmax_HeadMean and only consider
+                    viz_mode = pair.get('viz_softmax_mode', None)
+                    # determine number of key-views for viz (prefer pair, then global config)
+                    viz_num_k = pair.get('viz_num_key_views', None)
+                    if viz_num_k is None:
+                        viz_num_k = int(self.visualize_config.get('viz_num_key_views', self.visualize_config.get('loss_num_key_views', 1)))
+                    per_view_flag = str(viz_mode).lower() == 'per_view'
+                    num_view_for_per_view = int(viz_num_k) if per_view_flag else None
+
+                    unet_head = Softmax_HeadMean(softmax_temp=1.0, num_view_for_per_view=num_view_for_per_view)
+                    vggt_head = Softmax_HeadMean(softmax_temp=1.0, num_view_for_per_view=num_view_for_per_view)
 
                     pred_processed_viz = unet_head(pred_attn_logit_viz)
                     gt_processed_viz = vggt_head(gt_attn_logit_viz)
 
-                    print(f"Calling _maybe_save_attn_overlay for step {step_index}, layer {layer_key} (using processed logits)")
-                    # derive viz softmax settings from pair (fallback to loss settings)
-                    # use global softmax mode/num_k from visualize_config only
-                    viz_mode = self.visualize_config.get('softmax_mode', 'global')
-                    viz_num_k = int(self.visualize_config.get('loss_num_key_views', 1))
                     self._maybe_save_attn_overlay(
                         step_index=step_index,
                         layer_key=layer_key,
@@ -1337,8 +1105,6 @@ class AttentionVisualizationCallback(PipelineCallback):
                         F=F,
                         query_idx_list=viz_query_idx,
                         key_idx_list=viz_key_idx,
-                        viz_mode=viz_mode,
-                        viz_num_k=viz_num_k,
                     )
 
                 # cleanup per-pair intermediates
@@ -1376,7 +1142,7 @@ class AttentionVisualizationCallback(PipelineCallback):
                         self.step_layer_losses[step_index][layer_key] = loss_value.item() if hasattr(loss_value, 'item') else float(loss_value)
 
                 self.step_losses.append(step_avg_loss.item() if hasattr(step_avg_loss, 'item') else float(step_avg_loss))
-                print(f"Step {step_index} avg loss: {float(step_avg_loss):.6f}")
+                print(f"[DEBUG] Step {step_index} avg loss: {float(step_avg_loss):.6f}")
 
                 # 전체 loss dict에 추가
                 self.visualize_loss_dict.update(step_loss_dict)
@@ -1386,6 +1152,8 @@ class AttentionVisualizationCallback(PipelineCallback):
             print(f"Error in attention visualization callback at step {step_index}: {e}")
             import traceback
             traceback.print_exc()
+            
+            
         finally:
             # 각 step 이후 UNet attention cache 정리
             if hasattr(pipeline, 'unet'):
@@ -1422,11 +1190,29 @@ class AttentionVisualizationCallback(PipelineCallback):
         # Layer별 통계 계산
         for layer_key, losses in self.layer_losses.items():
             if losses:
+                # losses may contain per-step per-head lists; normalize to per-step scalars
+                scalar_vals = []
+                for item in losses:
+                    if isinstance(item, (list, tuple)):
+                        # average per-head values to a scalar for summary
+                        try:
+                            scalar_vals.append(float(sum(item) / len(item)))
+                        except Exception:
+                            # fallback: coerce first element
+                            scalar_vals.append(float(item[0]))
+                    else:
+                        scalar_vals.append(float(item))
+
+                mean_val = sum(scalar_vals) / len(scalar_vals)
+                min_val = min(scalar_vals)
+                max_val = max(scalar_vals)
+                std_val = (sum((x - mean_val) ** 2 for x in scalar_vals) / len(scalar_vals)) ** 0.5 if len(scalar_vals) > 1 else 0.0
+
                 structured_losses['layer_summary'][layer_key] = {
-                    'mean': sum(losses) / len(losses),
-                    'min': min(losses),
-                    'max': max(losses),
-                    'std': (sum((x - sum(losses)/len(losses))**2 for x in losses) / len(losses))**0.5 if len(losses) > 1 else 0.0,
+                    'mean': mean_val,
+                    'min': min_val,
+                    'max': max_val,
+                    'std': std_val,
                     'count': len(losses)
                 }
         

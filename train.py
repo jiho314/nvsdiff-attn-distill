@@ -1173,7 +1173,13 @@ def main():
                             # 4) Prob Map
                             logit_head_kwargs = {"num_view": len(key_idx)}
                             pred, gt = unet.unet_logit_head[str(unet_layer)](pred_attn_logit, **logit_head_kwargs), unet.vggt_logit_head[str(vggt_layer)](gt_attn_logit, **logit_head_kwargs) # [B head f1HW f2HW]
-
+                            ''' pred/gt format
+                                - always [B Head Q K]
+                                - if per_view is True, K -> V HW for loss compute
+                                - if softargmax
+                                    -- if per_view is True: B Head Q V*2
+                                    -- else: B Head Q 1 (*Caution, no view information)
+                            '''
                             if config.distill_config.get("consistency_check", False):
                                 assert config.distill_config.distill_query == "target", "consistency check only support distill_query to target"
                                 B, Head, F1HW, F2HW = gt_attn_logit.shape  

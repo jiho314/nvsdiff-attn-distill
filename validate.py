@@ -44,9 +44,6 @@ from src.distill_utils.attn_processor_cache import set_attn_cache, unset_attn_ca
 from src.modules.attention_visualization_callback import AttentionVisualizationCallback
 from src.modules.timestep_sample import truncated_normal
 
-from src.distill_utils.attn_logit_head import LOGIT_HEAD_CLS # JIHO TODO: save/load params
-from src.distill_utils.query_key_cost_metric import COST_METRIC_FN
-
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import pearsonr
@@ -57,13 +54,46 @@ logger = get_logger(__name__, log_level="INFO")
 
 
 def cross_entropy(prob, prob_gt):
-            """Cross entropy loss for attention probabilities."""
-            eps = 1e-8
-            return - (prob_gt * (prob + eps).log()).sum(dim=-1).mean()
+    """Cross entropy loss for attention probabilities.
+
+    Expects `prob` and `prob_gt` to be probabilities over the last (key) dimension.
+    This helper is provided for convenience; the visualization callback expects
+    per-sample *collapsed* functions (see notes below) and also supports
+    overriding/adding custom per-sample functions via `visualize_config['loss_fn_map']`.
+    """
+    eps = 1e-8
+    return - (prob_gt * (prob + eps).log()).sum(dim=-1).mean()
+
 
 def kl_divergence(prob, prob_gt):
     """Kullback-Leibler divergence loss for attention probabilities."""
     return (prob_gt * (prob_gt.log() - prob.log())).sum(dim=-1).mean()
+
+
+# Helper notes for adding custom loss functions
+# ---------------------------------------------
+# The attention visualization callback supports two internal modes when
+# computing losses: "global" and "per_view".  Implementations should supply
+# a *per-sample* function that operates on "collapsed" tensors:
+#
+#  - Global mode: pred_coll / gt_coll shape = (N, Q, K)
+#      where N == B * Head (batch times head)
+#
+#  - Per-view mode: the callback will collapse to
+#      pred_coll / gt_coll shape = (N, Q, K') where
+#      N == B * Head * V (batch * head * num_views)
+#      K' == HW (flattened per-view spatial keys)
+#
+# Your per-sample function must accept (pred_coll, gt_coll) and return a 1D
+# tensor of per-sample losses of length N. Example signature:
+#
+#     def my_per_sample_loss(pred_coll: torch.Tensor, gt_coll: torch.Tensor) -> torch.Tensor:
+#         # pred_coll, gt_coll: (N, Q, K)
+#         # return: torch.Tensor shape (N,)
+#
+# Register a custom per-sample fn by passing a mapping to
+# `visualize_config['loss_fn_map']` where key is the base name (e.g. 'cross_entropy')
+# and value is the callable described above.
 
 ATTN_LOSS_FN = {
     "l1": torch.nn.functional.l1_loss,
@@ -755,84 +785,51 @@ def main():
     unet.train()
 
     ## Seonghu TODO: 임시 visualize config
-    visualize_config = {
-        'timestep_interval': 1,
-        
-        # 'vggt_layer': "track_head",
-        'vggt_layer': "point_map",
-        # 'costmap_metric': 'neg_log_l2',
-
-        'vggt_logit_head': "softmax_headmean",
-        'vggt_logit_head_kwargs': {"softmax_temp": 0.01},
-        'unet_logit_head': "softmax_headmean",
-        'unet_logit_head_kwargs': {"softmax_temp": 1},
-        # 'costmap_metric': 'dot_product',
-        
-        # Loss 계산용 설정 (train과 동일하게)
+    visualize_config = {        
+        # Loss 계산용 전역 설정
         'loss_query': "target",      # loss 계산 시 사용할 query
         'loss_key': "reference",     # loss 계산 시 사용할 key
+        'loss_steps': [40],          # loss 계산/수집에 사용할 스텝 (빈 리스트 = 모든 스텝)
         
-        "loss_num_key_views": 2,
-        "softmax_mode": "per_view",
-        # Visualization용 설정 (시각화에서만 사용)
-        'viz_query': "target",       # 시각화 시 사용할 query
-        'viz_key': "reference",            # 시각화 시 사용할 key (self attention 포함)
-        'student_unet_attn_layers': list((2,4,6,8,10,12)),
-        
-        
-        # 시각화 설정 추가
-        # 빈 리스트 = 모든 스텝에서 시각화/로그, 아니면 명시된 스텝만 처리
-        'viz_steps': [],  # visualization (images) 저장/생성 스텝
-        'loss_steps': [40],                 # loss 계산/수집에 사용할 스텝 (빈 리스트 = 모든 스텝)
-        # per_head_loss: if True, compute loss per attention head and log each head separately
-        'per_head_loss': False,
+        # Visualization용 전역 설정 (시각화에서만 사용)
+        'viz_query': "target",      # 시각화 시 사용할 query
+        'viz_key': "reference",     # 시각화 시 사용할 key (self attention 포함)        
+        'viz_steps': [],            # visualization (images) 저장/생성 스텝, 빈 리스트 = 모든 스텝에서 시각화/로그, 아니면 명시된 스텝만 처리
         'viz_log_wandb': True,
         'viz_alpha': 0.6,
-        'viz_query_xy': None,  # None이면 랜덤 선택
-        'viz_query_index': 150,  # None이면 랜덤 선택
-        # pairs: list of dicts defining per-pair settings
-        # format: {'unet_layer': int, 'vggt_layer': str_or_int, 'costmap_metric': str, 'loss_fn': str}
-
-        # "roll_gt_map" : 3,
-        # debug options: enable detailed softargmax vs argmax dumps
-        # 'debug_softargmax': True,
-        # 'debug_save_dir': 'debug_attn_maps',
+        'viz_query_xy': None,       # None이면 랜덤 선택
+        'viz_query_index': 150,     # None이면 랜덤 선택
+        
+        # 각 Pair별 설정
         'pairs': [
             {
                 'unet_layer': l,
+                
                 'vggt_layer': 'point_map',
                 'costmap_metric': 'neg_log_l2',
-                'loss_fn': 'cross_entropy',
-                'loss_num_key_views': 2,
+                
+                # format: {'unet_layer': int, 'vggt_layer': str_or_int, 'costmap_metric': str, 'loss_fn': str or dict}
+                # `loss_fn` may be either a string (base name) or a dict: {'fn': '<base>', 'head_mean': 'pre'|'post'|None}
+                'loss_fn': {'fn': 'cross_entropy', 'head_mean': 'pre'},
+                
+                # if 
+                'unet_logit_head_kwargs': {'softmax_temp': 1.0, 'num_view_for_per_view': 2},
+                'vggt_logit_head_kwargs': {'softmax_temp': 0.01, 'num_view_for_per_view': 2},
+                
+                # Note that softmax head for visualization is always Softmax_HeadMean, 
+                # and other configs are from unet_logit_head_kwargs and vggt_logit_head_kwargs
+                # You only can choose viz_softmax_mode from 'per_view' or 'global'
                 'loss_softmax_mode': 'per_view',
-                # per-pair logit heads required by the visualization callback
-                'unet_logit_head': 'softmax_headmean',
-                'unet_logit_head_kwargs': {'softmax_temp': 1.0},
-                'vggt_logit_head': 'softmax_headmean',
-                'vggt_logit_head_kwargs': {'softmax_temp': 0.01},
-                # visualization-specific softmax/viz key settings
                 'viz_softmax_mode': 'per_view',
-                'viz_num_key_views': 2,
             }
             for l in list((2,4,6,8,10,12))
         ],
     }
+    
     # costmap metric 설정: 'neg_log_l2', 'neg_l2', 'inverse_l2', 'dot_product'
-    vggt_layer = visualize_config.get('vggt_layer', None)
+    # vggt_layer = visualize_config.get('vggt_layer', None)
     do_attn_visualize = args.visualize_attention_maps
     if do_attn_visualize:
-        # if hasattr(config, "distill_config"):
-        #     vggt_visualize_config = {
-        #         "cache_attn_layer_ids": list(set([p[1] for p in config.distill_config.distill_pairs if isinstance(p[1], int)])),
-        #         "cache_costmap_types": list(set([p[1] for p in config.distill_config.distill_pairs if isinstance(p[1], str)]))
-        #     }
-        # else:
-        #     ## seonghu TODO: default vggt layer; track head
-        #     print("WARNING: No vggt layer provided for visualize_attention_maps. Defaulting to track head")
-        #     vggt_visualize_config = {
-        #         "cache_attn_layer_ids": [],
-        #         "cache_costmap_types": ["track_head"]
-        #     }
         from vggt.models.vggt import VGGT
         
         # derive cache_costmap_types from visualize_config['pairs'] (support dict entries)
@@ -850,11 +847,7 @@ def main():
                 if vt not in cache_costmap_types:
                     cache_costmap_types.append(vt)
         if not cache_costmap_types:
-            # fallback to single vggt_layer if provided, otherwise to track_head
-            if vggt_layer is not None:
-                cache_costmap_types = [vggt_layer]
-            else:
-                cache_costmap_types = ["track_head"]
+            cache_costmap_types = ["track_head"]
 
         print(f"vggt caching costmap types: {cache_costmap_types}")
         vggt_visualize_config = {
@@ -862,10 +855,6 @@ def main():
             "cache_costmap_types": cache_costmap_types
         }
 
-        # with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
-        # Keep VGGT in full precision here; mixed dtypes caused xformers attention to fail
-        # (query/key/value dtype mismatch). We rely on later `.to(device, dtype=weight_dtype)`
-        # to cast weights appropriately.
         vggt_model = VGGT.from_pretrained("facebook/VGGT-1B", **vggt_visualize_config).eval()
         for p in vggt_model.parameters():
             p.requires_grad = False
@@ -886,67 +875,32 @@ def main():
     
     if do_attn_visualize:
         # logit heads: input: [B, Head, Q, K]
-        unet_logit_head = LOGIT_HEAD_CLS[visualize_config['unet_logit_head'].lower()](**visualize_config['unet_logit_head_kwargs'])
-        vggt_logit_head = LOGIT_HEAD_CLS[visualize_config['vggt_logit_head'].lower()](**visualize_config['vggt_logit_head_kwargs'])
-        vggt_layer = visualize_config['vggt_layer']
+        # unet_logit_head = LOGIT_HEAD_CLS[visualize_config['unet_logit_head'].lower()](**visualize_config['unet_logit_head_kwargs'])
+        # vggt_logit_head = LOGIT_HEAD_CLS[visualize_config['vggt_logit_head'].lower()](**visualize_config['vggt_logit_head_kwargs'])
+        # vggt_layer = visualize_config['vggt_layer']
 
         # Set Attention Cache for distillation
-        ## TODO Seonghu : check max layer number
-        visualize_student_unet_attn_layers = visualize_config['student_unet_attn_layers']
+        # visualize_config['pairs']의 모든 unet layer의 합집합 추출
+        visualize_student_unet_attn_layers = []
+        for pair in visualize_config['pairs']:
+            if isinstance(pair, dict) and 'unet_layer' in pair:
+                unet_layer = pair['unet_layer']
+                if unet_layer not in visualize_student_unet_attn_layers:
+                    visualize_student_unet_attn_layers.append(unet_layer)
         print(f"Number of unet attention layers: {len(list(unet.attn_processors.keys()))}")
         set_attn_cache(unet, visualize_student_unet_attn_layers)
     
-        # add to unet (only single module supported in deepspeed... fuk )
-        unet.vggt_logit_head = vggt_logit_head
-        unet.unet_logit_head = unet_logit_head
-        del vggt_logit_head, unet_logit_head
     else:
-        visualize_pairs = visualize_config['pairs']
+        print("WARNING: No vggt layer provided for visualize_attention_maps. Defaulting to track head")
         visualize_student_unet_attn_layers = []
         
-    # set feat cache for repa distill # JIHO TODO: repa 
-    # from src.modules.attn_processor_cache import set_feat_cache, unset_feat_cache, pop_cached_feat, clear_feat_cache
-    
-    # Assume no ema
-    # if args.use_ema:
-    #     ema_unet = copy.deepcopy(unet)
-    #     ema_unet = EMAModel(
-    #         ema_unet.parameters(),
-    #         model_cls=UNet2DConditionModel,
-    #         model_config=ema_unet.config,
-    #         foreach=True,
-    #         decay=args.ema_decay,
-    #         min_decay=args.min_decay,
-    #         ema_decay_step=args.ema_decay_step
-    #     )
-    # else:
-    #     ema_unet = None
-
-    # if config.gradient_checkpointing:
-    #     unet.enable_gradient_checkpointing()
-
+  
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     if config.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
     # set trainable parameters
-   
-    # # Get the datasets
-    # if cfg is None:
-    #     cfg = dict()
-    #     for data_name in config.dataset_names:
-    #         if "_easy" in data_name:
-    #             data_name = data_name.replace("_easy", "")
-    #             cfg[data_name] = EasyDict(OmegaConf.load(f"configs/datasets/{data_name}_easy.yaml"))
-    #         else:
-    #             cfg[data_name] = EasyDict(OmegaConf.load(f"configs/datasets/{data_name}.yaml"))
-    #         cfg[data_name]["image_height"] = config.image_size
-    #         cfg[data_name]["image_width"] = config.image_size
-
-    # train_dataset, val_dataset = load_global_dataset(config, cfg, rank=accelerator.process_index)
-    # Dataset jiho TODO
-    # from src.datasets.re10k_minseop import build_re10k_minseop    
 
     from src.datasets.re10k_wds import build_re10k_wds
 
