@@ -37,7 +37,7 @@ class Softmax(nn.Module):
         if self.per_view:
             K = x.shape[-1]
             HW = K // num_view
-            x = x.reshape(*x.shape[:-1], K, HW)
+            x = x.reshape(*x.shape[:-1], num_view, HW)
         x = x / self.softmax_temp
         return x.softmax(dim=-1)
 
@@ -52,6 +52,7 @@ class Softmax_HeadMlp(Softmax):
     def __init__(self, 
             in_head_num = 24, out_head_num = 1,
             mlp_ratio = 4.0, mlp_depth = 1,
+            final_activation = None,
             **kwargs
         ):
         super(Softmax_HeadMlp, self).__init__(**kwargs)
@@ -65,7 +66,7 @@ class Softmax_HeadMlp(Softmax):
         if self.per_view:
             K = x.shape[-1]
             HW = K // num_view
-            x = x.reshape(*x.shape[:-1], K, HW)
+            x = x.reshape(*x.shape[:-1], num_view, HW)
         x = x / self.softmax_temp
         x = x.softmax(dim=-1)
         x = x.permute(0,2,3,1) # B Q K Head
@@ -88,7 +89,7 @@ class HeadMlp_Softmax(Softmax):
         if self.per_view:
             K = x.shape[-1]
             HW = K // num_view
-            x = x.reshape(*x.shape[:-1], K, HW)
+            x = x.reshape(*x.shape[:-1], num_view, HW)
         x = x / self.softmax_temp
         return x.softmax(dim=-1)
 

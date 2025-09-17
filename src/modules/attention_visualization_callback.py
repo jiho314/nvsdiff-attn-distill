@@ -1017,7 +1017,7 @@ class AttentionVisualizationCallback(PipelineCallback):
             gt_key = layer_cache['key'].detach()
             return gt_query.shape, gt_query, gt_key
     
-    def _get_gt_costmap(self, vggt_layer: str, pair_metric: str, head):
+    def _get_gt_costmap(self, vggt_layer: str, pair_metric: str, num_head: int):
         metric_fn = COST_METRIC_FN.get(pair_metric, None)
         print(f"[DEBUG] Using costmap metric: {pair_metric}")
         if metric_fn is None:
@@ -1029,7 +1029,7 @@ class AttentionVisualizationCallback(PipelineCallback):
         # Head expansion for GT
         # gt_query_resized : (B, 1, pred_query_size, pred_query_size, C) -> (B, Head, pred_query_size, pred_query_size, C)
         # gt_key_resized : (B, 1, pred_key_size, pred_key_size, C) -> (B, Head, pred_key_size, pred_key_size, C)
-        pred_head = pred_attn_logit.shape[1]
+        pred_head = num_head
         head_gt = gt_query_resized.shape[1] if gt_query_resized.dim() == 4 else 1
         if head_gt == 1 and pred_head > 1:
             gt_query_resized = gt_query_resized.expand(-1, pred_head, -1, -1).contiguous()
@@ -1133,8 +1133,8 @@ class AttentionVisualizationCallback(PipelineCallback):
                     # pred_attn_logit_sliced: (B, Head, pred_query_size, pred_key_size) / (2,10,1024,2048)
                     pred_attn_logit_sliced = self._slice_attention_map(pred_attn_logit, loss_query_idx, loss_key_idx, F)
                     
-                    gt_attn_logit = self._get_gt_costmap(vggt_layer, pair_metric)
-                        
+                    # gt_attn_logit_sliced: (B, Head, pred_query_size, pred_key_size)
+                    gt_attn_logit = self._get_gt_costmap(vggt_layer, pair_metric, num_head=pred_attn_logit.shape[1])
                     gt_attn_logit_sliced = self._slice_attention_map(gt_attn_logit, loss_query_idx, loss_key_idx, F)
 
                     # Instantiate logit-heads for UNet and VGGT outputs.
@@ -1142,26 +1142,20 @@ class AttentionVisualizationCallback(PipelineCallback):
                     # 1) per-pair explicit head class in pair dict
                     # 2) global visualize_config head names
                     def _resolve_head(name_key, kwargs_key, layer_key):
-                        # 1) Prefer a per-layer Module attached to pipeline.unet (train behavior)
-                        try:
-                            if hasattr(pipeline, 'unet') and hasattr(pipeline.unet, name_key):
-                                ph = getattr(pipeline.unet, name_key)
-                                # ModuleDict per-layer case
-                                try:
-                                    return ph[str(layer_key)]
-                                except Exception:
-                                    # single-module case
-                                    return ph
-                        except Exception:
-                            pass
+                        """
+                        Instantiate a logit head for the given keys.
 
-                        # 2) If pair explicitly provides a head name, instantiate that class
+                        NOTE: Do NOT prefer or attempt to use any module already attached
+                        to `pipeline.unet`. Always instantiate from the per-pair override
+                        or fall back to the global `visualize_config` settings.
+                        """
+                        # 1) If pair explicitly provides a head name, instantiate that class
                         if isinstance(pair, dict) and pair.get(name_key, None) is not None:
                             name = pair[name_key].lower()
                             kw = pair.get(kwargs_key, {})
                             return LOGIT_HEAD_CLS[name](**kw)
 
-                        # 3) Fall back to global visualize_config names (instantiate)
+                        # 2) Fall back to global visualize_config names (instantiate)
                         gname = self.visualize_config.get(name_key, None)
                         gkw = self.visualize_config.get(kwargs_key, {})
                         if gname is not None:
