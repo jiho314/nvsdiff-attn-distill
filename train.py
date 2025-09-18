@@ -1114,6 +1114,9 @@ def main():
                         B, F, _, H, W = image.shape
                         unet_attn_cache = pop_cached_attn(unet)
                         distill_pairs = config.distill_config.distill_pairs
+                        # Random pair selection: VRAM Issue
+                        if config.distill_config.get('distill_pair_num', None) is not None:
+                            distill_pairs = random.sample(distill_pairs, config.distill_config.get('distill_pair_num'))
                         for unet_layer, vggt_layer in distill_pairs:
                             '''
                                 gt(VGGT): query and key (B Head N(FHW) C) 
