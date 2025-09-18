@@ -10,21 +10,6 @@ import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 
 
-def ho(attnmap, query_coord, ):
-    ''' 
-        attnmap: torch.Tensor [B, H, Q(HW), K(VHW)]
-        images: torch.Tensor [B, V, 3, 512, 512], values in [0,1] or [0,255]
-        query_coord: (x_coord, y_coord) in pixel space
-
-        Q. whether to compute softmax (on ref / total/ each view)
-        
-        return: imgs B V
-    '''
-    attnmap = ...
-
-    return attnmap
-
-
 def stitch_side_by_side_whole(images: List[Image.Image], padding: int = 0, bg_color: tuple = (0, 0, 0)):
     """
     Stitches a list of PIL Images with varying widths horizontally.
@@ -167,6 +152,54 @@ def save_image_total(images, x_coord, y_coord, score):
     background = np.clip(background * 255.0, 0, 255).astype(np.uint8)
     
     attn_heatmap_img = get_attn_map_whole(score, background,)
+    vis_list.append(Image.fromarray(attn_heatmap_img.astype(np.uint8)))
+    combined_img = stitch_side_by_side_whole(vis_list)
+
+    return combined_img
+
+def save_image_jinhk(images, target_idx, x_coord, y_coord, score):
+    """
+    images: torch.Tensor [B, V, 3, 512, 512], values in [0,1] or None
+    x, y: int coordinates to mark (0–511)
+    score: torch.Tensor [HW, VHW]
+        returns image to save, np.ndarray [512, 512, 3], uint8
+    """
+    # Visualization
+    images = images.squeeze()
+    vis_list = []
+
+    # Target image with marked point
+    if images is not None: 
+        tgt_image = images[target_idx]
+        tgt_image = mark_point_on_img(tgt_image, x_coord, y_coord)
+        vis_list.append(Image.fromarray(tgt_image))
+
+    V_images, _, _, _ = images.shape
+    fHW, VfHW = score.shape
+    V_score = int(VfHW/fHW)
+
+    if V_images != V_score: # cross_only
+        ref_image = torch.stack([images[i] for i in range(V_images) if i != target_idx], dim=0) # shape: [V-1, 3, 512, 512]
+    else:
+        ref_image = images
+    background = []
+    HW, VHW = score.shape
+    V = int(VHW/HW)
+
+    for i in range(V):
+        background_elem = ref_image[i].squeeze().permute(1,2,0).cpu().detach()
+        background.append(background_elem)
+    background = torch.stack(background, dim=1).reshape(512, -1, 3).numpy()
+    background = np.clip(background * 255.0, 0, 255).astype(np.uint8)
+    
+    attn_heatmap_img = get_attn_map_whole(score, background,)
+    # insert black image on the target image index t
+    # in the attn_heatmap_img
+    dummy_img = np.zeros((512, 512, 3), dtype=np.uint8)
+    attn_heatmap_img = np.concatenate(
+        [attn_heatmap_img[:, :512*(target_idx), :],
+         dummy_img,
+         attn_heatmap_img[:, 512*(target_idx):, :]], axis=1)
     vis_list.append(Image.fromarray(attn_heatmap_img.astype(np.uint8)))
     combined_img = stitch_side_by_side_whole(vis_list)
 

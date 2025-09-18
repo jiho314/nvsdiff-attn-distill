@@ -48,6 +48,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import pearsonr
 import pandas as pd
+import re
 logger = get_logger(__name__, log_level="INFO")
 
 
@@ -56,6 +57,8 @@ def uniform_push_batch(batch, random_cond_num=0):
      1) uniformly sample target idx
      2) push target views to last
     '''
+    if random_cond_num == 1:
+        return batch
     img = batch["image"]  # [B,F,3,H,W]
     B,F,_,H,W = img.shape
     target_num = F - random_cond_num
@@ -195,7 +198,7 @@ def get_show_images(input_images, pred_images, cond_num, depth=None):
     return show_image
 
 @torch.no_grad()
-def log_validation(accelerator, config, args, pipeline, val_dataloader, step, device, weight_dtype, cond_num = None, do_attn_visualize = False, vggt_model = None,
+def log_validation(accelerator, config, args, pipeline, val_dataloader, step, device, weight_dtype, cond_num = None, vggt_model = None,
                     visualize_config = None,
                     **kwargs):
     ''' Caution, batch=1 !
@@ -258,34 +261,34 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
             tag, sequence_name, depth = None, None , None
             # attention visualization callback 설정
             attention_callback = None
-            if do_attn_visualize:
-                # visualize_config 간소화
-                visualize_config_with_fn = visualize_config.copy()
-                visualize_config_with_fn['viz_log_wandb'] = True
-                
-                # 시퀀스 이름 설정
-                seq_name = f"sample_{val_iter:03d}"
-                if 'sequence_name' in batch:
-                    seq_batch = batch['sequence_name']
-                    if isinstance(seq_batch, (list, tuple)) and len(seq_batch) > 0:
-                        seq_name = str(seq_batch[0])
-                    elif seq_batch is not None:
-                        seq_name = str(seq_batch)
-                visualize_config_with_fn['viz_seq_name'] = seq_name
-                
-                # attention visualization도 샘플별 step 사용
-                visualize_config_with_fn['viz_wandb_step_base'] = val_iter
-                
-                attention_callback = AttentionVisualizationCallback(
-                    vggt_model=vggt_model,
-                    visualize_config=visualize_config_with_fn,
-                    batch=batch,
-                    cond_num=cond_num,
-                    device=accelerator.device,
-                    do_attn_visualize=do_attn_visualize,
-                    accelerator=accelerator
-                )
             
+                # visualize_config 간소화
+            visualize_config_with_fn = visualize_config.copy()
+            visualize_config_with_fn['viz_log_wandb'] = True
+            
+            # 시퀀스 이름 설정
+            seq_name = f"sample_{val_iter:03d}"
+            if 'sequence_name' in batch:
+                seq_batch = batch['sequence_name']
+                if isinstance(seq_batch, (list, tuple)) and len(seq_batch) > 0:
+                    seq_name = str(seq_batch[0])
+                elif seq_batch is not None:
+                    seq_name = str(seq_batch)
+            visualize_config_with_fn['viz_seq_name'] = seq_name
+            
+            # attention visualization도 샘플별 step 사용
+            visualize_config_with_fn['viz_wandb_step_base'] = val_iter
+            
+            attention_callback = AttentionVisualizationCallback(
+                vggt_model=vggt_model,
+                visualize_config=visualize_config_with_fn,
+                batch=batch,
+                cond_num=cond_num,
+                device=accelerator.device,
+                do_attn_visualize=True,
+                accelerator=accelerator
+            )
+        
             # 디버그: 첫 번째 샘플만 입력 차원 확인 (로그 정리)
             if val_iter == 0:
                 print(f"DEBUG - Pipeline input shapes:")
@@ -294,16 +297,16 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                 print(f"  cond_num: {cond_num}")
             
             preds = pipeline(images=image_normalized, nframe=config.nframe, cond_num=cond_num,
-                             height=image_normalized.shape[2], width=image_normalized.shape[3],
-                             intrinsics=intrinsic, extrinsics=extrinsic,
-                             num_inference_steps=50, guidance_scale=args.val_cfg,
-                             output_type="np", config=config, tag=tag,
-                             sequence_name=sequence_name, depth=depth, vae=kwargs['vae'],
-                             callback_on_step_end=attention_callback,
-                             callback_on_step_end_tensor_inputs=["latents"]).images  # [f,h,w,c]
-            
+                                height=image_normalized.shape[2], width=image_normalized.shape[3],
+                                intrinsics=intrinsic, extrinsics=extrinsic,
+                                num_inference_steps=50, guidance_scale=args.val_cfg,
+                                output_type="np", config=config, tag=tag,
+                                sequence_name=sequence_name, depth=depth, vae=kwargs['vae'],
+                                callback_on_step_end=attention_callback,
+                                callback_on_step_end_tensor_inputs=["latents"]).images  # [f,h,w,c]
+                
             # Pipeline 완료 후 VGGT cache 정리
-            if do_attn_visualize and attention_callback is not None:
+            if attention_callback is not None:
                 attention_callback.clear_vggt_cache()
 
             # Strict validation: if pipeline returned invalid predictions or targets are empty,
@@ -339,11 +342,22 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
             # attention visualization 데이터 가져오기
             attention_loss_data = {}
             attention_images_data = {}
-            if do_attn_visualize and attention_callback is not None:
+            if attention_callback is not None:
                 structured_losses = attention_callback.get_structured_losses()
                 attention_images = attention_callback.get_attention_images()
                 print(f"[DEBUG] structured_losses keys: {list(structured_losses.keys()) if structured_losses else 'None'}")
-                print(f"[DEBUG] attention_images keys: {list(attention_images.keys()) if attention_images else 'None'}")
+                # attention_callback may return either a dict (key->entry) or a list of entries.
+                try:
+                    if isinstance(attention_images, dict):
+                        a_keys = list(attention_images.keys())
+                    elif isinstance(attention_images, list):
+                        # list of dicts with 'key'
+                        a_keys = [e.get('key') if isinstance(e, dict) else None for e in attention_images]
+                    else:
+                        a_keys = None
+                except Exception:
+                    a_keys = None
+                print(f"[DEBUG] attention_images keys: {a_keys if a_keys else 'None'}")
                 print(f"[DEBUG] step_losses length: {len(attention_callback.step_losses)}")
                 print(f"[DEBUG] layer_losses keys: {list(attention_callback.layer_losses.keys())}")
                 
@@ -480,7 +494,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                             continue
 
                 # callback의 step-level loss들도 wandb에 업로드
-                if do_attn_visualize and attention_callback is not None:
+                if attention_callback is not None:
                     loss_dict = attention_callback.get_loss_dict()
                     for loss_key, loss_val in loss_dict.items():
                         # loss_val may be a tensor; coerce to float for logging
@@ -516,7 +530,7 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
                 accelerator.log(log_data, step=val_iter)
                 
                 # 로깅 완료 후 callback 상태 초기화 (다음 배치를 위해)
-                if do_attn_visualize and attention_callback is not None:
+                if attention_callback is not None:
                     attention_callback.reset()
             
             val_iter += 1 
@@ -627,11 +641,10 @@ def log_validation(accelerator, config, args, pipeline, val_dataloader, step, de
     del loss_fn_alex
     
     # Validation 완료 후 모든 attention cache 정리
-    if do_attn_visualize:
-        from src.distill_utils.attn_processor_cache import unset_attn_cache
-        # UNet attention cache 설정 해제
-        unset_attn_cache(pipeline.unet)
-        logger.info("Unset UNet attention cache after validation")
+    from src.distill_utils.attn_processor_cache import unset_attn_cache
+    # UNet attention cache 설정 해제
+    unset_attn_cache(pipeline.unet)
+    logger.info("Unset UNet attention cache after validation")
     
     torch.cuda.empty_cache()
 
@@ -675,8 +688,9 @@ def parse_args():
         ),
     )
     parser.add_argument("--val_cfg", type=float, default=1.0)
+    parser.add_argument("--viz_config_file", type=str, default=None, help="Path to YAML file containing visualize_config overrides")
+    parser.add_argument("--run_name", type=str, default=None, help="Run name to pass to the tracker (wandb)")
     parser.add_argument("--val_path", type=str, default=None)
-    parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--config_file", type=str, default="configs/cat3d.yaml")
 
@@ -762,8 +776,8 @@ def main():
                                                 ignore_mismatched_sizes=True)
     unet.train()
 
-    ## Seonghu TODO: 임시 visualize config
-    visualize_config = {        
+    ## Seonghu TODO: 임시 visualize config (default)
+    visualize_config = OmegaConf.create({        
         # Loss 계산용 전역 설정
         'loss_query': "target",      # loss 계산 시 사용할 query
         'loss_key': "reference",     # loss 계산 시 사용할 key
@@ -772,7 +786,7 @@ def main():
         # Visualization용 전역 설정 (시각화에서만 사용)
         'viz_query': "target",      # 시각화 시 사용할 query
         'viz_key': "reference",     # 시각화 시 사용할 key (self attention 포함)        
-        'viz_steps': [],            # visualization (images) 저장/생성 스텝, 빈 리스트 = 모든 스텝에서 시각화/로그, 아니면 명시된 스텝만 처리
+        'viz_steps': [40],            # visualization (images) 저장/생성 스텝, 빈 리스트 = 모든 스텝에서 시각화/로그, 아니면 명시된 스텝만 처리
         'viz_log_wandb': True,
         'viz_alpha': 0.6,
         'viz_query_xy': None,       # None이면 랜덤 선택
@@ -806,76 +820,88 @@ def main():
             }
             for l in list((2,4,6,8,10,12))
         ],
-    }
-    
-    # costmap metric 설정: 'neg_log_l2', 'neg_l2', 'inverse_l2', 'dot_product'
-    # vggt_layer = visualize_config.get('vggt_layer', None)
-    do_attn_visualize = args.visualize_attention_maps
-    if do_attn_visualize:
-        from vggt.models.vggt import VGGT
-        
-        # derive cache_costmap_types from visualize_config['pairs'] (support dict entries)
-        pairs_list = visualize_config.get('pairs', [])
-        cache_costmap_types = []
-        for p in pairs_list:
-            if isinstance(p, dict):
-                vt = p.get('vggt_layer', None)
-            else:
-                try:
-                    _, vt = p
-                except Exception:
-                    vt = None
-            if vt is not None:
-                if vt not in cache_costmap_types:
-                    cache_costmap_types.append(vt)
-        if not cache_costmap_types:
-            cache_costmap_types = ["track_head"]
+    })
 
-        print(f"vggt caching costmap types: {cache_costmap_types}")
-        vggt_visualize_config = {
-            "cache_attn_layer_ids": [],
-            "cache_costmap_types": cache_costmap_types
-        }
+    # If a viz config file is provided, load it and update visualize_config
+    if args.viz_config_file is not None:
+        if os.path.exists(args.viz_config_file):
+            try:
+                loaded = OmegaConf.load(args.viz_config_file)
+                # Merge loaded config into visualize_config, prefer loaded values
+                visualize_config = OmegaConf.to_container(OmegaConf.merge(OmegaConf.create(visualize_config), loaded), resolve=True)
+            except Exception as e:
+                print(f"Failed to load viz_config_file {args.viz_config_file}: {e}")
+                raise
+        else:
+            raise FileNotFoundError(f"viz_config_file not found: {args.viz_config_file}")
 
-        vggt_model = VGGT.from_pretrained("facebook/VGGT-1B", **vggt_visualize_config).eval()
-        for p in vggt_model.parameters():
-            p.requires_grad = False
-        
-    else:
-        vggt_model = None
-        assert not config.get("use_vggt_camera", False), "use_vggt_camera is only available when vggt_on_fly is set"
+    # Support shorthand specification for UNet layers in visualize_config.
+    # If `unet_layers` is provided and `pairs` is missing or empty, expand it.
+    def _parse_unet_layers_spec(spec):
+        # spec may be list, int, or range string like '2-12:2'
+        if spec is None:
+            return []
+        if isinstance(spec, (list, tuple)):
+            return [int(x) for x in spec]
+        if isinstance(spec, int):
+            return [spec]
+        if isinstance(spec, str):
+            # formats: '2-12:2' or '2,4,6' or '2-8'
+            spec = spec.strip()
+            if ',' in spec:
+                parts = [s.strip() for s in spec.split(',') if s.strip()]
+                return [int(p) for p in parts]
+            m = re.match(r"^(\d+)-(\d+)(?::(\d+))?$", spec)
+            if m:
+                a = int(m.group(1)); b = int(m.group(2)); step = int(m.group(3)) if m.group(3) else 1
+                return list(range(a, b + 1, step))
+            # fallback single int
+            try:
+                return [int(spec)]
+            except Exception:
+                return []
 
-    
-    # Save attention maps to a separate directory sibling to `args.val_path` (not inside `val/`)
-    if args.val_path:
-        attn_root = os.path.join(os.path.dirname(args.val_path), "attn_maps")
-    else:
-        attn_root = os.path.join(os.getcwd(), "attn_maps")
-    visualize_config['viz_save_dir'] = attn_root
-    # visualize_config['pairs'] is directly used (can be list of dicts)
+    if isinstance(visualize_config, dict):
+        has_pairs = bool(visualize_config.get('pairs'))
+        if not has_pairs and 'unet_layers' in visualize_config:
+            layers = _parse_unet_layers_spec(visualize_config.get('unet_layers'))
+            defaults = visualize_config.get('pair_defaults', None)
+            if defaults is None:
+                defaults = {
+                    'vggt_layer': 'point_map',
+                    'costmap_metric': 'neg_log_l2',
+                    'loss_fn': {'fn': 'cross_entropy', 'head_mean': None},
+                    'unet_logit_head_kwargs': {'softmax_temp': 1.0, 'num_view_for_per_view': 2},
+                    'vggt_logit_head_kwargs': {'softmax_temp': 0.01, 'num_view_for_per_view': 2},
+                    'loss_softmax_mode': 'per_view',
+                    'viz_softmax_mode': 'per_view'
+                }
+
+            pairs = []
+            for l in layers:
+                p = defaults.copy()
+                # ensure unet_layer key present
+                p['unet_layer'] = int(l)
+                pairs.append(p)
+
+            visualize_config['pairs'] = pairs
     ## =====================================
     
-    if do_attn_visualize:
-        # logit heads: input: [B, Head, Q, K]
         # unet_logit_head = LOGIT_HEAD_CLS[visualize_config['unet_logit_head'].lower()](**visualize_config['unet_logit_head_kwargs'])
         # vggt_logit_head = LOGIT_HEAD_CLS[visualize_config['vggt_logit_head'].lower()](**visualize_config['vggt_logit_head_kwargs'])
         # vggt_layer = visualize_config['vggt_layer']
 
         # Set Attention Cache for distillation
         # visualize_config['pairs']의 모든 unet layer의 합집합 추출
-        visualize_student_unet_attn_layers = []
-        for pair in visualize_config['pairs']:
-            if isinstance(pair, dict) and 'unet_layer' in pair:
-                unet_layer = pair['unet_layer']
-                if unet_layer not in visualize_student_unet_attn_layers:
-                    visualize_student_unet_attn_layers.append(unet_layer)
-        print(f"Number of unet attention layers: {len(list(unet.attn_processors.keys()))}")
-        set_attn_cache(unet, visualize_student_unet_attn_layers)
-    
-    else:
-        print("WARNING: No vggt layer provided for visualize_attention_maps. Defaulting to track head")
-        visualize_student_unet_attn_layers = []
-        
+    visualize_student_unet_attn_layers = []
+    for pair in visualize_config['pairs']:
+        if isinstance(pair, dict) and 'unet_layer' in pair:
+            unet_layer = pair['unet_layer']
+            if unet_layer not in visualize_student_unet_attn_layers:
+                visualize_student_unet_attn_layers.append(unet_layer)
+    print(f"Number of unet attention layers: {len(list(unet.attn_processors.keys()))}")
+    set_attn_cache(unet, visualize_student_unet_attn_layers)
+  
   
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -1076,7 +1102,48 @@ def main():
     # Cast all models to correct dtype BEFORE prepare
     unet.to(dtype=weight_dtype)
     vae.to(dtype=weight_dtype)
-    if do_attn_visualize and vggt_model is not None:
+    
+       
+    # costmap metric 설정: 'neg_log_l2', 'neg_l2', 'inverse_l2', 'dot_product'
+    # vggt_layer = visualize_config.get('vggt_layer', None)
+    from vggt.models.vggt import VGGT
+    # derive cache_costmap_types from visualize_config['pairs'] (support dict entries)
+    pairs_list = visualize_config.get('pairs', [])
+    cache_costmap_types = []
+    for p in pairs_list:
+        if isinstance(p, dict):
+            vt = p.get('vggt_layer', None)
+        else:
+            try:
+                _, vt = p
+            except Exception:
+                vt = None
+        if vt is not None:
+            if vt not in cache_costmap_types:
+                cache_costmap_types.append(vt)
+    if not cache_costmap_types:
+        cache_costmap_types = ["track_head"]
+
+    print(f"vggt caching costmap types: {cache_costmap_types}")
+    vggt_visualize_config = {
+        "cache_attn_layer_ids": [],
+        "cache_costmap_types": cache_costmap_types
+    }
+
+    vggt_model = VGGT.from_pretrained("facebook/VGGT-1B", **vggt_visualize_config).eval()
+    for p in vggt_model.parameters():
+        p.requires_grad = False
+        
+    
+    # Save attention maps to a separate directory sibling to `args.val_path` (not inside `val/`)
+    if args.val_path:
+        attn_root = os.path.join(os.path.dirname(args.val_path), "attn_maps")
+    else:
+        attn_root = os.path.join(os.getcwd(), "attn_maps")
+    visualize_config['viz_save_dir'] = attn_root
+    # visualize_config['pairs
+    
+    if vggt_model is not None:
         vggt_model.to(dtype=weight_dtype)
         logger.info(f"VGGT model cast to {weight_dtype}")
 
@@ -1085,7 +1152,7 @@ def main():
 
     # Move non-prepared models to device (they already have correct dtype from above)
     vae.to(accelerator.device)
-    if do_attn_visualize and vggt_model is not None:
+    if vggt_model is not None:
         vggt_model.to(accelerator.device)
         logger.info(f"VGGT model moved to device: {accelerator.device}")
         
@@ -1103,9 +1170,12 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
+        init_kwargs = {}
+        if args.run_name is not None:
+            init_kwargs = {"wandb": {"name": args.run_name}}
         accelerator.init_trackers(
             project_name=args.tracker_project_name,
-            init_kwargs={"wandb": {"name": args.run_name}} if args.run_name is not None else {},
+            init_kwargs=init_kwargs,
         )
         
         # wandb 초기화 확인 및 메트릭 정의
@@ -1137,7 +1207,7 @@ def main():
     _ = log_validation(accelerator=accelerator, config=config, args=args,
                             pipeline=pipeline, val_dataloader=val_dataloader,
                             step=global_step, device=device, weight_dtype=weight_dtype, vae=vae, 
-                            do_attn_visualize=do_attn_visualize, vggt_model=vggt_model,
+                            vggt_model=vggt_model,
                             visualize_config=visualize_config)
 
     

@@ -1,0 +1,34 @@
+# Creating visualize config file
+
+# ... existing code ...
+# NEW FILE CONTENTS
+loss_query: target
+loss_key: reference
+loss_steps: [40]
+
+viz_query: target
+viz_key: reference
+viz_steps: []
+viz_log_wandb: true
+viz_alpha: 0.6
+viz_query_xy: null
+viz_query_index: 150
+
+# shorthand: specify UNet layers using a range or list. examples: '2-12:2', '2,4,6'
+unet_layers: "2-12:2"
+
+# optional pair defaults - override defaults for each generated pair
+pair_defaults:
+  vggt_layer: point_map
+  costmap_metric: neg_log_l2
+  loss_fn:
+    fn: cross_entropy
+    head_mean: null
+  unet_logit_head_kwargs:
+    softmax_temp: 1.0
+    num_view_for_per_view: 2
+  vggt_logit_head_kwargs:
+    softmax_temp: 0.01
+    num_view_for_per_view: 2
+  loss_softmax_mode: per_view
+  viz_softmax_mode: per_view

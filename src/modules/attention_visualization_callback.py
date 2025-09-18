@@ -246,44 +246,7 @@ class AttentionVisualizationCallback(PipelineCallback):
         # Allow validate.py to pass an external mapping via visualize_config['loss_fn_map']
         external_map = self.visualize_config.get('loss_fn_map', None)
 
-        # decorator factory
-        def loss_variant(variant: Optional[str] = None):
-            def decorator(per_sample_fn):
-                def loss_callable(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-                    mode, P, G, meta = _prepare_for_loss(pred, gt)
-
-                    # pre-headmean
-                    if variant == 'pre':
-                        P = P.mean(dim=1, keepdim=True)
-                        G = G.mean(dim=1, keepdim=True)
-
-                    if mode == 'per_view':
-                        B, H, Q, V, HW = P.shape
-                        print(f"[DEBUG] P.shape: {P.shape}")
-                        print(f"[DEBUG] G.shape: {G.shape}")
-                        P_coll = P.permute(0, 1, 3, 2, 4).contiguous().view(B * H * V, Q, HW)
-                        G_coll = G.permute(0, 1, 3, 2, 4).contiguous().view(B * H * V, Q, HW)
-                        per_sample = per_sample_fn(P_coll, G_coll)
-
-                        if variant == 'post':
-                            per_sample = per_sample.view(B, H, V).mean(dim=1).mean()
-                            return per_sample
-                        return per_sample.mean()
-
-                    else:  # global
-                        B, H, Q, K = P.shape
-                        P_coll = _collapse_heads_as_batch(P)
-                        G_coll = _collapse_heads_as_batch(G)
-                        per_sample = per_sample_fn(P_coll, G_coll)
-
-                        if variant == 'post':
-                            per_sample = per_sample.view(B, H).mean(dim=1).mean()
-                            return per_sample
-                        return per_sample.mean()
-
-                return loss_callable
-
-            return decorator
+        # decorator factory: canonical implementation is defined earlier (keep the first occurrence)
 
         # Store base per-sample functions (may be overridden by external_map).
         # expose base per-sample map (possibly overridden by external_map)
@@ -320,8 +283,39 @@ class AttentionVisualizationCallback(PipelineCallback):
         """VGGT attention cache를 미리 계산"""
         with torch.no_grad():
             image = self.batch['image'].to(self.device)  # [B,F,3,H,W]
-            vggt_pred = self.vggt_model(image)
-            self.batch['vggt_attn_cache'] = vggt_pred['attn_cache']
+            # Ensure VGGT has been configured to cache the numeric vggt layers requested in visualize_config['pairs']
+            try:
+                desired_layers = []
+                for p in self.visualize_config.get('pairs', []):
+                    if isinstance(p, dict):
+                        vt = p.get('vggt_layer', None)
+                    else:
+                        try:
+                            _, vt = p
+                        except Exception:
+                            vt = None
+                    try:
+                        if vt is not None:
+                            vtid = int(vt)
+                            if vtid not in desired_layers:
+                                desired_layers.append(vtid)
+                    except Exception:
+                        # non-numeric vggt layer (e.g., 'track_head') -> skip
+                        pass
+                if desired_layers and hasattr(self.vggt_model, 'set_attn_cache'):
+                    # (re)configure VGGT to cache these layers (idempotent)
+                    try:
+                        self.vggt_model.set_attn_cache(attn_layer_ids=desired_layers)
+                    except Exception:
+                        pass
+                # run forward and capture attn_cache
+                vggt_pred = self.vggt_model(image)
+                self.batch['vggt_attn_cache'] = vggt_pred.get('attn_cache', {})
+                print(f"[DEBUG] VGGT reported cache_attn_layer_ids: {getattr(self.vggt_model, 'cache_attn_layer_ids', None)}")
+                print(f"[DEBUG] vggt_pred['attn_cache'] keys: {list(self.batch['vggt_attn_cache'].keys()) if self.batch.get('vggt_attn_cache') else None}")
+            except Exception as e:
+                print(f"[WARN] failed to prepare vggt cache: {e}")
+                self.batch['vggt_attn_cache'] = {}
 
     def _logits_to_probs(self, logits: torch.Tensor, num_key_views: int, mode: Optional[str]) -> torch.Tensor:
         """Convert logits to probabilities according to `mode`.
@@ -898,6 +892,15 @@ class AttentionVisualizationCallback(PipelineCallback):
                 raise RuntimeError(f"[DEBUG] vggt_attn_cache[{vggt_layer}] missing 'query'/'key')")
             gt_query = layer_cache['query'].detach()
             gt_key = layer_cache['key'].detach()
+            print(f"[DEBUG] gt_query.shape: {gt_query.shape}")
+            print(f"[DEBUG] gt_key.shape: {gt_key.shape}")
+            # 만약 레이어가 숫자면 1번 차원 (head) mean (keep dim)
+            if str(vggt_layer).isdigit():
+                gt_query = gt_query.mean(dim=1, keepdim=True)
+                gt_key = gt_key.mean(dim=1, keepdim=True)
+                print(f"[DEBUG] Applied head mean for numeric layer {vggt_layer}")
+                print(f"[DEBUG] gt_query.shape after head mean: {gt_query.shape}")
+                print(f"[DEBUG] gt_key.shape after head mean: {gt_key.shape}")
             return gt_query.shape, gt_query, gt_key
     
     def _get_gt_costmap(self, gt_query_resized, gt_key_resized, pair_metric: str, num_head: int):
@@ -907,17 +910,25 @@ class AttentionVisualizationCallback(PipelineCallback):
             raise ValueError(f"Unknown costmap metric {pair_metric}, falling back to neg_log_l2")
         
         
-        pred_head = num_head
-        gt_query_resized = gt_query_resized.repeat(1, pred_head, 1, 1, 1).contiguous()
-        gt_key_resized = gt_key_resized.repeat(1, pred_head, 1, 1, 1).contiguous()
-        
-        # gt_attn_logit: (B, Head, pred_query_size, pred_key_size)
-        gt_attn_logit = metric_fn(gt_query_resized, gt_key_resized).squeeze(2)
-        
-        # Head expansion for GT
-        # gt_query_resized : (B, 1, pred_query_size, pred_query_size, C) -> (B, Head, pred_query_size, pred_query_size, C)
-        # gt_key_resized : (B, 1, pred_key_size, pred_key_size, C) -> (B, Head, pred_key_size, pred_key_size, C)
-        
+        pred_head = int(num_head)
+
+        # Compute costmap once on the provided tensors (head dimension == 1 expected) to reduce peak GPU memory.
+        # Then replicate the resulting per-head map across heads if needed.
+        gt_attn = metric_fn(gt_query_resized, gt_key_resized)
+        # metric_fn may return shape (B,1,Q,K) or (B,1,Q,K,1); normalize
+        if gt_attn.dim() == 5:
+            gt_attn = gt_attn.squeeze(-1)
+        if gt_attn.dim() == 4 and gt_attn.shape[1] == 1:
+            gt_attn_logit = gt_attn.squeeze(1)
+        else:
+            gt_attn_logit = gt_attn
+
+        if pred_head > 1:
+            # ensure shape is (B, Q, K) before expanding
+            if gt_attn_logit.dim() == 3:
+                gt_attn_logit = gt_attn_logit.unsqueeze(1)
+            gt_attn_logit = gt_attn_logit.repeat(1, pred_head, 1, 1)
+
         return gt_attn_logit
     
     
@@ -1071,7 +1082,6 @@ class AttentionVisualizationCallback(PipelineCallback):
                     
                     # aggregated loss 계산
                     loss_fn, chosen_fn_str, is_head_mean = self._get_loss_fn(pair_loss_fn)
-                    import pdb; pdb.set_trace()
                     loss_value = loss_fn(pred_processed_viz, gt_processed_viz)
 
                     # include chosen loss function name in the step-level key
@@ -1138,11 +1148,19 @@ class AttentionVisualizationCallback(PipelineCallback):
                     per_view_flag = str(viz_mode).lower() == 'per_view'
                     num_view_for_per_view = int(viz_num_k) if per_view_flag else None
 
-                    unet_head = Softmax_HeadMean(softmax_temp=1.0, num_view_for_per_view=num_view_for_per_view)
-                    vggt_head = Softmax_HeadMean(softmax_temp=1.0, num_view_for_per_view=num_view_for_per_view)
-
-                    pred_processed_viz = unet_head(pred_attn_logit_viz)
-                    gt_processed_viz = vggt_head(gt_attn_logit_viz)
+                    pred_processed_viz = unet_viz_head(pred_attn_logit_viz)
+                    gt_processed_viz = vggt_viz_head(gt_attn_logit_viz)
+                    
+                    print(f"[DEBUG] pred_processed_viz.shape: {pred_processed_viz.shape}")
+                    print(f"[DEBUG] gt_processed_viz.shape: {gt_processed_viz.shape}")
+                    
+                    if len(pred_processed_viz.shape)== 5:
+                        pred_processed_viz = pred_processed_viz.mean(dim=-2)
+                    if len(gt_processed_viz.shape)== 5:
+                        gt_processed_viz = gt_processed_viz.mean(dim=-2)
+                        
+                    print(f"[DEBUG] pred_processed_viz.shape: {pred_processed_viz.shape}")
+                    print(f"[DEBUG] gt_processed_viz.shape: {gt_processed_viz.shape}")
 
                     self._maybe_save_attn_overlay(
                         step_index=step_index,

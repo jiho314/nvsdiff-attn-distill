@@ -24,7 +24,7 @@ from torchvision.utils import save_image
 from datetime import datetime
 import json
 import torchvision.transforms as T
-from src.distill_utils.attn_visualize import mark_point_on_img, save_image_total, overlay_grid_and_save
+from src.distill_utils.attn_visualize import mark_point_on_img, save_image_total, overlay_grid_and_save, save_image_jinhk
 
 
 # dataloader_workers: 16
@@ -46,6 +46,22 @@ from src.distill_utils.attn_visualize import mark_point_on_img, save_image_total
 #   image_size : 512
 #   num_ref_views: 2
 #   num_tgt_views: 1
+
+def concat_vertical(pil_images):
+    """Concatenate a list of PIL Images vertically (row direction)."""
+    if len(pil_images) == 1:
+        return pil_images[0]
+    widths, heights = zip(*(im.size for im in pil_images))
+    w_max = max(widths)
+    h_sum = sum(heights)
+    canvas = Image.new("RGB", (w_max, h_sum), (0, 0, 0))
+    y = 0
+    for im in pil_images:
+        # center each image horizontally
+        x = (w_max - im.size[0]) // 2
+        canvas.paste(im, (x, y))
+        y += im.size[1]
+    return canvas
 
 def main(nframe, cond_num, inference_view_range, 
          caching_unet_attn_layers, noise_timestep, 
@@ -204,45 +220,45 @@ def main(nframe, cond_num, inference_view_range,
     set_attn_cache(unet, caching_unet_attn_layers)
     
     
-    ## visualization 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    # minkyung TODO: 여러 idx에 대해서 viz
     for idx, batch in enumerate(val_dataloader):
         parent_name = os.path.basename(os.path.dirname(resume_checkpoint))   # lr1_cosine_noema
         ckpt_name = os.path.basename(resume_checkpoint)                     # checkpoint-30000
-        outdir = os.path.join("outputs_unet_attn", timestamp, parent_name, ckpt_name, f"{noise_timestep}", f"sample{idx}")
-        os.makedirs(outdir, exist_ok=True)
+        outdir_root = os.path.join("outputs_unet_attn", timestamp, parent_name, ckpt_name, f"{noise_timestep}", f"sample{idx}")
+        os.makedirs(outdir_root, exist_ok=True)
         
-        images = batch['image'].to(device)  # B V C H W
-        tgt_image = images.squeeze()[0]      # [C, H, W]
+        images = batch['image'].to(device)  # B V C H W  (V == nframe)
+        Bv, V, C, H, W = images.shape
+        assert V == nframe, f"batch frames {V} != nframe {nframe}"
 
+        # ---------- choose coordinates (one pair for all targets by default) ----------
+        # If you want different coords per target, move this inside the per-target loop below.
         # --- visualize with grid before input ---
-        
         if config.unet_visualize.view_select:
-            overlay_grid_and_save(tgt_image, spacing=64, out_path="VIS_OVERLAY.png")
-            save_image(images.squeeze()[1:], "VIS_REFERENCE.png")
+            # For multi-target, overlay grid on ALL target frames for clarity
+            for t in range(cond_num, nframe):  # <<< CHANGED >>>
+                tgt_image_t = images.squeeze()[t]  # [C,H,W]
+                overlay_grid_and_save(tgt_image_t, spacing=64,
+                                      out_path=os.path.join(outdir_root, f"VIS_OVERLAY_t{t}.png"))
+            save_image(images.squeeze()[:cond_num], os.path.join(outdir_root, "VIS_REFERENCE.png"))
             while True:
                 answer = input("Do you want to visualize? (yes/no): ").strip().lower()
-                if answer == "yes":
-                    # run visualization code
-                    counter_out = False
+                if answer in ("yes", "no"):
+                    counter_out = (answer == "no")
                     break
-                elif answer == "no":
-                    # skip this batch
-                    counter_out = True
-                    break  # goes back to your for-loop
                 else:
                     print("Invalid input. Please type 'yes' or 'no'.")
-                    
             if counter_out:
                 continue
         
         if config.unet_visualize.coord_select:
             if config.unet_visualize.view_select is False:
-                overlay_grid_and_save(tgt_image, spacing=64, out_path="VIS_OVERLAY.png")
-                save_image(images.squeeze()[1:], "VIS_REFERENCE.png")
-            # Ask user for coordinates
+                for t in range(cond_num, nframe):  # <<< CHANGED >>>
+                    tgt_image_t = images.squeeze()[t]
+                    overlay_grid_and_save(tgt_image_t, spacing=64,
+                                          out_path=os.path.join(outdir_root, f"VIS_OVERLAY_t{t}.png"))
+                save_image(images.squeeze()[:cond_num], os.path.join(outdir_root, "VIS_REFERENCE.png"))
             while True: 
                 x_coord = int(input("Enter x coordinate (0–512): "))
                 y_coord = int(input("Enter y coordinate (0–512): "))
@@ -251,80 +267,94 @@ def main(nframe, cond_num, inference_view_range,
                 else: 
                     print("Invalid input. Please type valid values. ")
         else:
-            # Random selection
             x_coord = random.randint(0, 511)
             y_coord = random.randint(0, 511)
+
         coords = {"x": x_coord, "y": y_coord}
-        json_path = os.path.join(outdir, "coords.json")
-        with open(json_path, "w") as f:
+        with open(os.path.join(outdir_root, "coords.json"), "w") as f:
             json.dump(coords, f, indent=4) 
 
-        # batch: always order by seq idx
-        # uniform_push_batch: set condition (uniform sampling, no randomness) to front, tgt to last
+        # ---------- run UNet once to fill attention cache ----------
         _ = unet_inference(batch)
         unet_attn_cache = pop_cached_attn(unet)
-        ''' unet_attn_cache(dict): {layer_id(str): attnmap tensor(B, head, Q(VHW), K(VHW)}
-        '''
+        # dict: {layer_id(str): attn[B, H, Q(VHW), K(VHW)]}
+
+        # ---------- per-target visualization loop ----------
+        # Targets are frames [cond_num, nframe)
         for unet_layer in caching_unet_attn_layers:
-            print(f"layer: {unet_layer} shape : {unet_attn_cache[str(unet_layer)].shape}")
-            unet_attn_logit = unet_attn_cache[str(unet_layer)] # [B, H, Q, K]
-            B, H, Q, K = unet_attn_logit.shape
-            if B == 3 : # self attention
-                query_size = int(math.sqrt(Q))
-                # Convert pixel coords -> feature map index
-                y_feat_cost = int((y_coord / 512) * query_size)
-                x_feat_cost = int((x_coord / 512) * query_size)
-                query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
-                attn_maps = unet_attn_logit.mean(dim=1) # [3, Q, K]
-                all_scores = torch.softmax(attn_maps[:, query_token_idx_cost], dim=-1)
-                score1 = all_scores[0].reshape(query_size, query_size)
-                score2 = all_scores[1].reshape(query_size, query_size)
-                score = torch.cat([score1, score2], dim=-1)
-            else: 
-                query_idx = [nframe-1]
-                if config.unet_visualize.cross_only: 
-                    key_idx = list(range(nframe-1))
-                else:
-                    key_idx = list(range(nframe))
-                unet_attn_logit = slice_attnmap(unet_attn_logit, query_idx=query_idx, key_idx=key_idx) # [B, H, Q, K]
-                # average over head
-                attn_maps = unet_attn_logit.mean(dim=1)   # [B, Q, K]
-                attn_maps = attn_maps[0]                  # take batch 0 → [Q, K]
-                
-                B, H, Q, K = unet_attn_logit.shape
-                query_size = int(math.sqrt(Q))
-                # Convert pixel coords -> feature map index
-                y_feat_cost = int((y_coord / 512) * query_size)
-                x_feat_cost = int((x_coord / 512) * query_size)
-                query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
-                
-                # attention for chosen query token
-                all_scores = torch.softmax(attn_maps[query_token_idx_cost], dim=-1)
-                tokens_per_img = query_size * query_size
-                scores_split = all_scores.split(tokens_per_img)
-                score = torch.cat([s.reshape(query_size, query_size) for s in scores_split], dim=-1)
-
-            combined_img = save_image_total(images, x_coord, y_coord, score)
-            combined_img.save(f"{outdir}/attn{unet_layer}.png")
         
-        if config.unet_visualize.save_originals:
-            save_image(tgt_image, f"{outdir}/TARGET.png")
-            tgt_image_marked = mark_point_on_img(tgt_image, x_coord, y_coord)
-            target_marked = torch.from_numpy(tgt_image_marked).permute(2, 0, 1).float() / 255.0
-            save_image(target_marked, f"{outdir}/TARGET_MARKED.png")
+            # outdir = os.path.join(outdir_root, f"tgt_{t}")  # separate folder per target
+            # os.makedirs(outdir, exist_ok=True)
+            stacked_images = []
+            for t in range(0, nframe):  # <<< CHANGED >>>
+                tgt_image = images.squeeze()[t]  # [C, H, W]  (this target)
+                print(f"[t={t}] layer: {unet_layer} shape : {unet_attn_cache[str(unet_layer)].shape}")
+                unet_attn_logit = unet_attn_cache[str(unet_layer)]  # [B, H, Q, K]
+                Bc, Hh, Q, K = unet_attn_logit.shape
 
-            ref_imgs = images.squeeze()[:-1]
-            ref_concat = torch.cat([img for img in ref_imgs], dim=-1)  # shape [C, H, W*3] # save as one single image save_image(ref_concat, f"{outdir}/REFERENCE.png")
-            save_image(ref_concat, f"{outdir}/REFERENCE.png")
-            print(f"Saved visualization to outputs.png")
-        if idx == 200: break
+                # Self-attn vs cross-attn handling stays the same,
+                # but query index is now the CURRENT TARGET t (not nframe-1).
+                if Bc == 3:  # (kept from your original heuristic)
+                    query_size = int(math.sqrt(Q))
+                    y_feat_cost = int((y_coord / 512) * query_size)
+                    x_feat_cost = int((x_coord / 512) * query_size)
+                    query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
+
+                    attn_maps = unet_attn_logit.mean(dim=1)  # [3, Q, K]
+                    # Use the head-averaged attention from stream index == t if applicable.
+                    # Original code indexed [0], [1], [2] explicitly. Keep compatibility:
+                    # we’ll clamp t to [0, 2] here to avoid OOB if Bc==3 encodes 3 streams.
+                    sidx = max(0, min(2, t))                 # <<< CHANGED >>>
+                    all_scores = torch.softmax(attn_maps[sidx, query_token_idx_cost], dim=-1)
+                    score = all_scores.reshape(query_size, query_size)  # visualize the chosen stream only
+                else:
+                    # Cross-attention (common case): slice Q/K by frame dimensions
+                    def slice_attnmap(attnmap, query_idx, key_idx):
+                        B_, Head, Q_, K_ = attnmap.shape
+                        F = nframe
+                        HW = Q_ // F
+                        attnmap = einops.rearrange(attnmap, 'B Head (F1 HW1) (F2 HW2) -> B Head F1 HW1 F2 HW2',
+                                                   B=B_, Head=Head, F1=F, HW1=HW, F2=F, HW2=HW)
+                        attnmap = attnmap[:, :, query_idx][:, :, :, :, key_idx]
+                        attnmap = einops.rearrange(attnmap, 'B Head f1 HW1 f2 HW2 -> B Head (f1 HW1) (f2 HW2)',
+                                                   B=B_, Head=Head, f1=len(query_idx), f2=len(key_idx), HW1=HW, HW2=HW)
+                        return attnmap
+
+                    query_idx = [t]  # <<< CHANGED >>>
+                    if config.unet_visualize.cross_only:
+                        key_idx = [i for i in range(nframe) if i not in query_idx]             # <<< CHANGED >>> refs only
+                    else:
+                        key_idx = list(range(nframe))               # refs + all frames
+
+                    sliced = slice_attnmap(unet_attn_logit, query_idx=query_idx, key_idx=key_idx)  # [B, H, Q, K]
+                    attn_maps = sliced.mean(dim=1)[0]  # [Q, K] head-avg, take batch 0
+
+                    query_size = int(math.sqrt(attn_maps.shape[0]))
+                    y_feat_cost = int((y_coord / 512) * query_size)
+                    x_feat_cost = int((x_coord / 512) * query_size)
+                    query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
+
+                    all_scores = torch.softmax(attn_maps[query_token_idx_cost], dim=-1)  # [K]
+                    tokens_per_img = query_size * query_size
+                    scores_split = all_scores.split(tokens_per_img)
+                    # Concatenate attention maps horizontally for each key frame
+                    score = torch.cat([s.reshape(query_size, query_size) for s in scores_split], dim=-1)
+
+                combined_img = save_image_jinhk(images, t, x_coord, y_coord, score)
+                stacked_images.append(combined_img)
+            stacked_images = concat_vertical(stacked_images)
+            stacked_images.save(os.path.join(outdir_root, f"attn{unet_layer}.png"))
+
+        if config.unet_visualize.save_stack:
+            # Save stacked images (ref + tgt)
+            save_image(images.squeeze(), os.path.join(outdir_root, f"VIS_STACKED.png"))
+        if idx == 200:
+            break
         
 
 if __name__ == "__main__":
-    
-    # minkyung TODO
     # unet: (down_blocks(6), mid_block(1), up_blocks(9))
-    #  size: [64,64,32,32,16,16] [8] [16,16,16,32,32,32,64,64,64]
+    # size: [64,64,32,32,16,16] [8] [16,16,16,32,32,32,64,64,64]
     # checkpoint
     config_file_path = 'configs/viz.yaml'
     config = EasyDict(OmegaConf.load(config_file_path))

@@ -90,8 +90,10 @@ def shuffle_batch(batch):
     # for key in data_keys:
     #     batch[key] = batch[key][:, perm]
     for k in batch.keys():
-        if not "key" in k:
-            batch[k] = batch[k][:, perm]
+        data = batch[k]
+        if torch.is_tensor(data):
+            if data.ndim >= 2:
+                batch[k] = batch[k][:, new_idx]
     # batch["image"] = img[:, perm]
     # batch["intrinsic"] = batch["intrinsic"][:, perm]
     # batch["extrinsic"] = batch["extrinsic"][:, perm]
@@ -102,6 +104,8 @@ def uniform_push_batch(batch, random_cond_num=0):
      1) uniformly sample target idx
      2) push target views to last
     '''
+    if random_cond_num == 1:
+        return batch
     img = batch["image"]  # [B,F,3,H,W]
     B,F,_,H,W = img.shape
     target_num = F - random_cond_num
@@ -905,6 +909,8 @@ def main():
                     # batch['tag'] = new_tags
                     if "depth" in batch:
                         batch['depth'] = batch['depth'][:, :random_nframe]
+                    if "point_map" in batch:
+                        batch['point_map'] = batch['point_map'][:, :random_nframe]
                         
                 # 2) Random cond_num among nframe
                 if config.get("fix_cond_num", None) is not None:
@@ -1121,10 +1127,10 @@ def main():
                             '''
                             gt_query, gt_key = distill_gt_dict[str(vggt_layer)]['query'].detach(), distill_gt_dict[str(vggt_layer)]['key'].detach() # B Head VHW C, B Head VHW C
                             pred_attn_logit = unet_attn_cache[str(unet_layer)] # B Head Q(FHW) K(FHW)
-                            Q, K = pred_attn_logit.shape[-2], pred_attn_logit.shape[-1]
+                            B, Head, Q, K = pred_attn_logit
                             assert Q==K, f"pred attn should have same Q,K dim, but {pred_attn_logit.shape}"
 
-                            # 1) gt Query/key -> logit map
+                            # 1. gt Query/key -> logit map
                             with torch.no_grad():
                                 # resize qk
                                 def resize_tok(tok, target_size):
@@ -1139,73 +1145,227 @@ def main():
                                 gt_query, gt_key = resize_tok(gt_query, target_size=pred_query_size), resize_tok(gt_key, target_size=pred_key_size)
                                 # qk -> logit map
                                 gt_attn_logit = distill_cost_fn(gt_query, gt_key)
+                            
+                            # 2. Mask
+                            mask_per_view = torch.ones((B,Head,Q,F)).bool().to(device)
+                            # (Option 1) Consistency Checker
+                            if config.distill_config.get("consistency_check", False):
+                                def get_consistency_mask(logit):
+                                    # assert config.distill_config.distill_query == "target", "consistency check only support distill_query to target"
+                                    B, Head, F1HW, F2HW = logit.shape  
+                                    assert F1HW == F2HW, "first process full(square) consistency mask"
+                                    # assert Head == 1, "costmap should have only one head, while consistency checking?"
+                                    HW = F1HW // F
+                                    logit = einops.rearrange(logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1 F2) HW1 HW2', B=B,Head=Head, F1=F, F2=F, HW1=HW, HW2=HW)
+                                    mask_per_view = cycle_consistency_checker(logit, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1 F2) HW1 HW2
+                                    mask_per_view = einops.rearrange(mask_per_view, '(B Head F1 F2) HW 1 -> B Head (F1 HW) (F2 1)', B=B, Head=Head, F1=F, F2=F, HW=HW)
+                                    # mask = mask.any(dim=-1) # B Head Q(F1HW) 
+                                    return mask_per_view # B Head Q(F1HW) F2
+                                mask_per_view = get_consistency_mask(gt_attn_logit) # B Head Q(F1HW) F2
 
-                            # 2) Extract Distill Views
-                            ''' View idx order: [Reference, Target]
-                            '''
-                            # Distill Query to target/all 
-                            if config.distill_config.distill_query == "target":
-                                query_idx = list(range(random_cond_num, F))
-                            elif config.distill_config.distill_query == "all":
-                                query_idx = list(range(0, F))
-                            else:
-                                raise NotImplementedError(f"distill_query {config.distill_config.distill_query} not implemented")
-                            
-                            # Distill Key to reference/all
-                            if config.distill_config.distill_key == "reference":
-                                key_idx = list(range(0, random_cond_num))
-                            elif config.distill_config.distill_key == "all":
-                                key_idx = list(range(0, F))
-                            else:
-                                raise NotImplementedError(f"distill_key {config.distill_config.distill_key} not implemented")
-                            
-                            def slice_attnmap(attnmap, query_idx, key_idx):
+
+                            # 3. Loss Compute
+                            ''' View idx order: [Reference, Target]'''
+                            def slice_attnmap(attnmap, query_idx, key_idx, exclude_selfattn=False):
                                 B, Head, Q, K = attnmap.shape
                                 HW = Q // F
-                                attnmap = einops.rearrange(attnmap, 'B Head (F1 HW1) (F2 HW2) -> B Head F1 HW1 F2 HW2', B=B, Head=Head, F1=F, HW1=HW, F2=F, HW2=HW)
-                                attnmap = attnmap[:, :, query_idx][:, :, :, :, key_idx]
-                                attnmap = einops.rearrange(attnmap, 'B Head f1 HW1 f2 HW2 -> B Head (f1 HW1) (f2 HW2)', B=B, Head=Head, f1=len(query_idx), f2=len(key_idx), HW1=HW, HW2=HW)
-                                return attnmap
+                                C = K // F
+                                attnmap_ = einops.rearrange(attnmap, 'B Head (F1 HW) (F2 C) -> B Head F1 HW F2 C', B=B, Head=Head, F1=F, HW=HW, F2=F, C=C)
+                                attnmap_sliced = []
+                                for i in query_idx:
+                                    a = attnmap_[:,:,[i]] # B Head 1 HW F HW
+                                    k_id = key_idx.copy()
+                                    if (i in k_id) and exclude_selfattn: # remove self is necessary
+                                        k_id.remove(i)
+                                    a = a[:,:,:,:,k_id] # B Head 1 HW f2 HW
+                                    attnmap_sliced += [a]
+                                attnmap_sliced = torch.cat(attnmap_sliced, dim=2) # B Head f1 HW f2 HW
+                                f1, f2 = attnmap_sliced.shape[2], attnmap_sliced.shape[4] 
+                                attnmap_sliced = einops.rearrange(attnmap_sliced, 'B Head f1 HW f2 C -> B Head (f1 HW) (f2 C)', B=B, Head=Head, f1=f1, f2=f2, HW=HW, C=C)
+                                return attnmap_sliced, f1, f2  # B Head f1 HW f2 HW
                             
-                            pred_attn_logit = slice_attnmap(pred_attn_logit, query_idx, key_idx)
-                            gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx, key_idx) # B head f1HW f2HW
-
-                            # 4) Prob Map
-                            logit_head_kwargs = {"num_view": len(key_idx)}
-                            pred, gt = unet.unet_logit_head[str(unet_layer)](pred_attn_logit, **logit_head_kwargs), unet.vggt_logit_head[str(vggt_layer)](gt_attn_logit, **logit_head_kwargs) # [B head f1HW f2HW]
-                            ''' pred/gt format
-                                - always [B Head Q K]
-                                - if per_view is True, K -> V HW for loss compute
-                                - if softargmax
-                                    -- if per_view is True: B Head Q V*2
-                                    -- else: B Head Q 1 (*Caution, no view information)
-                            '''
-                            if config.distill_config.get("consistency_check", False):
-                                assert config.distill_config.distill_query == "target", "consistency check only support distill_query to target"
-                                B, Head, F1HW, F2HW = gt_attn_logit.shape  
-                                # assert Head == 1, "costmap should have only one head, while consistency checking?"
-                                F1, F2, HW = len(query_idx), len(key_idx), F1HW // len(query_idx)
-
-                                if config.distill_config.get("consistency_check_per_view", False):
-                                    assert unet.unet_logit_head[str(unet_layer)].per_view == True and unet.vggt_logit_head[str(vggt_layer)].per_view == True
-                                    gt_attn_logit_HW = einops.rearrange(gt_attn_logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1 F2) HW1 HW2', B=B,Head=Head, F1=F1, F2=F2, HW1=HW, HW2=HW)
-                                    consistency_mask = cycle_consistency_checker(gt_attn_logit_HW, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1 F2) HW1 HW2
-                                    consistency_mask = einops.rearrange(consistency_mask, '(B Head F1 F2) HW 1 -> B Head (F1 HW) F2 1', B=B, Head=Head, F1=F1, F2=F2, HW=HW)
-                                    consistency_mask = consistency_mask.reshape(B, Head, F1HW, F2)
-                                    pred, gt = pred.reshape(B,Head,F1HW,F2, -1), gt.reshape(B,Head,F1HW,F2, -1)
-                                    pred, gt = pred[consistency_mask.bool()], gt[consistency_mask.bool()]
+                            # Reference Query Attnmap
+                            ref_query_idx = list(range(random_cond_num))
+                            key_list = config.distill_config.distill_key_for_reference_query # among ["self", "reference","target"]
+                            key_idx = []
+                            if "reference" in key_list:
+                                key_idx += list(range(random_cond_num))
+                            if "target" in  key_list:
+                                key_idx += list(range(random_cond_num, F))
+                            key_idx =sorted(key_idx)
+                            if len(key_idx) > 0 :
+                                # 1) slice
+                                ref_pred_attn, f1, f2 = slice_attnmap(pred_attn_logit, ref_query_idx, key_idx, exclude_selfattn="self" not in key_list)
+                                ref_gt_attn, _, _ = slice_attnmap(gt_attn_logit, ref_query_idx, key_idx, exclude_selfattn="self" not in key_list)
+                                ref_mask_per_view, _, _ = slice_attnmap(mask_per_view, ref_query_idx, key_idx, exclude_selfattn="self" not in key_list)
+                                # 2) logit head
+                                logit_head_kwargs = {'num_view': f2}
+                                ref_pred, ref_gt = unet.unet_logit_head[str(unet_layer)](ref_pred_attn, **logit_head_kwargs), unet.vggt_logit_head[str(vggt_layer)](ref_gt_attn, **logit_head_kwargs) # [B head f1HW f2HW]
+                                ''' [B Head Q K] 
+                                    - if softargmax: (always per_view == True)
+                                        -- B Head Q K(V*2)
+                                '''
+                                # 3) apply masking (consistency)
+                                if config.distill_config.get("mask_per_view", False):
+                                    ref_pred = einops.rearrange(ref_pred, 'B Head f1HW (f2 C) -> B Head f1HW f2 C', f2 = f2)
+                                    ref_gt =  einops.rearrange(ref_gt, 'B Head f1HW (f2 C) -> B Head f1HW f2 C', f2 = f2)
+                                    ref_pred, ref_gt = ref_pred[ref_mask_per_view.bool()], ref_gt[ref_mask_per_view.bool()]
                                 else:
-                                    gt_attn_logit_HW = einops.rearrange(gt_attn_logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1) HW1 (F2 HW2)', B=B,Head=Head, F1=F1, F2=F2, HW1=HW, HW2=HW)
-                                    consistency_mask = cycle_consistency_checker(gt_attn_logit_HW, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1) HW1 (F2 HW2)
-                                    consistency_mask = einops.rearrange(consistency_mask, '(B Head F1) HW 1 -> B Head (F1 HW) 1', B=B, Head=Head, F1=F1, HW=HW)
-                                    consistency_mask = consistency_mask.reshape(B, Head, F1HW)
-                                    pred, gt = pred[consistency_mask.bool()], gt[consistency_mask.bool()]
+                                    ref_mask = ref_mask_per_view.any(dim=-1) # B Head f1HW f2 -> B Head f1HW
+                                    ref_pred, ref_gt = ref_pred[ref_mask.bool()], ref_gt[ref_mask.bool()]
+                                # 4) loss
+                                ref_query_distill_loss = distill_loss_fn(ref_pred.float(), ref_gt.float(), **distill_loss_fn_config)
+                            else:
+                                ref_query_distill_loss = 0
 
-                            # 5) distill loss 
-                            if torch.isnan(gt).any().item():
-                                accelerator.print("NaN in gt attn, skip this layer distill...")
+                            # 2-2) Target Query
+                            tgt_query_idx = list(range(random_cond_num, F))
+                            key_list = config.distill_config.distill_key_for_target_query # among ["self", "reference","target"]
+                            key_idx = []
+                            if "reference" in key_list:
+                                key_idx += list(range(random_cond_num))
+                            if "target" in  key_list:
+                                key_idx += list(range(random_cond_num, F))
+                            key_idx =sorted(key_idx)
+                            if len(key_idx) > 0 :
+                                # 1) slice
+                                tgt_pred_attn, f1, f2 = slice_attnmap(pred_attn_logit, tgt_query_idx, key_idx, exclude_selfattn="self" not in key_list)
+                                tgt_gt_attn, _, _ = slice_attnmap(gt_attn_logit, tgt_query_idx, key_idx, exclude_selfattn="self" not in key_list)
+                                tgt_mask_per_view, _, _ = slice_attnmap(mask_per_view, tgt_query_idx, key_idx, exclude_selfattn="self" not in key_list)
+                                # 2) compute loss
+                                logit_head_kwargs = {'num_view': f2}
+                                tgt_pred, tgt_gt = unet.unet_logit_head[str(unet_layer)](tgt_pred_attn, **logit_head_kwargs), unet.vggt_logit_head[str(vggt_layer)](tgt_gt_attn, **logit_head_kwargs) # [B head f1HW f2HW]
+                                ''' [B Head Q K] 
+                                    - if softargmax: (always per_view == True)
+                                        -- B Head Q K(V*2)
+                                '''
+                                # 3) apply masking (consistency)
+                                if config.distill_config.get("mask_per_view", False):
+                                    tgt_pred = einops.rearrange(tgt_pred, 'B Head f1HW (f2 C) -> B Head f1HW f2 C', f2 = f2)
+                                    tgt_gt =  einops.rearrange(tgt_gt, 'B Head f1HW (f2 C) -> B Head f1HW f2 C', f2 = f2)
+                                    tgt_pred, tgt_gt = tgt_pred[tgt_mask_per_view.bool()], tgt_gt[tgt_mask_per_view.bool()]
+                                else:
+                                    tgt_mask = tgt_mask_per_view.any(dim=-1) # B Head f1HW f2 -> B Head f1HW
+                                    tgt_pred, tgt_gt = tgt_pred[tgt_mask.bool()], tgt_gt[tgt_mask.bool()]
+                                # 4) loss
+                                tgt_query_distill_loss = distill_loss_fn(tgt_pred.float(), tgt_gt.float(), **distill_loss_fn_config)
+                            else:
+                                tgt_query_distill_loss = 0
+                            # weighted average(by each num_view of ref / tgt)
+                            distill_loss = random_cond_num / F * ref_query_distill_loss + (F-random_cond_num) / F * tgt_query_distill_loss
+                            if torch.isnan(distill_loss).any().item():
+                                accelerator.print("NaN in distill_loss, skip this layer distill...")
                                 continue
-                            distill_loss_dict[f"train/distill/unet{unet_layer}_vggt{vggt_layer}"] = distill_loss_fn(pred.float(), gt.float(), **distill_loss_fn_config)
+                            distill_loss_dict[f"train/distill/unet{unet_layer}_vggt{vggt_layer}"] = distill_loss
+
+                            # # Distill Query to target/all 
+                            # if config.distill_config.distill_query == "target":
+                            #     query_idx = list(range(random_cond_num, F))
+                            #     exclude_query_idx = list(range(0, random_cond_num))
+                            # elif config.distill_config.distill_query == "all":
+                            #     query_idx = list(range(0, F))
+                            #     exclude_query_idx = list(range(0))
+                            # else:
+                            #     raise NotImplementedError(f"distill_query {config.distill_config.distill_query} not implemented")
+                            
+                            # # Distill Key to reference/all
+                            # if config.distill_config.distill_key == "reference":
+                            #     key_idx = list(range(0, random_cond_num))
+                            #     exclude_key_idx = list(range(random_cond_num,F))
+                            # elif config.distill_config.distill_key == "all":
+                            #     key_idx = list(range(0, F))
+                            #     exclude_key_idx = list(range(0))
+                            # else:
+                            #     raise NotImplementedError(f"distill_key {config.distill_config.distill_key} not implemented")
+
+                            # # Distill Query to target/all 
+                            # if config.distill_config.distill_query == "target":
+                            #     query_idx = list(range(random_cond_num, F))
+                            #     exclude_query_idx = list(range(0, random_cond_num))
+                            # elif config.distill_config.distill_query == "all":
+                            #     query_idx = list(range(0, F))
+                            #     exclude_query_idx = list(range(0))
+                            # else:
+                            #     raise NotImplementedError(f"distill_query {config.distill_config.distill_query} not implemented")
+                            
+                            # # Distill Key to reference/all
+                            # if config.distill_config.distill_key == "reference":
+                            #     key_idx = list(range(0, random_cond_num))
+                            #     exclude_key_idx = list(range(random_cond_num,F))
+                            # elif config.distill_config.distill_key == "all":
+                            #     key_idx = list(range(0, F))
+                            #     exclude_key_idx = list(range(0))
+                            # else:
+                            #     raise NotImplementedError(f"distill_key {config.distill_config.distill_key} not implemented")
+                            
+                            # def slice_attnmap(attnmap, query_idx, key_idx):
+                            #     B, Head, Q, K = attnmap.shape
+                            #     HW = Q // F
+                            #     C = K // F
+                            #     attnmap = einops.rearrange(attnmap, 'B Head (F1 HW) (F2 C) -> B Head F1 HW F2 C', B=B, Head=Head, F1=F, HW=HW, F2=F, C=C)
+                            #     attnmap = attnmap[:, :, query_idx][:, :, :, :, key_idx]
+                            #     attnmap = einops.rearrange(attnmap, 'B Head f1 HW f2 C -> B Head (f1 HW) (f2 C)', B=B, Head=Head, f1=len(query_idx), f2=len(key_idx), HW=HW, C=C)
+                            #     return attnmap
+                            # def slice_attnmap(attnmap, query_idx, key_idx):
+                            #     B, Head, Q, K = attnmap.shape
+                            #     HW = Q // F
+                            #     C = K // F
+                            #     attnmap = einops.rearrange(attnmap, 'B Head (F1 HW) (F2 C) -> B Head F1 HW F2 C', B=B, Head=Head, F1=F, HW=HW, F2=F, C=C)
+                            #     attnmap = attnmap[:, :, query_idx][:, :, :, :, key_idx]
+                            #     attnmap = einops.rearrange(attnmap, 'B Head f1 HW f2 C -> B Head (f1 HW) (f2 C)', B=B, Head=Head, f1=len(query_idx), f2=len(key_idx), HW=HW, C=C)
+                            #     return attnmap
+                            # pred_attn_logit = slice_attnmap(pred_attn_logit, query_idx, key_idx)
+                            # gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx, key_idx) # B head f1HW f2HW
+                            # mask_per_view = slice_attnmap(mask_per_view, query_idx, key_idx) # B head f1HW f2
+                            # mask_per_view = einops.rearrange(mask_per_view, 'B Head (F1 HW) F2 -> B Head F1 HW F2', B=B, Head=Head, F1=F, F2=F)
+                            # mask_per_view[:, :, exclude_query_idx][:, :, :, :, exclude_key_idx] = False
+                            # mask_per_view = einops.rearrange(mask_per_view, 'B Head F1 HW F2 -> B Head (F1 HW) F2', B=B, Head=Head, F1=F, F2=F)
+
+
+                            # # 4) Prob Map
+                            # logit_head_kwargs = {"num_view": len(key_idx)}
+                            # pred, gt = unet.unet_logit_head[str(unet_layer)](pred_attn_logit, **logit_head_kwargs), unet.vggt_logit_head[str(vggt_layer)](gt_attn_logit, **logit_head_kwargs) # [B head f1HW f2HW]
+                            # ''' pred/gt format
+                            #     - always [B Head Q K]
+                            #     - if per_view is True, K -> V HW for loss compute
+                            #     - if softargmax
+                            #         -- if per_view is True: B Head Q V*2
+                            #         -- else: B Head Q 1 (*Caution, no view information)
+                            # '''
+                            # if config.distill_config.get("mask_per_view", False):
+                            #     pred = einops.rearrange(pred, 'B Head f1HW (f2 HW) -> B Head f1HW f2 HW', f2 = len(key_idx))
+                            #     gt =  einops.rearrange(gt, 'B Head f1HW (f2 HW) -> B Head f1HW f2 HW', f2 = len(key_idx))
+                            #     pred, gt = pred[mask_per_view.bool()], gt[mask_per_view.bool()]
+                            # else:
+                            #     mask = mask_per_view.any(dim=-1) # B Head f1HW f2 -> B Head f1HW
+                            #     pred, gt = pred[mask.bool()], gt[mask.bool()]
+
+                            # if config.distill_config.get("consistency_check", False):
+                            #     assert config.distill_config.distill_query == "target", "consistency check only support distill_query to target"
+                            #     B, Head, F1HW, F2HW = gt_attn_logit.shape  
+                            #     # assert Head == 1, "costmap should have only one head, while consistency checking?"
+                            #     F1, F2, HW = len(query_idx), len(key_idx), F1HW // len(query_idx)
+
+                            #     if config.distill_config.get("consistency_check_per_view", False):
+                            #         assert unet.unet_logit_head[str(unet_layer)].per_view == True and unet.vggt_logit_head[str(vggt_layer)].per_view == True
+                            #         gt_attn_logit_HW = einops.rearrange(gt_attn_logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1 F2) HW1 HW2', B=B,Head=Head, F1=F1, F2=F2, HW1=HW, HW2=HW)
+                            #         consistency_mask = cycle_consistency_checker(gt_attn_logit_HW, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1 F2) HW1 HW2
+                            #         consistency_mask = einops.rearrange(consistency_mask, '(B Head F1 F2) HW 1 -> B Head (F1 HW) F2 1', B=B, Head=Head, F1=F1, F2=F2, HW=HW)
+                            #         consistency_mask = consistency_mask.reshape(B, Head, F1HW, F2)
+                            #         pred, gt = pred.reshape(B,Head,F1HW,F2, -1), gt.reshape(B,Head,F1HW,F2, -1)
+                            #         pred, gt = pred[consistency_mask.bool()], gt[consistency_mask.bool()]
+                            #     else:
+                            #         gt_attn_logit_HW = einops.rearrange(gt_attn_logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1) HW1 (F2 HW2)', B=B,Head=Head, F1=F1, F2=F2, HW1=HW, HW2=HW)
+                            #         consistency_mask = cycle_consistency_checker(gt_attn_logit_HW, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1) HW1 (F2 HW2)
+                            #         consistency_mask = einops.rearrange(consistency_mask, '(B Head F1) HW 1 -> B Head (F1 HW) 1', B=B, Head=Head, F1=F1, HW=HW)
+                            #         consistency_mask = consistency_mask.reshape(B, Head, F1HW)
+                            #         pred, gt = pred[consistency_mask.bool()], gt[consistency_mask.bool()]
+
+                            # # 5) distill loss 
+                            # if torch.isnan(gt).any().item():
+                            #     accelerator.print("NaN in gt attn, skip this layer distill...")
+                            #     continue
+                            # distill_loss_dict[f"train/distill/unet{unet_layer}_vggt{vggt_layer}"] = distill_loss_fn(pred.float(), gt.float(), **distill_loss_fn_config)
                         distill_loss = sum(distill_loss_dict.values()) / len(distill_loss_dict.values()) if len(distill_loss_dict) > 0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
                     loss = diff_loss + distill_loss * distill_loss_weight
                 else:
