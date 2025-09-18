@@ -1187,6 +1187,7 @@ def main():
                                 key_idx += list(range(random_cond_num))
                             if "target" in  key_list:
                                 key_idx += list(range(random_cond_num, F))
+                            '''Caution: "self" applied in slice_attnmap'''
                             key_idx =sorted(key_idx)
                             if len(key_idx) > 0 :
                                 # 1) slice
@@ -1213,7 +1214,7 @@ def main():
                             else:
                                 ref_query_distill_loss = 0
 
-                            # 2-2) Target Query
+                            # Target Query Attnmap
                             tgt_query_idx = list(range(random_cond_num, F))
                             key_list = config.distill_config.distill_key_for_target_query # among ["self", "reference","target"]
                             key_idx = []
@@ -1246,8 +1247,7 @@ def main():
                                 tgt_query_distill_loss = distill_loss_fn(tgt_pred.float(), tgt_gt.float(), **distill_loss_fn_config)
                             else:
                                 tgt_query_distill_loss = 0
-                            # weighted average(by each num_view of ref / tgt)
-                            distill_loss = random_cond_num / F * ref_query_distill_loss + (F-random_cond_num) / F * tgt_query_distill_loss
+                            distill_loss =  ref_query_distill_loss + tgt_query_distill_loss # TODO: weight?
                             if torch.isnan(distill_loss).any().item():
                                 accelerator.print("NaN in distill_loss, skip this layer distill...")
                                 continue

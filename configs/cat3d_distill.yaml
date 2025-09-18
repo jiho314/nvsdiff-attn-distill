@@ -1,28 +1,36 @@
 
+
 # Distill 
 distill_config:
   distill_pairs:  [
     [2, "point_map"],
     [4, "point_map"],
-    [6, "point_map"],
-    [8, "point_map"],
+    [7, "point_map"],
     [10, "point_map"],
   ] # student(unet)(down_blocks(6), mid_block(1), up_blocks(9)), teacher(vggt)(0~23, "track_head", "point_head")
   # unet: [64,64,32,32,16,16] [8] [16,16,16,32,32,32,64,64,64]
   distill_loss_weight: 0.02 # 0.05 per layer 
   distill_loss_fn: "cross_entropy"  # "cross_entropy", "l1", ...
   vggt_logit_head: "softmax_headmean"  # "softmax_headmean", "identity", "softmax_headmlp"
-  vggt_logit_head_kwargs: {"softmax_temp": 1.0}
-  unet_logit_head: "softmax_headmean"  # "softmax_headmean", "identity", "softmax_headmlp"
-  unet_logit_head_kwargs: {"softmax_temp": 1.0} 
-
+  vggt_logit_head_kwargs: {"per_view":False, "softmax_temp": 0.01}
+  unet_logit_head: "HeadMlp_Softmax"  # "softmax_headmean", "identity", "softmax_headmlp"
+  unet_logit_head_kwargs: {"per_view":False, "softmax_temp": 0.15, "learnable_temp": true, "mlp_ratio":4, mlp_depth": 3}
+  
   distill_query: "target" # "target", "all"
   distill_key: "reference" # "reference", "all", (TODO: "cross")
-  cost_metric: "neg_log_l2" # "dot_product", "neg_l2", "neg_log_le", "inverse_l2"
+  cost_metric: "neg_l2" # "dot_product", "neg_l2", "neg_log_l2", "inverse_l2"
+
+  distill_key_for_reference_query: [  ] # ["reference", "target", "self"] 
+  distill_key_for_target_query: [ "reference"  ] # ["reference", "target", "self"]
+
+  # masking option
+  mask_per_view : False  # if logit_head using per_view, mask_per_view should be applied 
 
   consistency_check: True
+  # consistency_check_per_view : False # if True, increase loss weight 
   consistency_check_cfg:
     pixel_threshold: 1.5
+  learning_rate : 1e-4
 
 # vggt
 vggt_on_fly : false

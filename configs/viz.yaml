@@ -158,7 +158,7 @@ unet_visualize:
   noise_timestep: 999 #(0, 999)
   inference_view_range: 25
   cond_num: 2 #reference num
-  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/lr1_cosine_noema/checkpoint-30000'
+  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/naive_0915/checkpoint-2000'
   save_originals: false
   save_stack: true
   per_view: false

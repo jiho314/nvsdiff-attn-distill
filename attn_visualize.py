@@ -348,7 +348,7 @@ def main(nframe, cond_num, inference_view_range,
         if config.unet_visualize.save_stack:
             # Save stacked images (ref + tgt)
             save_image(images.squeeze(), os.path.join(outdir_root, f"VIS_STACKED.png"))
-        if idx == 200:
+        if idx == 50:
             break
         
 
