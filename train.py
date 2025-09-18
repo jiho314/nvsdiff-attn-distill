@@ -93,7 +93,7 @@ def shuffle_batch(batch):
         data = batch[k]
         if torch.is_tensor(data):
             if data.ndim >= 2:
-                batch[k] = batch[k][:, new_idx]
+                batch[k] = batch[k][:, perm]
     # batch["image"] = img[:, perm]
     # batch["intrinsic"] = batch["intrinsic"][:, perm]
     # batch["extrinsic"] = batch["extrinsic"][:, perm]
