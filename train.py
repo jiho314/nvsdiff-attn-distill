@@ -86,14 +86,9 @@ def shuffle_batch(batch):
     img = batch["image"]  # [B,F,3,H,W]
     B,F,_,H,W = img.shape
     perm = torch.randperm(F)
-
+    
     # for key in data_keys:
     #     batch[key] = batch[key][:, perm]
-    for k in batch.keys():
-        data = batch[k]
-        if torch.is_tensor(data):
-            if data.ndim >= 2:
-                batch[k] = batch[k][:, perm]
     # batch["image"] = img[:, perm]
     # batch["intrinsic"] = batch["intrinsic"][:, perm]
     # batch["extrinsic"] = batch["extrinsic"][:, perm]
@@ -1127,7 +1122,7 @@ def main():
                             '''
                             gt_query, gt_key = distill_gt_dict[str(vggt_layer)]['query'].detach(), distill_gt_dict[str(vggt_layer)]['key'].detach() # B Head VHW C, B Head VHW C
                             pred_attn_logit = unet_attn_cache[str(unet_layer)] # B Head Q(FHW) K(FHW)
-                            B, Head, Q, K = pred_attn_logit
+                            B, Head, Q, K = pred_attn_logit.shape
                             assert Q==K, f"pred attn should have same Q,K dim, but {pred_attn_logit.shape}"
 
                             # 1. gt Query/key -> logit map
