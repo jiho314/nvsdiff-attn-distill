@@ -25,7 +25,7 @@ def set_attn_cache( unet,  cache_layers = [] , print_=True):
     attn_proc_names = sorted(list(unet.attn_processors.keys()))
     for i, name in enumerate(attn_proc_names):
         if i in cache_layers:
-            print(f"Cache attn layer: {i}={name}")
+            # print(f"Cache attn layer: {i}={name}")
             unet.attn_processors[name].cache_attn = True
         else:
             unet.attn_processors[name].cache_attn = False
