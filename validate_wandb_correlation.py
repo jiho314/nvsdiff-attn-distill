@@ -631,36 +631,757 @@ def compute_and_save_correlation(history_df, out_path, output_postfix=None):
     return good_cols, numeric
 
 
+def collect_and_organize_runs_summary(project_name="jsh0423_/nvs-vggt-distill", run_name_prefixes=["distill", "naive"]):
+    """
+    WandB에서 지정된 prefix(distill, naive)로 시작하는 모든 run을 가져와서 
+    summary 데이터를 run별로 정리하여 반환하는 함수
+    
+    Args:
+        project_name (str): WandB 프로젝트 경로 (user/project 형식)
+        run_name_prefixes (list): 검색할 run 이름의 prefix 리스트
+        
+    Returns:
+        pandas.DataFrame: run별로 정리된 summary 데이터 (정렬됨)
+    """
+    api = wandb.Api()
+    
+    # 프로젝트의 모든 run 가져오기
+    runs = api.runs(project_name)
+    
+    # prefix에 해당하는 run들 필터링
+    filtered_runs = []
+    for run in runs:
+        run_name = run.name
+        if any(run_name.startswith(prefix) for prefix in run_name_prefixes):
+            filtered_runs.append(run)
+    
+    print(f"총 {len(filtered_runs)}개의 run을 찾았습니다 (prefix: {run_name_prefixes})")
+    
+    # 각 run의 summary 데이터 수집
+    summary_data = []
+    for run in filtered_runs:
+        run_info = {
+            'run_name': run.name,
+            'run_id': run.id,
+            'run_path': f"{project_name}/{run.id}",
+            'state': run.state,
+            'created_at': run.created_at if hasattr(run, 'created_at') else None,
+        }
+        
+        # updated_at이 있는 경우에만 추가 (일부 WandB API 버전에서는 없을 수 있음)
+        if hasattr(run, 'updated_at'):
+            run_info['updated_at'] = run.updated_at
+        elif hasattr(run, 'heartbeat_at'):
+            run_info['updated_at'] = run.heartbeat_at
+        else:
+            run_info['updated_at'] = None
+        
+        # summary 데이터 추가
+        if hasattr(run, 'summary') and run.summary:
+            for key, value in run.summary.items():
+                # summary/ prefix가 있는 키들만 수집
+                if key.startswith('summary/'):
+                    run_info[key] = value
+                # summary/ prefix가 없는 경우도 포함 (backward compatibility)
+                elif not key.startswith('_'):  # wandb internal keys 제외
+                    run_info[f"summary/{key}"] = value
+        
+        summary_data.append(run_info)
+    
+    # DataFrame으로 변환
+    df = pd.DataFrame(summary_data)
+    
+    if df.empty:
+        print("수집된 데이터가 없습니다.")
+        return df
+    
+    # run_name으로 정렬
+    df = df.sort_values('run_name').reset_index(drop=True)
+    
+    # 결과 출력
+    print(f"\n수집된 run들:")
+    for idx, row in df.iterrows():
+        print(f"  {row['run_name']} (ID: {row['run_id']}, State: {row['state']})")
+    
+    # summary 컬럼들 출력
+    summary_cols = [col for col in df.columns if col.startswith('summary/')]
+    if summary_cols:
+        print(f"\n수집된 summary 메트릭들:")
+        for col in sorted(summary_cols):
+            non_null_count = df[col].notna().sum()
+            print(f"  {col}: {non_null_count}/{len(df)} runs에서 사용 가능")
+    
+    return df
+
+
+def plot_summary_graphs(csv_file_path="runs_summary_organized.csv"):
+    """
+    CSV 파일에서 summary 데이터를 읽어와서 run 숫자 기준으로 정렬하고 
+    주요 메트릭들에 대한 그래프를 생성하는 함수
+    
+    Args:
+        csv_file_path (str): CSV 파일 경로
+    """
+    import re
+    
+    # CSV 파일 읽기
+    df = pd.read_csv(csv_file_path)
+    
+    if df.empty:
+        print("CSV 파일이 비어있습니다.")
+        return
+    
+    # run_name에서 숫자 추출하는 함수
+    def extract_run_number(run_name):
+        # distill_val_run_숫자 또는 naive_val_run_숫자 패턴에서 숫자 추출
+        match = re.search(r'(distill|naive)_val_run_(\d+)', str(run_name))
+        if match:
+            return int(match.group(2))
+        return 0
+    
+    # run 타입 추출하는 함수 (distill/naive)
+    def extract_run_type(run_name):
+        if str(run_name).startswith('distill'):
+            return 'distill'
+        elif str(run_name).startswith('naive'):
+            return 'naive'
+        return 'unknown'
+    
+    # 숫자와 타입 추출
+    df['run_number'] = df['run_name'].apply(extract_run_number)
+    df['run_type'] = df['run_name'].apply(extract_run_type)
+    
+    # run_number로 정렬
+    df = df.sort_values('run_number').reset_index(drop=True)
+    
+    # 완료된 run들만 필터링 (finished 상태)
+    finished_df = df[df['state'] == 'finished'].copy()
+    
+    if finished_df.empty:
+        print("완료된 run이 없습니다.")
+        return
+    
+    print(f"그래프 생성을 위한 완료된 run 개수: {len(finished_df)}")
+    
+    # 출력 디렉토리 생성
+    from datetime import datetime
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_dir = f"summary_plots_{ts}"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 주요 메트릭 컬럼들 찾기
+    metric_cols = {}
+    
+    # PSNR, SSIM, LPIPS 찾기
+    for col in finished_df.columns:
+        if 'psnr' in col.lower() and 'summary' in col:
+            metric_cols['PSNR'] = col
+        elif 'ssim' in col.lower() and 'summary' in col:
+            metric_cols['SSIM'] = col  
+        elif 'lpips' in col.lower() and 'summary' in col:
+            metric_cols['LPIPS'] = col
+    
+    # attention loss 관련 메트릭들 찾기
+    attn_cols = [col for col in finished_df.columns if 'attention_loss' in col and 'summary' in col and 'mean' in col]
+    
+    print(f"발견된 주요 메트릭: {list(metric_cols.keys())}")
+    print(f"발견된 attention loss 메트릭 개수: {len(attn_cols)}")
+    
+    # 그래프 생성
+    fig_width = 12
+    fig_height = 8
+    
+    # 1. 주요 메트릭들 (PSNR, SSIM, LPIPS) 그래프
+    if metric_cols:
+        fig, axes = plt.subplots(len(metric_cols), 1, figsize=(fig_width, fig_height * len(metric_cols)))
+        if len(metric_cols) == 1:
+            axes = [axes]
+        
+        for idx, (metric_name, col_name) in enumerate(metric_cols.items()):
+            ax = axes[idx]
+            
+            # distill과 naive 분리해서 플롯
+            distill_data = finished_df[finished_df['run_type'] == 'distill']
+            naive_data = finished_df[finished_df['run_type'] == 'naive']
+            
+            if not distill_data.empty:
+                ax.plot(distill_data['run_number'], distill_data[col_name], 
+                       'o-', label='Distill', linewidth=2, markersize=6)
+            
+            if not naive_data.empty:
+                ax.plot(naive_data['run_number'], naive_data[col_name], 
+                       's-', label='Naive', linewidth=2, markersize=6)
+            
+            ax.set_xlabel('Run Number')
+            ax.set_ylabel(metric_name)
+            ax.set_title(f'{metric_name} vs Run Number')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # y축 범위 자동 조정
+            if not finished_df[col_name].isna().all():
+                y_min = finished_df[col_name].min()
+                y_max = finished_df[col_name].max()
+                y_range = y_max - y_min
+                ax.set_ylim(y_min - y_range * 0.05, y_max + y_range * 0.05)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'main_metrics.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"주요 메트릭 그래프 저장: {os.path.join(output_dir, 'main_metrics.png')}")
+    
+    # 2. Attention Loss 메트릭들 그래프 (상위 몇 개만)
+    if attn_cols:
+        # 상위 6개 attention loss 메트릭만 선택
+        selected_attn_cols = attn_cols[:6]
+        
+        fig, axes = plt.subplots(2, 3, figsize=(fig_width * 1.5, fig_height))
+        axes = axes.flatten()
+        
+        for idx, col_name in enumerate(selected_attn_cols):
+            if idx >= len(axes):
+                break
+                
+            ax = axes[idx]
+            
+            # distill과 naive 분리해서 플롯
+            distill_data = finished_df[finished_df['run_type'] == 'distill']
+            naive_data = finished_df[finished_df['run_type'] == 'naive']
+            
+            if not distill_data.empty and not distill_data[col_name].isna().all():
+                ax.plot(distill_data['run_number'], distill_data[col_name], 
+                       'o-', label='Distill', linewidth=2, markersize=6)
+            
+            if not naive_data.empty and not naive_data[col_name].isna().all():
+                ax.plot(naive_data['run_number'], naive_data[col_name], 
+                       's-', label='Naive', linewidth=2, markersize=6)
+            
+            # 컬럼명에서 간단한 제목 추출
+            title = col_name.replace('summary/', '').replace('attention_loss/', '').replace('_mean', '')
+            ax.set_xlabel('Run Number')
+            ax.set_ylabel('Attention Loss')
+            ax.set_title(title, fontsize=10)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # y축 범위 자동 조정
+            if not finished_df[col_name].isna().all():
+                y_min = finished_df[col_name].min()
+                y_max = finished_df[col_name].max()
+                y_range = y_max - y_min
+                if y_range > 0:
+                    ax.set_ylim(y_min - y_range * 0.05, y_max + y_range * 0.05)
+        
+        # 사용하지 않는 subplot 숨기기
+        for idx in range(len(selected_attn_cols), len(axes)):
+            axes[idx].set_visible(False)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'attention_loss_metrics.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Attention Loss 메트릭 그래프 저장: {os.path.join(output_dir, 'attention_loss_metrics.png')}")
+    
+    # 3. 요약 통계 저장
+    summary_stats = []
+    for run_type in ['distill', 'naive']:
+        type_data = finished_df[finished_df['run_type'] == run_type]
+        if not type_data.empty:
+            for metric_name, col_name in metric_cols.items():
+                if not type_data[col_name].isna().all():
+                    stats = {
+                        'run_type': run_type,
+                        'metric': metric_name,
+                        'count': len(type_data),
+                        'mean': type_data[col_name].mean(),
+                        'std': type_data[col_name].std(),
+                        'min': type_data[col_name].min(),
+                        'max': type_data[col_name].max()
+                    }
+                    summary_stats.append(stats)
+    
+    if summary_stats:
+        stats_df = pd.DataFrame(summary_stats)
+        stats_file = os.path.join(output_dir, 'summary_statistics.csv')
+        stats_df.to_csv(stats_file, index=False)
+        print(f"요약 통계 저장: {stats_file}")
+    
+    print(f"\n모든 그래프와 통계가 '{output_dir}' 폴더에 저장되었습니다.")
+    
+    return output_dir
+
+
+def analyze_timestep_layer_ce(csv_file_path="runs_summary_organized.csv"):
+    """
+    TIMESTEP별로 각 레이어의 Cross Entropy(CE) STD와 MEAN 변화를 시계열로 분석하는 함수
+    
+    Args:
+        csv_file_path (str): CSV 파일 경로
+        
+    Returns:
+        str: 출력 디렉토리 경로
+    """
+    import re
+    
+    # CSV 파일 읽기
+    df = pd.read_csv(csv_file_path)
+    
+    if df.empty:
+        print("CSV 파일이 비어있습니다.")
+        return
+    
+    # run_name에서 숫자와 타입 추출 (timestep으로 사용)
+    def extract_run_info(run_name):
+        match = re.search(r'(distill|naive)_val_run_(\d+)', str(run_name))
+        if match:
+            return match.group(1), int(match.group(2))
+        return 'unknown', 0
+    
+    df['run_type'] = df['run_name'].apply(lambda x: extract_run_info(x)[0])
+    df['timestep'] = df['run_name'].apply(lambda x: extract_run_info(x)[1])  # timestep으로 사용
+    
+    # 완료된 run들만 필터링
+    finished_df = df[df['state'] == 'finished'].copy()
+    
+    if finished_df.empty:
+        print("완료된 run이 없습니다.")
+        return
+    
+    print(f"TIMESTEP별 레이어 CE 분석을 위한 완료된 run 개수: {len(finished_df)}")
+    
+    # 출력 디렉토리 생성
+    from datetime import datetime
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_dir = f"timestep_layer_ce_analysis_{ts}"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Cross Entropy 관련 컬럼들 찾기 (cross_entropy가 포함되고 head가 없는 컬럼만)
+    ce_cols = [col for col in finished_df.columns 
+               if 'cross_entropy' in col and 'summary' in col and 'head' not in col]
+    
+    print(f"발견된 Cross Entropy 컬럼 (head 제외): {len(ce_cols)}")
+    
+    # 레이어 정보 추출 함수
+    def extract_layer_info(col_name):
+        # unet 뒤의 숫자 추출
+        layer_match = re.search(r'unet(\d+)', col_name)
+        layer_num = int(layer_match.group(1)) if layer_match else None
+        
+        return layer_num
+    
+    # 시계열 데이터 정리
+    timeseries_data = []
+    
+    for col in ce_cols:
+        layer_num = extract_layer_info(col)
+        if layer_num is None:
+            continue
+        
+        # 각 run의 데이터 수집
+        for _, row in finished_df.iterrows():
+            if pd.notna(row[col]):  # 유효한 값이 있는 경우만
+                timeseries_data.append({
+                    'timestep': row['timestep'],
+                    'run_type': row['run_type'],
+                    'layer': layer_num,
+                    'ce_value': row[col],
+                    'run_name': row['run_name'],
+                    'column_name': col
+                })
+    
+    if not timeseries_data:
+        print("Cross Entropy 데이터를 찾을 수 없습니다.")
+        return output_dir
+    
+    # DataFrame으로 변환
+    ts_df = pd.DataFrame(timeseries_data)
+    
+    # timestep으로 정렬
+    ts_df = ts_df.sort_values(['timestep', 'layer']).reset_index(drop=True)
+    
+    # CSV로 저장
+    ts_file = os.path.join(output_dir, 'timestep_layer_ce_data.csv')
+    ts_df.to_csv(ts_file, index=False)
+    print(f"TIMESTEP별 레이어 CE 데이터 저장: {ts_file}")
+    
+    # 레이어별로 시계열 그래프 생성
+    unique_layers = sorted(ts_df['layer'].unique())
+    unique_timesteps = sorted(ts_df['timestep'].unique())
+    
+    print(f"발견된 레이어: {unique_layers}")
+    print(f"발견된 timesteps: {unique_timesteps}")
+    
+    # 각 레이어별로 그래프 생성 (head 제외)
+    for layer in unique_layers:
+        layer_data = ts_df[ts_df['layer'] == layer]
+        
+        if layer_data.empty:
+            continue
+        
+        # 단순한 레이어별 시계열 분석 (head 없음)
+        # 1) combined (distill vs naive) + difference (as before)
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+        # combined plot (distill vs naive)
+        ax = axes[0]
+        for run_type in ['distill', 'naive']:
+            type_data = layer_data[layer_data['run_type'] == run_type]
+            if not type_data.empty:
+                marker = 'o' if run_type == 'distill' else 's'
+                ax.plot(type_data['timestep'], type_data['ce_value'], 
+                       marker=marker, label=f'{run_type.capitalize()}', 
+                       linewidth=2, markersize=6)
+
+        ax.set_xlabel('Timestep')
+        ax.set_ylabel('CE Value')
+        ax.set_title(f'Layer {layer} - CE Over Time')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        # difference plot (distill - naive)
+        ax = axes[1]
+        distill_data = layer_data[layer_data['run_type'] == 'distill'].set_index('timestep')['ce_value']
+        naive_data = layer_data[layer_data['run_type'] == 'naive'].set_index('timestep')['ce_value']
+
+        # 공통 timestep에서만 차이 계산
+        common_timesteps = set(distill_data.index) & set(naive_data.index)
+        if common_timesteps:
+            common_timesteps = sorted(common_timesteps)
+            diff_values = [distill_data[ts] - naive_data[ts] for ts in common_timesteps]
+
+            ax.plot(common_timesteps, diff_values, 'ro-', linewidth=2, markersize=6)
+            ax.axhline(y=0, color='k', linestyle='--', alpha=0.5)
+            ax.set_xlabel('Timestep')
+            ax.set_ylabel('CE Difference (Distill - Naive)')
+            ax.set_title(f'Layer {layer} - Distill vs Naive Difference')
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plot_file = os.path.join(output_dir, f'layer_{layer}_ce_timeseries.png')
+        plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Layer {layer} CE 시계열 그래프 저장: {plot_file}")
+
+        # 2) separate plots: distill-only and naive-only per layer (요청사항)
+        # distill-only
+        distill_df = layer_data[layer_data['run_type'] == 'distill']
+        if not distill_df.empty:
+            fig_d, ax_d = plt.subplots(1, 1, figsize=(8, 4))
+            ax_d.plot(distill_df['timestep'], distill_df['ce_value'], 'o-', color='tab:blue', linewidth=2, markersize=6)
+            ax_d.set_xlabel('Timestep')
+            ax_d.set_ylabel('CE Value')
+            ax_d.set_title(f'Layer {layer} - Distill CE Over Time')
+            ax_d.grid(True, alpha=0.3)
+            out_d = os.path.join(output_dir, f'layer_{layer}_ce_distill.png')
+            fig_d.tight_layout()
+            fig_d.savefig(out_d, dpi=300, bbox_inches='tight')
+            plt.close(fig_d)
+            print(f"Layer {layer} Distill CE 그래프 저장: {out_d}")
+
+        # naive-only
+        naive_df = layer_data[layer_data['run_type'] == 'naive']
+        if not naive_df.empty:
+            fig_n, ax_n = plt.subplots(1, 1, figsize=(8, 4))
+            ax_n.plot(naive_df['timestep'], naive_df['ce_value'], 's-', color='tab:orange', linewidth=2, markersize=6)
+            ax_n.set_xlabel('Timestep')
+            ax_n.set_ylabel('CE Value')
+            ax_n.set_title(f'Layer {layer} - Naive CE Over Time')
+            ax_n.grid(True, alpha=0.3)
+            out_n = os.path.join(output_dir, f'layer_{layer}_ce_naive.png')
+            fig_n.tight_layout()
+            fig_n.savefig(out_n, dpi=300, bbox_inches='tight')
+            plt.close(fig_n)
+            print(f"Layer {layer} Naive CE 그래프 저장: {out_n}")
+    
+    # 전체 요약 그래프 생성 (모든 레이어 한번에)
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # 1. 모든 레이어의 평균 CE 시계열
+    ax = axes[0, 0]
+    for run_type in ['distill', 'naive']:
+        type_data = ts_df[ts_df['run_type'] == run_type]
+        if not type_data.empty:
+            # timestep별 전체 평균
+            overall_means = type_data.groupby('timestep')['ce_value'].mean()
+            marker = 'o' if run_type == 'distill' else 's'
+            ax.plot(overall_means.index, overall_means.values, 
+                   marker=marker, label=f'{run_type.capitalize()}', 
+                   linewidth=2, markersize=6)
+    
+    ax.set_xlabel('Timestep')
+    ax.set_ylabel('Overall CE Mean')
+    ax.set_title('Overall CE Mean Over Time (All Layers)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 2. 레이어별 CE 평균 히트맵
+    ax = axes[0, 1]
+    pivot_data = ts_df.groupby(['timestep', 'layer'])['ce_value'].mean().unstack(fill_value=np.nan)
+    im = ax.imshow(pivot_data.values, aspect='auto', cmap='viridis', interpolation='nearest')
+    ax.set_xlabel('Layer')
+    ax.set_ylabel('Timestep')
+    ax.set_title('CE Mean Heatmap (Timestep vs Layer)')
+    ax.set_xticks(range(len(pivot_data.columns)))
+    ax.set_xticklabels(pivot_data.columns)
+    ax.set_yticks(range(len(pivot_data.index)))
+    ax.set_yticklabels(pivot_data.index)
+    plt.colorbar(im, ax=ax)
+    
+    # 3. 레이어별 최종 성능 비교
+    ax = axes[1, 0]
+    final_timestep = max(unique_timesteps)
+    final_data = ts_df[ts_df['timestep'] == final_timestep]
+    
+    for run_type in ['distill', 'naive']:
+        type_final = final_data[final_data['run_type'] == run_type]
+        if not type_final.empty:
+            layer_means = type_final.groupby('layer')['ce_value'].mean()
+            marker = 'o' if run_type == 'distill' else 's'
+            ax.plot(layer_means.index, layer_means.values, 
+                   marker=marker, label=f'{run_type.capitalize()}', 
+                   linewidth=2, markersize=8)
+    
+    ax.set_xlabel('Layer')
+    ax.set_ylabel('Final CE Value')
+    ax.set_title(f'Final CE by Layer (Timestep {final_timestep})')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 4. 전체 차이 시계열
+    ax = axes[1, 1]
+    for layer in unique_layers:
+        layer_data = ts_df[ts_df['layer'] == layer]
+        distill_data = layer_data[layer_data['run_type'] == 'distill'].groupby('timestep')['ce_value'].mean()
+        naive_data = layer_data[layer_data['run_type'] == 'naive'].groupby('timestep')['ce_value'].mean()
+        
+        common_timesteps = set(distill_data.index) & set(naive_data.index)
+        if common_timesteps:
+            common_timesteps = sorted(common_timesteps)
+            diff_values = [distill_data[ts] - naive_data[ts] for ts in common_timesteps]
+            ax.plot(common_timesteps, diff_values, 'o-', label=f'Layer {layer}', alpha=0.7)
+    
+    ax.axhline(y=0, color='k', linestyle='--', alpha=0.5)
+    ax.set_xlabel('Timestep')
+    ax.set_ylabel('CE Difference (Distill - Naive)')
+    ax.set_title('CE Difference by Layer Over Time')
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    summary_plot = os.path.join(output_dir, 'overall_ce_timeseries_summary.png')
+    plt.savefig(summary_plot, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"전체 요약 그래프 저장: {summary_plot}")
+
+    # --- Combined figure: two subplots (distill / naive), y-axis = timestep, lines per layer ---
+    try:
+        import colorsys
+        layers = unique_layers
+        if layers:
+            # palette per layer (consistent across subplots)
+            base_palette = sns.color_palette('hls', n_colors=len(layers))
+
+            figC, axesC = plt.subplots(1, 2, figsize=(14, 8), sharey=True)
+            for idx, run_type in enumerate(['distill', 'naive']):
+                ax = axesC[idx]
+                for i, layer in enumerate(layers):
+                    ld = ts_df[(ts_df['layer'] == layer) & (ts_df['run_type'] == run_type)].sort_values('timestep')
+                    if ld.empty:
+                        continue
+                    base_rgb = base_palette[i % len(base_palette)]
+                    # adjust saturation: distill more saturated, naive less
+                    sat_factor = 1.0 if run_type == 'distill' else 0.6
+                    r, g, b = base_rgb
+                    h, l, s = colorsys.rgb_to_hls(r, g, b)
+                    new_r, new_g, new_b = colorsys.hls_to_rgb(h, l, max(0.0, min(1.0, s * sat_factor)))
+                    color = (new_r, new_g, new_b)
+                    # plot timestep (x) vs CE (y)
+                    ax.plot(ld['timestep'], ld['ce_value'], marker='o', label=f'Layer {layer}', color=color, linewidth=2, markersize=5)
+
+                ax.set_xlabel('Timestep')
+                ax.set_title(run_type.capitalize())
+                ax.grid(True, alpha=0.3)
+
+            axesC[0].set_ylabel('CE Value')
+            # place legend outside the subplots to the right
+            handles, labels = axesC[0].get_legend_handles_labels()
+            if handles:
+                figC.legend(handles, labels, loc='upper center', ncol=min(8, len(labels)), bbox_to_anchor=(0.5, 0.99))
+
+            figC.suptitle('Per-layer CE over Timesteps (Distill vs Naive)')
+            figC.tight_layout(rect=[0, 0.03, 1, 0.95])
+            out_combined = os.path.join(output_dir, 'combined_distill_naive_layers.png')
+            figC.savefig(out_combined, dpi=300, bbox_inches='tight')
+            plt.close(figC)
+            print(f"Combined distill/naive layers plot 저장: {out_combined}")
+    except Exception:
+        # non-fatal: continue if combined plotting fails
+        pass
+    
+    # 통계 요약 생성
+    summary_stats = []
+    for layer in unique_layers:
+        layer_data = ts_df[ts_df['layer'] == layer]
+        
+        for run_type in ['distill', 'naive']:
+            type_data = layer_data[layer_data['run_type'] == run_type]
+            if not type_data.empty:
+                stats = {
+                    'layer': layer,
+                    'run_type': run_type,
+                    'timesteps_count': len(type_data['timestep'].unique()),
+                    'ce_mean': type_data['ce_value'].mean(),
+                    'ce_std': type_data['ce_value'].std(),
+                    'ce_min': type_data['ce_value'].min(),
+                    'ce_max': type_data['ce_value'].max(),
+                    'final_timestep': type_data['timestep'].max(),
+                    'final_ce': type_data[type_data['timestep'] == type_data['timestep'].max()]['ce_value'].mean()
+                }
+                summary_stats.append(stats)
+    
+    if summary_stats:
+        stats_df = pd.DataFrame(summary_stats)
+        stats_file = os.path.join(output_dir, 'timestep_ce_summary_stats.csv')
+        stats_df.to_csv(stats_file, index=False)
+        print(f"통계 요약 저장: {stats_file}")
+    
+    print(f"\n모든 TIMESTEP별 레이어 CE 분석 결과가 '{output_dir}' 폴더에 저장되었습니다.")
+    
+    return output_dir
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', default='validation_metrics_correlation_wandb.png')
     parser.add_argument('--run_id', type=str, default=None, help='WandB run path, e.g. user/project/runid')
+    parser.add_argument('--ckpts', type=str, default=None, help='Comma-separated checkpoint numbers to find corresponding runs')
     parser.add_argument('--output_postfix', type=str, default=None, help='Optional postfix to append to output folder name')
+    parser.add_argument('--collect_summary', action='store_true', help='Collect and organize summary data from distill/naive runs')
+    parser.add_argument('--plot_graphs', action='store_true', help='Generate plots from runs_summary_organized.csv')
+    parser.add_argument('--analyze_layers', action='store_true', help='Analyze timestep-wise layer CE mean/std changes')
     args = parser.parse_args()
 
     os.environ['WANDB_API_KEY'] = "5e4d6a67a9287ff9ad9b05ccc97582fcb1d48dfe"
-    # require run_id via CLI or environment
-    if args.run_id is None:
-        raise RuntimeError('Please provide --run_id (wandb run path)')
-
-    # If run_id doesn't contain '/', assume it's just the run_id and construct full path
-    run_path = args.run_id
-    if '/' not in run_path:
-        # Default to current user and project
-        run_path = f"jsh0423_/nvs-vggt-distill/{run_path}"
-        print(f"Converting run_id '{args.run_id}' to full path: {run_path}")
     
-    print(f"Fetching run metrics for: {run_path}")
-    history = fetch_run_metrics(run_path)
+    # 새로운 summary 수집 기능 처리
+    if args.collect_summary:
+        print("Collecting and organizing summary data from distill/naive runs...")
+        summary_df = collect_and_organize_runs_summary()
+        
+        # CSV로 저장
+        output_file = "runs_summary_organized.csv"
+        summary_df.to_csv(output_file, index=False)
+        print(f"\nSummary 데이터가 {output_file}에 저장되었습니다.")
+        
+        # 간단한 통계 출력
+        if not summary_df.empty:
+            print(f"\n요약:")
+            print(f"  총 run 개수: {len(summary_df)}")
+            
+            # run type별 개수
+            distill_count = len([name for name in summary_df['run_name'] if name.startswith('distill')])
+            naive_count = len([name for name in summary_df['run_name'] if name.startswith('naive')])
+            print(f"  distill runs: {distill_count}")
+            print(f"  naive runs: {naive_count}")
+            
+            # 상태별 개수
+            state_counts = summary_df['state'].value_counts()
+            print(f"  상태별 개수: {dict(state_counts)}")
+        
+        return
+    
+    # 새로운 그래프 생성 기능 처리
+    if args.plot_graphs:
+        print("Generating plots from summary data...")
+        csv_path = "validation_metrics_correlation_wandb_per_metric/runs_summary_organized.csv"
+        if not os.path.exists(csv_path):
+            csv_path = "runs_summary_organized.csv"
+        
+        if os.path.exists(csv_path):
+            output_dir = plot_summary_graphs(csv_path)
+            print(f"그래프 생성 완료! 결과는 '{output_dir}' 폴더에 저장되었습니다.")
+        else:
+            print(f"CSV 파일을 찾을 수 없습니다: {csv_path}")
+            print("먼저 --collect_summary를 실행해서 데이터를 수집하세요.")
+        return
+    
+    # TIMESTEP별 레이어 CE 분석 기능 처리
+    if args.analyze_layers:
+        print("Analyzing timestep-wise layer CE changes...")
+        csv_path = "validation_metrics_correlation_wandb_per_metric/runs_summary_organized.csv"
+        if not os.path.exists(csv_path):
+            csv_path = "runs_summary_organized.csv"
+        
+        if os.path.exists(csv_path):
+            output_dir = analyze_timestep_layer_ce(csv_path)
+            print(f"TIMESTEP별 레이어 CE 분석 완료! 결과는 '{output_dir}' 폴더에 저장되었습니다.")
+        else:
+            print(f"CSV 파일을 찾을 수 없습니다: {csv_path}")
+            print("먼저 --collect_summary를 실행해서 데이터를 수집하세요.")
+        return
+    
+    # Simple run selection logic inside this script:
+    # - If --ckpts is provided, search WandB project runs for names containing each checkpoint string and process matches
+    # - Else if --run_id provided, process that run
+    # - Else auto-detect latest finished run
+    api = wandb.Api()
+    project = 'jsh0423_/nvs-vggt-distill'
 
-    # Diagnostic: print available columns and non-null counts
-    print('Available columns in run history:')
-    for c in history.columns:
-        non_null = int(history[c].notna().sum())
-        print(f"  {c}: non-null={non_null}")
+    run_paths_to_process = []
 
-    # Compute and save correlation plot; receive selected good_cols and numeric df
-    good_cols, numeric_df = compute_and_save_correlation(history, args.out, args.output_postfix)
+    if args.ckpts:
+        ckpts = [s.strip() for s in args.ckpts.split(',') if s.strip()]
+        try:
+            runs = api.runs(project, per_page=200)
+            for ck in ckpts:
+                candidates = [r for r in runs if (str(ck) in (getattr(r, 'name', '') or '') or str(ck) in (getattr(r, 'displayName', '') or ''))]
+                if not candidates:
+                    print(f"No wandb runs found containing checkpoint '{ck}' in name")
+                    continue
+                picked = sorted(candidates, key=lambda r: getattr(r, 'created_at', None) or 0, reverse=True)[0]
+                run_paths_to_process.append(picked.path)
+                print(f"Found run for ckpt {ck}: {picked.path}")
+        except Exception as e:
+            print(f"[WARN] failed to search runs for ckpts: {e}")
+
+    if args.run_id:
+        run_paths_to_process.append(args.run_id if '/' in args.run_id else f"{project}/{args.run_id}")
+
+    if not run_paths_to_process:
+        try:
+            runs = api.runs(project, per_page=200)
+            finished = [r for r in runs if getattr(r, 'state', '') == 'finished']
+            if finished:
+                picked = sorted(finished, key=lambda r: getattr(r, 'created_at', None) or 0, reverse=True)[0]
+                run_paths_to_process.append(picked.path)
+                print(f"Auto-detected latest finished run: {picked.path}")
+        except Exception as e:
+            print(f"[WARN] failed to auto-detect run: {e}")
+
+    if not run_paths_to_process:
+        raise RuntimeError('No runs found to process. Provide --run_id or --ckpts')
+
+    for run_path in run_paths_to_process:
+        print(f"Fetching run metrics for: {run_path}")
+        try:
+            history = fetch_run_metrics(run_path)
+        except Exception as e:
+            print(f"Failed to fetch run {run_path}: {e}")
+            continue
+
+        # Diagnostic: print available columns and non-null counts
+        print('Available columns in run history:')
+        for c in history.columns:
+            non_null = int(history[c].notna().sum())
+            print(f"  {c}: non-null={non_null}")
+
+        try:
+            postfix = args.output_postfix or run_path.split('/')[-1]
+            compute_and_save_correlation(history, args.out, postfix)
+        except Exception as e:
+            print(f"Error processing run {run_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
 
     # Print summary (mean/std) only for good_cols
     # print('\nSummary for used columns:')

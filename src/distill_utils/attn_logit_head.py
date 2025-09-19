@@ -237,16 +237,6 @@ class HeadMlp_SoftArgmax(HeadMlp_Softmax):
         return x.flatten(-2,-1) # B 1 Q V*2
 
 
-LOGIT_HEAD_CLS = {
-    "identity": Identity,
-    "softmax": Softmax,
-    "softmax_headmean": Softmax_HeadMean,
-    "softmax_headmlp": Softmax_HeadMlp,
-    "headmlp_softmax": HeadMlp_Softmax,
-    # "headmlp": HeadMlp,
-    "headmlp_softargmax": HeadMlp_SoftArgmax,
-    "headmean_softargmax": HeadMean_SoftArgmax,
-}
 
 def cycle_consistency_checker(costmap, pixel_threshold=None):
     ''' costmap : [B, HW, (V-1)*HW]
@@ -284,6 +274,55 @@ def cycle_consistency_checker(costmap, pixel_threshold=None):
     final_distance_tensor = is_close.view(B, HW, 1)
 
     return final_distance_tensor
+
+
+from einops import rearrange
+class OneHot(nn.Module):
+    ''' non-differentiable, just for GT'''
+    def forward(self, x, num_view=None, consistency_pixel_threshold=1.5 ,**kwargs):
+        ''' x: B Head Q(f1HW) K(f2HW)
+        '''
+        f2 = num_view
+        B, Head, Q, K = x.shape
+        HW = K // f2
+        f1 = Q // HW
+        x = rearrange(x, "B Head (f1 HW1) (f2 HW2) -> (B Head f1 f2) HW1 HW2", B=B, Head=Head, f1=f1,f2=f2,HW1=HW, HW2=HW)
+
+        max_idx = torch.argmax(x, dim=-1)  # (..., q(HW))
+        mask_per_view = cycle_consistency_checker(x, consistency_pixel_threshold ) # (B Head F1 F2) HW1 1
+
+
+        
+
+        # mask_per_view = cycle_consistency_checker()
+
+        # def get_consistency_mask(logit):
+        #     # assert config.distill_config.distill_query == "target", "consistency check only support distill_query to target"
+        #     B, Head, F1HW, F2HW = logit.shape  
+        #     assert F1HW == F2HW, "first process full(square) consistency mask"
+        #     # assert Head == 1, "costmap should have only one head, while consistency checking?"
+        #     HW = F1HW // F
+        #     logit = einops.rearrange(logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1 F2) HW1 HW2', B=B,Head=Head, F1=F, F2=F, HW1=HW, HW2=HW)
+        #     mask_per_view = cycle_consistency_checker(logit, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1 F2) HW
+        #     mask_per_view = einops.rearrange(mask_per_view, '(B Head F1 F2) HW 1 -> B Head (F1 HW) (F2 1)', B=B, Head=Head, F1=F, F2=F, HW=HW)
+        #     # mask = mask.any(dim=-1) # B Head Q(F1HW) 
+        #     return mask_per_view # B Head Q(F1HW) F2
+
+
+        pass
+
+
+LOGIT_HEAD_CLS = {
+    "identity": Identity,
+    "softmax": Softmax,
+    "softmax_headmean": Softmax_HeadMean,
+    "softmax_headmlp": Softmax_HeadMlp,
+    "headmlp_softmax": HeadMlp_Softmax,
+    # "headmlp": HeadMlp,
+    "headmlp_softargmax": HeadMlp_SoftArgmax,
+    "headmean_softargmax": HeadMean_SoftArgmax,
+}
+
 
 
 

@@ -15,7 +15,7 @@ viz_query_xy: null
 viz_query_index: 150
 
 # shorthand: specify UNet layers using a range or list. examples: '2-12:2', '2,4,6'
-unet_layers: "2-12:2"
+unet_layers: "2-12:1"
 
 # optional pair defaults - override defaults for each generated pair
 pair_defaults:
@@ -30,5 +30,5 @@ pair_defaults:
   vggt_logit_head_kwargs:
     softmax_temp: 0.01
     num_view_for_per_view: 2
-  loss_softmax_mode: per_view
-  viz_softmax_mode: per_view
+  loss_softmax_mode: global
+  viz_softmax_mode: global

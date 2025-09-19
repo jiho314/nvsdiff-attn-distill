@@ -223,6 +223,10 @@ def main(nframe, cond_num, inference_view_range,
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     for idx, batch in enumerate(val_dataloader):
+        if config.unet_visualize.idx_set and idx not in config.unet_visualize.idx_set:
+            continue
+        elif config.unet_visualize.idx_set is None and idx < config.unet_visualize.start_data_idx:
+            continue
         parent_name = os.path.basename(os.path.dirname(resume_checkpoint))   # lr1_cosine_noema
         ckpt_name = os.path.basename(resume_checkpoint)                     # checkpoint-30000
         outdir_root = os.path.join("outputs_unet_attn", timestamp, parent_name, ckpt_name, f"{noise_timestep}", f"sample{idx}")
@@ -348,7 +352,8 @@ def main(nframe, cond_num, inference_view_range,
         if config.unet_visualize.save_stack:
             # Save stacked images (ref + tgt)
             save_image(images.squeeze(), os.path.join(outdir_root, f"VIS_STACKED.png"))
-        if idx == 50:
+ 
+        if config.unet_visualize.idx_set is None and idx >= config.unet_visualize.end_data_idx:
             break
         
 

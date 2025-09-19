@@ -580,12 +580,11 @@ def main():
         unet.vggt_logit_head = vggt_logit_head
         del vggt_logit_head, unet_logit_head
 
-        # Set Attention Cache for distillation
-        distill_student_unet_attn_layers = [p[0] for p in distill_pairs]
-        set_attn_cache(unet, distill_student_unet_attn_layers)
+        # # Set Attention Cache for distillation
+        # distill_student_unet_attn_layers = [p[0] for p in distill_pairs]
     else:
         distill_pairs = []
-        distill_student_unet_attn_layers = []
+        # distill_student_unet_attn_layers = []
         distill_cost_fn = None
         distill_loss_fn = None
         distill_loss_weight = 0.0
@@ -1078,6 +1077,13 @@ def main():
                 # Predict the noise residual and compute loss
                 # with torch.cuda.amp.autocast(enabled=True, dtype=weight_dtype):
                 clear_attn_cache(unet)
+                if do_attn_distill: # Cache mode selected
+                    distill_pairs = list(config.distill_config.distill_pairs).copy()
+                    # Random pair selection: VRAM Issue
+                    if config.distill_config.get('distill_pair_num', None) is not None:
+                        distill_pairs = random.sample(distill_pairs, config.distill_config.get('distill_pair_num'))
+                    distill_student_unet_attn_layers = [p[0] for p in distill_pairs]
+                    set_attn_cache(unet, distill_student_unet_attn_layers, print_=False)
                 model_pred = unet(inputs, timesteps, encoder_hidden_states, add_inputs=add_inputs,
                                     class_labels=class_labels, coords=coords, return_dict=False)[0]  # [BF,C,H,W]
                 model_pred = einops.rearrange(model_pred, "(b f) c h w -> b f c h w", f=f)
@@ -1102,7 +1108,7 @@ def main():
                         if config.get('use_vggt_point_map', False ):
                             batch['point_map'] = vggt_pred.get('world_points_from_depth', None)
 
-                    distill_vggt_gt = [p[1] for p in config.distill_config.distill_pairs]
+                    distill_vggt_gt = [p[1] for p in distill_pairs]
                     if "point_map" in distill_vggt_gt: # process point_map -> query / key tokens
                         point_map = batch["point_map"].to(device)  # b,f,3,h,w
                         assert point_map.shape[2] == 3, f"pointmap coord im should be on 2 (b,f,3,h,w) but {point_map.shape}"
@@ -1113,10 +1119,6 @@ def main():
                     with torch.autocast(device_type="cuda", dtype = torch.float32):
                         B, F, _, H, W = image.shape
                         unet_attn_cache = pop_cached_attn(unet)
-                        distill_pairs = config.distill_config.distill_pairs
-                        # Random pair selection: VRAM Issue
-                        if config.distill_config.get('distill_pair_num', None) is not None:
-                            distill_pairs = random.sample(distill_pairs, config.distill_config.get('distill_pair_num'))
                         for unet_layer, vggt_layer in distill_pairs:
                             '''
                                 gt(VGGT): query and key (B Head N(FHW) C) 
@@ -1145,7 +1147,7 @@ def main():
                                 gt_attn_logit = distill_cost_fn(gt_query, gt_key)
                             
                             # 2. Mask
-                            mask_per_view = torch.ones((B,Head,Q,F)).bool().to(device)
+                            # mask_per_view = torch.ones((B,Head,Q,F)).bool().to(device)
                             # (Option 1) Consistency Checker
                             if config.distill_config.get("consistency_check", False):
                                 def get_consistency_mask(logit):
@@ -1155,7 +1157,7 @@ def main():
                                     # assert Head == 1, "costmap should have only one head, while consistency checking?"
                                     HW = F1HW // F
                                     logit = einops.rearrange(logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1 F2) HW1 HW2', B=B,Head=Head, F1=F, F2=F, HW1=HW, HW2=HW)
-                                    mask_per_view = cycle_consistency_checker(logit, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1 F2) HW1 HW2
+                                    mask_per_view = cycle_consistency_checker(logit, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1 F2) HW 1
                                     mask_per_view = einops.rearrange(mask_per_view, '(B Head F1 F2) HW 1 -> B Head (F1 HW) (F2 1)', B=B, Head=Head, F1=F, F2=F, HW=HW)
                                     # mask = mask.any(dim=-1) # B Head Q(F1HW) 
                                     return mask_per_view # B Head Q(F1HW) F2
@@ -1173,18 +1175,31 @@ def main():
                                 for i in query_idx:
                                     a = attnmap_[:,:,[i]] # B Head 1 HW F HW
                                     k_id = key_idx.copy()
-                                    if (i in k_id) and exclude_selfattn: # remove self is necessary
+                                    if (i in k_id) and exclude_selfattn: # remove self if necessary
                                         k_id.remove(i)
                                     a = a[:,:,:,:,k_id] # B Head 1 HW f2 HW
                                     attnmap_sliced += [a]
                                 attnmap_sliced = torch.cat(attnmap_sliced, dim=2) # B Head f1 HW f2 HW
                                 f1, f2 = attnmap_sliced.shape[2], attnmap_sliced.shape[4] 
                                 attnmap_sliced = einops.rearrange(attnmap_sliced, 'B Head f1 HW f2 C -> B Head (f1 HW) (f2 C)', B=B, Head=Head, f1=f1, f2=f2, HW=HW, C=C)
-                                return attnmap_sliced, f1, f2  # B Head f1 HW f2 HW
+                                return attnmap_sliced, f1, f2  # B Head f1HW f2HW
                             
+
+                            distill_key_for_reference_query = list(config.distill_config.distill_key_for_reference_query).copy()
+                            distill_key_for_target_query = list(config.distill_config.distill_key_for_target_query).copy()
+                            # if save vram, select query type
+                            if len(distill_key_for_reference_query)>0 and len(distill_key_for_target_query) > 0 and  \
+                                config.distill_config.get('save_vram_query_axis', False):
+                                if random.random() > 0.5:
+                                    distill_key_for_reference_query.clear()
+                                else:
+                                    distill_key_for_target_query.clear()
+
+                                
+
                             # Reference Query Attnmap
                             ref_query_idx = list(range(random_cond_num))
-                            key_list = config.distill_config.distill_key_for_reference_query # among ["self", "reference","target"]
+                            key_list = distill_key_for_reference_query # among ["self", "reference","target"]
                             key_idx = []
                             if "reference" in key_list:
                                 key_idx += list(range(random_cond_num))
@@ -1204,12 +1219,13 @@ def main():
                                     - if softargmax: (always per_view == True)
                                         -- B Head Q K(V*2)
                                 '''
-                                # 3) apply masking (consistency)
-                                if config.distill_config.get("mask_per_view", False):
+                                # 3) apply consistency mask
+                                if config.distill_config.get("mask_per_view_consistency", False):
+                                    assert config.distill_config.get("mask_full_view_consistency", False) == False
                                     ref_pred = einops.rearrange(ref_pred, 'B Head f1HW (f2 C) -> B Head f1HW f2 C', f2 = f2)
                                     ref_gt =  einops.rearrange(ref_gt, 'B Head f1HW (f2 C) -> B Head f1HW f2 C', f2 = f2)
                                     ref_pred, ref_gt = ref_pred[ref_mask_per_view.bool()], ref_gt[ref_mask_per_view.bool()]
-                                else:
+                                elif config.distill_config.get("mask_full_view_consistency", False):
                                     ref_mask = ref_mask_per_view.any(dim=-1) # B Head f1HW f2 -> B Head f1HW
                                     ref_pred, ref_gt = ref_pred[ref_mask.bool()], ref_gt[ref_mask.bool()]
                                 # 4) loss
@@ -1219,7 +1235,7 @@ def main():
 
                             # Target Query Attnmap
                             tgt_query_idx = list(range(random_cond_num, F))
-                            key_list = config.distill_config.distill_key_for_target_query # among ["self", "reference","target"]
+                            key_list = distill_key_for_target_query # among ["self", "reference","target"]
                             key_idx = []
                             if "reference" in key_list:
                                 key_idx += list(range(random_cond_num))
@@ -1238,18 +1254,22 @@ def main():
                                     - if softargmax: (always per_view == True)
                                         -- B Head Q K(V*2)
                                 '''
-                                # 3) apply masking (consistency)
-                                if config.distill_config.get("mask_per_view", False):
+                                
+                                # 3) apply consistency mask
+                                if config.distill_config.get("mask_per_view_consistency", False):
+                                    assert config.distill_config.get("mask_full_view_consistency", False) == False
                                     tgt_pred = einops.rearrange(tgt_pred, 'B Head f1HW (f2 C) -> B Head f1HW f2 C', f2 = f2)
                                     tgt_gt =  einops.rearrange(tgt_gt, 'B Head f1HW (f2 C) -> B Head f1HW f2 C', f2 = f2)
                                     tgt_pred, tgt_gt = tgt_pred[tgt_mask_per_view.bool()], tgt_gt[tgt_mask_per_view.bool()]
-                                else:
+                                elif config.distill_config.get("mask_full_view_consistency", False):
                                     tgt_mask = tgt_mask_per_view.any(dim=-1) # B Head f1HW f2 -> B Head f1HW
                                     tgt_pred, tgt_gt = tgt_pred[tgt_mask.bool()], tgt_gt[tgt_mask.bool()]
+
                                 # 4) loss
                                 tgt_query_distill_loss = distill_loss_fn(tgt_pred.float(), tgt_gt.float(), **distill_loss_fn_config)
                             else:
                                 tgt_query_distill_loss = 0
+                                
                             distill_loss =  ref_query_distill_loss + tgt_query_distill_loss # TODO: weight?
                             if torch.isnan(distill_loss).any().item():
                                 accelerator.print("NaN in distill_loss, skip this layer distill...")
@@ -1417,7 +1437,7 @@ def main():
                         accelerator.log({"train/distill_loss_weighted": (distill_loss_weight * distill_loss).item()}, step=global_step)
                         accelerator.log(distill_loss_dict, step=global_step)
                         # softmax temperature info
-                        for unet_layer, vggt_layer in config.distill_config.distill_pairs:
+                        for unet_layer, vggt_layer in distill_pairs:
                             unet_layer_logit_head = unet.unet_logit_head[str(unet_layer)]
                             if hasattr(unet_layer_logit_head, 'softmax_temp'):
                                 t = unet_layer_logit_head.softmax_temp
@@ -1443,7 +1463,7 @@ def main():
                               pipeline=pipeline, weight_dtype=weight_dtype, batch=batch,
                               step=global_step, random_cond_num=random_cond_num,
                               device=device, vae=vae, nframe=f)
-                    set_attn_cache(unet, distill_student_unet_attn_layers, print_=False)
+                    # set_attn_cache(unet, distill_student_unet_attn_layers, print_=False)
                     del pipeline
                     torch.cuda.empty_cache()
                     gc.collect()
@@ -1488,7 +1508,7 @@ def main():
                     res = log_validation(accelerator=accelerator, config=config, args=args,
                                          pipeline=pipeline, val_dataloader=val_dataloader,
                                          step=global_step, device=device, vae=vae)
-                    set_attn_cache(unet, distill_student_unet_attn_layers, print_=False)
+                    # set_attn_cache(unet, distill_student_unet_attn_layers, print_=False)
                     
                     del pipeline
                     torch.cuda.empty_cache()

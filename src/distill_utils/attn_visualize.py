@@ -62,8 +62,9 @@ def get_attn_map_whole(attn_layer: torch.Tensor, background: np.ndarray) -> np.n
     # 1. Resize attn_layer to background size
     resize_transform = T.Resize(
         (H_large, W_large),
-        interpolation=T.InterpolationMode.BILINEAR,
-        antialias=True
+        # interpolation=T.InterpolationMode.BILINEAR,
+        interpolation=T.InterpolationMode.NEAREST,
+        # antialias=True
     )
     attn_resized = resize_transform(attn_layer.unsqueeze(0).unsqueeze(0))  # [1,1,H,W]
     attn_resized = attn_resized.squeeze().cpu().detach().numpy()           # [H, W]
@@ -179,8 +180,10 @@ def save_image_jinhk(images, target_idx, x_coord, y_coord, score):
     V_score = int(VfHW/fHW)
 
     if V_images != V_score: # cross_only
+        cross_only = True
         ref_image = torch.stack([images[i] for i in range(V_images) if i != target_idx], dim=0) # shape: [V-1, 3, 512, 512]
     else:
+        cross_only = False
         ref_image = images
     background = []
     HW, VHW = score.shape
@@ -193,13 +196,14 @@ def save_image_jinhk(images, target_idx, x_coord, y_coord, score):
     background = np.clip(background * 255.0, 0, 255).astype(np.uint8)
     
     attn_heatmap_img = get_attn_map_whole(score, background,)
-    # insert black image on the target image index t
+    # insert gray image on the target image index t
     # in the attn_heatmap_img
-    dummy_img = np.zeros((512, 512, 3), dtype=np.uint8)
-    attn_heatmap_img = np.concatenate(
-        [attn_heatmap_img[:, :512*(target_idx), :],
-         dummy_img,
-         attn_heatmap_img[:, 512*(target_idx):, :]], axis=1)
+    if cross_only:
+        dummy_img = np.ones((512, 512, 3), dtype=np.uint8) * 127
+        attn_heatmap_img = np.concatenate(
+            [attn_heatmap_img[:, :512*(target_idx), :],
+            dummy_img,
+            attn_heatmap_img[:, 512*(target_idx):, :]], axis=1)
     vis_list.append(Image.fromarray(attn_heatmap_img.astype(np.uint8)))
     combined_img = stitch_side_by_side_whole(vis_list)
 

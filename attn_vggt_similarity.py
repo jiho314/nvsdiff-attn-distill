@@ -153,9 +153,10 @@ def main(nframe, cond_num, inference_view_range,
                 dist = torch.norm(diff, dim=-1)
 
                 # Convert to probabilities (smaller distance = higher prob)
-                #logits = -torch.log(dist + 1e-6) / temperature
-                logits = -dist / temperature
+                logits = -torch.log(dist + 1e-6) / temperature
+                # logits = - dist / temperature
                 probs = slice_softmax(logits) if config.split else torch.softmax(logits, dim=-1)
+                import pdb; pdb.set_trace()
 
                 return probs.squeeze()
             query, key = resize_tok(gt_query, target_size=H), resize_tok(gt_key, target_size=W)  # B Head (FHW) C

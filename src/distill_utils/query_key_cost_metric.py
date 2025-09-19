@@ -37,6 +37,11 @@ def neg_log_l2_norm(query, key, eps=1e-6):
 def cosine_similarity(query, key):
     raise NotImplementedError("cosine similarity not implemented yet")
 
+
+def one_hot(query, key):
+    
+    pass
+
 COST_METRIC_FN ={
     "dot_product": dot_product,
     "neg_l2": neg_l2_norm,
