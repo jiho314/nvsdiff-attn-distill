@@ -44,7 +44,7 @@ from src.modules.schedulers import get_diffusion_scheduler
 from utils import get_lpips_score, _seq_name_to_seed
 
 from src.distill_utils.attn_logit_head import cycle_consistency_checker
-from src.distill_utils.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache
+from src.distill_utils.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache, set_feat_cache, unset_feat_cache, pop_cached_feat, clear_feat_cache
 from src.modules.timestep_sample import truncated_normal
 logger = get_logger(__name__, log_level="INFO")
 
@@ -590,7 +590,29 @@ def main():
         distill_loss_weight = 0.0
         distill_loss_fn_config = {}
         
+            
     # set feat cache for repa distill # JIHO TODO: repa     
+    if config.get('repa_config', None) is not None:
+        do_repa = len(config.repa_config.distill_layers) > 0
+    else:
+        do_repa = False
+
+    if do_repa:
+        assert config.vggt_on_fly == True, "use vggt dinov2 for now"
+        from src.distill_utils.attn_logit_head import build_mlp
+        from src.distill_utils.attn_processor_cache import SDXL_ATTN_DIM 
+        repa_feat_head = nn.ModuleDict()
+        for unet_layer in config.repa_config.distill_layers:
+            unet_feat_dim = SDXL_ATTN_DIM[int(unet_layer)]
+            repa_feat_head[str(unet_layer)] = build_mlp(unet_feat_dim, 1024, mlp_ratio = None,mlp_depth=1,  mid_dim=2048) # following repa
+        unet.repa_feat_head = repa_feat_head
+        del repa_feat_head
+        
+
+
+
+
+
 
     if args.use_ema:
         ema_unet = copy.deepcopy(unet)
@@ -1076,37 +1098,46 @@ def main():
 
                 # Predict the noise residual and compute loss
                 # with torch.cuda.amp.autocast(enabled=True, dtype=weight_dtype):
-                clear_attn_cache(unet)
                 if do_attn_distill: # Cache mode selected
                     distill_pairs = list(config.distill_config.distill_pairs).copy()
                     # Random pair selection: VRAM Issue
                     if config.distill_config.get('distill_pair_num', None) is not None:
                         distill_pairs = random.sample(distill_pairs, config.distill_config.get('distill_pair_num'))
                     distill_student_unet_attn_layers = [p[0] for p in distill_pairs]
+                    clear_attn_cache(unet)
                     set_attn_cache(unet, distill_student_unet_attn_layers, print_=False)
+                if do_repa:
+                    repa_layers = list(config.repa_config.distill_layers)
+                    clear_feat_cache(unet)
+                    set_feat_cache(unet, repa_layers)
                 model_pred = unet(inputs, timesteps, encoder_hidden_states, add_inputs=add_inputs,
                                     class_labels=class_labels, coords=coords, return_dict=False)[0]  # [BF,C,H,W]
                 model_pred = einops.rearrange(model_pred, "(b f) c h w -> b f c h w", f=f)
 
                 diff_loss = torch.nn.functional.mse_loss(model_pred.float()[:, random_cond_num:], target.float()[:, random_cond_num:], reduction="mean")
 
-                # JIHO TODO
+                loss = diff_loss
+
+                # VGGT 
+                if config.vggt_on_fly:
+                    with torch.no_grad():
+                        image = batch["image"].to(device)  #  0 1 tensor [B,F,3,H,W]
+                        vggt_pred = vggt_model(image) # jiho TODO make image [0,1]
+                        batch['vggt_attn_cache'] = vggt_pred['attn_cache']
+                    assert config.get('use_vggt_camera', False) != True, "use_vggt_camera while training not supproted! should be False"
+                    # if config.use_vggt_camera:
+                    #     batch['extrinsic'], batch['intrinsic'] = vggt_pred['extrinsic'], vggt_pred['intrinsic']  # currently using pointcloud from camera & depth ('world_points' to use pointmap pred)
+                    if config.get('use_vggt_point_map', False ):
+                        batch['point_map'] = vggt_pred.get('world_points_from_depth', None)
+                    if do_repa:
+                        batch['dino_feat'] = vggt_pred['dino_feat'] # B N C
+
                 # Distill Loss
                 if do_attn_distill:
                     distill_loss_dict = {}
                     distill_gt_dict = {}
-                    # VGGT Process (+ if needed, use vggt Camera)
                     if config.vggt_on_fly:
-                        with torch.no_grad():
-                            image = batch["image"].to(device)  #  0 1 tensor [B,F,3,H,W]
-                            vggt_pred = vggt_model(image) # jiho TODO make image [0,1]
-
-                        distill_gt_dict.update( vggt_pred['attn_cache'] ) 
-                        assert config.get('use_vggt_camera', False) != True, "use_vggt_camera while training not supproted! should be False"
-                        # if config.use_vggt_camera:
-                        #     batch['extrinsic'], batch['intrinsic'] = vggt_pred['extrinsic'], vggt_pred['intrinsic']  # currently using pointcloud from camera & depth ('world_points' to use pointmap pred)
-                        if config.get('use_vggt_point_map', False ):
-                            batch['point_map'] = vggt_pred.get('world_points_from_depth', None)
+                        distill_gt_dict.update( batch['vggt_attn_cache'] ) 
 
                     distill_vggt_gt = [p[1] for p in distill_pairs]
                     if "point_map" in distill_vggt_gt: # process point_map -> query / key tokens
@@ -1385,9 +1416,46 @@ def main():
                             #     continue
                             # distill_loss_dict[f"train/distill/unet{unet_layer}_vggt{vggt_layer}"] = distill_loss_fn(pred.float(), gt.float(), **distill_loss_fn_config)
                         distill_loss = sum(distill_loss_dict.values()) / len(distill_loss_dict.values()) if len(distill_loss_dict) > 0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
-                    loss = diff_loss + distill_loss * distill_loss_weight
-                else:
-                    loss = diff_loss
+                    loss = loss + distill_loss * distill_loss_weight
+                
+                if do_repa:
+                    B, F, _, H, W = image.shape
+                    unet_feat_cache = pop_cached_feat(unet)
+                    gt_feat = batch['dino_feat']
+                    repa_view = []
+                    if 'reference' in config.repa_config.distill_view:
+                        repa_view += list(range(random_cond_num))
+                    if 'target' in config.repa_config.distill_view:
+                        repa_view += list(range(random_cond_num, F))
+                    repa_view = sorted(repa_view)
+
+                    repa_loss_dict = {}
+                    for unet_layer in repa_layers:
+                        '''
+                            gt_feat (dino, from vggt): B F H W C
+                            pred(UNet): feat B (f hw) C
+                        '''
+                        # slice view
+                        gt_feat = gt_feat[:, repa_view]
+                        pred_feat = unet_feat_cache[str(unet_layer)] # B (f hw) C
+                        pred_feat = einops.rearrange(pred_feat, 'B (F HW) C -> B F HW C', F=F)[:, repa_view]
+                        _,_,pred_hw, pred_c = pred_feat.shape
+                        pred_h=pred_w = int(pred_hw**0.5)
+                        pred_feat= pred_feat.flatten(1,2)
+
+                        # resize gt -> unet
+                        gt_feat = einops.rearrange(gt_feat, 'B f H W C -> (B f) C H W', f =len(repa_view))
+                        gt_feat = torch.nn.functional.interpolate(gt_feat, size=(pred_h,pred_w), mode='bilinear')
+                        gt_feat = einops.rearrange(gt_feat, '(B f) C h w -> B (f h w) C', f = len(repa_view))
+
+                        # pred_feat
+                        pred_feat = unet.repa_feat_head[str(unet_layer)](pred_feat)
+                        pred_feat, gt_feat = torch.nn.functional.normalize(pred_feat, dim=-1), torch.nn.functional.normalize(gt_feat, dim= -1)
+                        repa_loss_dict[f"train/repa/unet{unet_layer}"] = - (gt_feat * pred_feat).sum(dim=-1).mean()
+                    repa_loss = sum(repa_loss_dict.values()) / len(repa_loss_dict.values()) if len(repa_loss_dict) >0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
+                    loss = loss + repa_loss * config.repa_config.distill_loss_weight
+
+
 
                 # DEBUG for NaN loss
                 if torch.isnan(loss).item():
@@ -1448,7 +1516,8 @@ def main():
                                 t = vggt_layer_logit_head.softmax_temp
                                 t = t.detach().cpu().item() if torch.is_tensor(t) else t
                                 accelerator.log({f"train/distill/vggt{vggt_layer}_temp": vggt_layer_logit_head.softmax_temp}, step=global_step)
-
+                    if do_repa:
+                        accelerator.log({"train/repa_loss": repa_loss.item()}, step = global_step)
                     # logger.info(f"Loss: {train_loss}")
 
                 if (global_step % args.train_log_interval == 0 or first_batch) and accelerator.is_main_process:
@@ -1457,7 +1526,8 @@ def main():
                         # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                         ema_unet.store(unet.parameters())
                         ema_unet.copy_to(unet.parameters())
-                    unset_attn_cache(unet)
+                    if do_attn_distill: unset_attn_cache(unet)
+                    if do_repa: unset_feat_cache(unet)
                     pipeline = get_pipeline(accelerator, config, vae, unet, weight_dtype)
                     log_train(accelerator=accelerator, config=config, args=args,
                               pipeline=pipeline, weight_dtype=weight_dtype, batch=batch,
@@ -1503,7 +1573,8 @@ def main():
                         # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                         ema_unet.store(unet.parameters())
                         ema_unet.copy_to(unet.parameters())
-                    unset_attn_cache(unet)
+                    if do_attn_distill: unset_attn_cache(unet)
+                    if do_repa: unset_feat_cache(unet)
                     pipeline = get_pipeline(accelerator, config, vae, unet, weight_dtype)
                     res = log_validation(accelerator=accelerator, config=config, args=args,
                                          pipeline=pipeline, val_dataloader=val_dataloader,

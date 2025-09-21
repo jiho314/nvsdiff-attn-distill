@@ -5,12 +5,16 @@ import numpy as np
 '''
 x = [B, Head, Q, K]
 '''
-def build_mlp(in_dim, out_dim, mlp_ratio=4.0, mlp_depth=1):
+def build_mlp(in_dim, out_dim, mlp_ratio=4.0, mlp_depth=1, mid_dim = None):
+    
     mlp = []
     if mlp_depth <= 0:
         mlp += [nn.Linear(in_dim, out_dim)]
     else:
-        mid_dim = int(in_dim * mlp_ratio)
+        if mid_dim is not None:
+            assert mlp_ratio is None
+        else:
+            mid_dim = int(in_dim * mlp_ratio)
         mlp += [nn.Linear(in_dim, mid_dim), nn.GELU()]
         for _ in range(mlp_depth - 1):
             mlp += [nn.Linear(mid_dim, mid_dim), nn.GELU()]

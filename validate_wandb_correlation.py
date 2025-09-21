@@ -631,7 +631,7 @@ def compute_and_save_correlation(history_df, out_path, output_postfix=None):
     return good_cols, numeric
 
 
-def collect_and_organize_runs_summary(project_name="jsh0423_/nvs-vggt-distill", run_name_prefixes=["distill", "naive"]):
+def collect_and_organize_runs_summary(project_name="jsh0423_/nvs-vggt-distill", run_name_prefixes=["EXP_val_run"]):
     """
     WandB에서 지정된 prefix(distill, naive)로 시작하는 모든 run을 가져와서 
     summary 데이터를 run별로 정리하여 반환하는 함수
@@ -1338,8 +1338,12 @@ def main():
                     print(f"No wandb runs found containing checkpoint '{ck}' in name")
                     continue
                 picked = sorted(candidates, key=lambda r: getattr(r, 'created_at', None) or 0, reverse=True)[0]
-                run_paths_to_process.append(picked.path)
-                print(f"Found run for ckpt {ck}: {picked.path}")
+                # Handle case where path is a list
+                path = picked.path
+                if isinstance(path, list):
+                    path = '/'.join(path)
+                run_paths_to_process.append(path)
+                print(f"Found run for ckpt {ck}: {path}")
         except Exception as e:
             print(f"[WARN] failed to search runs for ckpts: {e}")
 
@@ -1352,8 +1356,12 @@ def main():
             finished = [r for r in runs if getattr(r, 'state', '') == 'finished']
             if finished:
                 picked = sorted(finished, key=lambda r: getattr(r, 'created_at', None) or 0, reverse=True)[0]
-                run_paths_to_process.append(picked.path)
-                print(f"Auto-detected latest finished run: {picked.path}")
+                # Handle case where path is a list
+                path = picked.path
+                if isinstance(path, list):
+                    path = '/'.join(path)
+                run_paths_to_process.append(path)
+                print(f"Auto-detected latest finished run: {path}")
         except Exception as e:
             print(f"[WARN] failed to auto-detect run: {e}")
 

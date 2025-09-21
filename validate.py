@@ -688,7 +688,7 @@ def parse_args():
         ),
     )
     parser.add_argument("--val_cfg", type=float, default=1.0)
-    parser.add_argument("--viz_config_file", type=str, default=None, help="Path to YAML file containing visualize_config overrides")
+    parser.add_argument("--viz_config_file", type=str, required=True, help="Path to YAML file containing visualize_config (required)")
     parser.add_argument("--run_name", type=str, default=None, help="Run name to pass to the tracker (wandb)")
     parser.add_argument("--val_path", type=str, default=None)
     parser.add_argument("--log_every", type=int, default=20)
@@ -776,64 +776,18 @@ def main():
                                                 ignore_mismatched_sizes=True)
     unet.train()
 
-    ## Seonghu TODO: 임시 visualize config (default)
-    visualize_config = OmegaConf.create({        
-        # Loss 계산용 전역 설정
-        'loss_query': "target",      # loss 계산 시 사용할 query
-        'loss_key': "reference",     # loss 계산 시 사용할 key
-        'loss_steps': [40],          # loss 계산/수집에 사용할 스텝 (빈 리스트 = 모든 스텝)
-        
-        # Visualization용 전역 설정 (시각화에서만 사용)
-        'viz_query': "target",      # 시각화 시 사용할 query
-        'viz_key': "reference",     # 시각화 시 사용할 key (self attention 포함)        
-        'viz_steps': [40],            # visualization (images) 저장/생성 스텝, 빈 리스트 = 모든 스텝에서 시각화/로그, 아니면 명시된 스텝만 처리
-        'viz_log_wandb': True,
-        'viz_alpha': 0.6,
-        'viz_query_xy': None,       # None이면 랜덤 선택
-        'viz_query_index': 150,     # None이면 랜덤 선택
-        
-        # 각 Pair별 설정
-        'pairs': [
-            {
-                'unet_layer': l,
-                
-                # vggt Layer: "track_head", "point_head", any int
-                'vggt_layer': 'point_map',
-                
-                # Costmap metric for vggt: "neg_log_l2", "neg_l2", "inverse_l2", "dot_product"
-                'costmap_metric': 'neg_log_l2',
-                
-                # format: {'unet_layer': int, 'vggt_layer': str_or_int, 'costmap_metric': str, 'loss_fn': str or dict}
-                # `loss_fn` may be either a string (base name) or a dict: {'fn': '<base>', 'head_mean': 'pre'|'post'|None}
-                # IF YOU WANT PER-HEAD LOSS, SET 'head_mean' TO NONE
-                'loss_fn': {'fn': 'cross_entropy', 'head_mean': None},
-                
-                # if 
-                'unet_logit_head_kwargs': {'softmax_temp': 1.0, 'num_view_for_per_view': 2},
-                'vggt_logit_head_kwargs': {'softmax_temp': 0.01, 'num_view_for_per_view': 2},
-                
-                # Note that softmax head for visualization is always Softmax_HeadMean, 
-                # and other configs are from unet_logit_head_kwargs and vggt_logit_head_kwargs
-                # You only can choose viz_softmax_mode from 'per_view' or 'global'
-                'loss_softmax_mode': 'per_view',
-                'viz_softmax_mode': 'per_view',
-            }
-            for l in list((2,4,6,8,10,12))
-        ],
-    })
 
-    # If a viz config file is provided, load it and update visualize_config
-    if args.viz_config_file is not None:
-        if os.path.exists(args.viz_config_file):
-            try:
-                loaded = OmegaConf.load(args.viz_config_file)
-                # Merge loaded config into visualize_config, prefer loaded values
-                visualize_config = OmegaConf.to_container(OmegaConf.merge(OmegaConf.create(visualize_config), loaded), resolve=True)
-            except Exception as e:
-                print(f"Failed to load viz_config_file {args.viz_config_file}: {e}")
-                raise
-        else:
-            raise FileNotFoundError(f"viz_config_file not found: {args.viz_config_file}")
+    # Load visualize_config from required config file (no defaults)
+    if not os.path.exists(args.viz_config_file):
+        raise FileNotFoundError(f"viz_config_file not found: {args.viz_config_file}")
+    
+    try:
+        visualize_config = OmegaConf.to_container(OmegaConf.load(args.viz_config_file), resolve=True)
+    except Exception as e:
+        raise ValueError(f"Failed to load viz_config_file {args.viz_config_file}: {e}")
+    
+    if not isinstance(visualize_config, dict) or not visualize_config:
+        raise ValueError("visualize_config must be a non-empty dictionary")
 
     # Support shorthand specification for UNet layers in visualize_config.
     # If `unet_layers` is provided and `pairs` is missing or empty, expand it.
@@ -867,15 +821,10 @@ def main():
             layers = _parse_unet_layers_spec(visualize_config.get('unet_layers'))
             defaults = visualize_config.get('pair_defaults', None)
             if defaults is None:
-                defaults = {
-                    'vggt_layer': 'point_map',
-                    'costmap_metric': 'neg_log_l2',
-                    'loss_fn': {'fn': 'cross_entropy', 'head_mean': None},
-                    'unet_logit_head_kwargs': {'softmax_temp': 1.0, 'num_view_for_per_view': 2},
-                    'vggt_logit_head_kwargs': {'softmax_temp': 0.01, 'num_view_for_per_view': 2},
-                    'loss_softmax_mode': 'per_view',
-                    'viz_softmax_mode': 'per_view'
-                }
+                raise ValueError(
+                    "visualize_config에서 'unet_layers'를 사용할 때 'pair_defaults'가 필수입니다. "
+                    "pair_defaults를 반드시 제공해야 합니다."
+                )
 
             pairs = []
             for l in layers:
@@ -902,6 +851,7 @@ def main():
     print(f"Number of unet attention layers: {len(list(unet.attn_processors.keys()))}")
     set_attn_cache(unet, visualize_student_unet_attn_layers)
   
+    print(f"visualize config: {visualize_config}")
   
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -913,7 +863,7 @@ def main():
     from src.datasets.re10k_wds import build_re10k_wds
 
     val_wds_dataset_config = {'url_paths': [ "/mnt/data2/minseop/realestate_val_wds", ],
-        'dataset_length': 53,
+        'dataset_length': 200,
         'resampled': False,
         'shardshuffle': False,
         'num_viewpoints': 3,

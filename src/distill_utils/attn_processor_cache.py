@@ -12,6 +12,7 @@ from my_diffusers.models.attention_processor import AttnProcessor2_0
 # Attn Head Num: [5,5,10,10,20,20] [20] [20,20,20, 10,10,10, 5,5,5]
 
 SDXL_ATTN_DIM = [320, 320, 640, 640, 1280, 1280, 1280, 1280, 1280, 1280, 640, 640, 640, 320, 320, 320]
+SDXL_FEAT_DIM = []
 SDXL_ATTN_HEAD_NUM = [5,5,10,10,20,20, 20, 20,20,20,10,10,10,5,5,5]
 
 def print_attn_cache_setting(unet):
@@ -55,7 +56,7 @@ def clear_attn_cache(unet):
         unet.attn_processors[name].cache['attn'].clear()
     torch.cuda.empty_cache()
 
-
+# Feat
 def print_feat_cache_setting(unet):
     attn_proc_names = sorted(list(unet.attn_processors.keys()))
     for i, name in enumerate(attn_proc_names):
@@ -65,7 +66,7 @@ def set_feat_cache( unet,  cache_layers = [] ):
     attn_proc_names = sorted(list(unet.attn_processors.keys()))
     for i, name in enumerate(attn_proc_names):
         if i in cache_layers:
-            print(f"Cache feat layer: {name}")
+            # print(f"Cache feat layer: {name}")
             unet.attn_processors[name].cache_feat = True
         else:
             unet.attn_processors[name].cache_feat = False
@@ -88,3 +89,9 @@ def pop_cached_feat(unet):
             assert len(cache_list) == 1, f"Expected single cached feature tensor, got {len(cache_list)}"
             block_feat_cache[str(i)] = cache_list.pop()
     return block_feat_cache
+
+def clear_feat_cache(unet):
+    attn_proc_names = sorted(list(unet.attn_processors.keys()))
+    for i, name in enumerate(attn_proc_names):
+        unet.attn_processors[name].cache['feat'].clear()
+    torch.cuda.empty_cache()

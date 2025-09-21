@@ -2,8 +2,8 @@
 
 # ... existing code ...
 # NEW FILE CONTENTS
-loss_query: target
-loss_key: reference
+loss_query: all
+loss_key: all
 loss_steps: [40]
 
 viz_query: target
@@ -30,5 +30,5 @@ pair_defaults:
   vggt_logit_head_kwargs:
     softmax_temp: 0.01
     num_view_for_per_view: 2
-  loss_softmax_mode: global
-  viz_softmax_mode: global
+  loss_softmax_mode: per_view # global
+  viz_softmax_mode: per_view # global

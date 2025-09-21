@@ -9,7 +9,7 @@ CKPTS="${CKPTS:-2000,4000,8000,10000,12000,16000}"
 
 for ckpt in $(echo "$CKPTS" | tr ',' ' '); do
     CKPT_NAME="checkpoint-${ckpt}"
-    RUN_NAME="naive_global_val_run_${ckpt}_$(date +%Y%m%d_%H%M%S)"
+    RUN_NAME="EXP_val_run_${ckpt}_$(date +%Y%m%d_%H%M%S)"
     export RUN_NAME
     CUDA_VISIBLE_DEVICES=2 accelerate launch --mixed_precision="fp16" \
                         --num_processes=1 \

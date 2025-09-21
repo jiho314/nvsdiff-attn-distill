@@ -119,7 +119,7 @@ def main(nframe, cond_num, inference_view_range,
             gt_attn_logit = query @ key.transpose(-1, -2)
             gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx=query_idx, key_idx=key_idx)
             attn_maps = gt_attn_logit.squeeze()
-            all_scores = slice_softmax(attn_maps / 8) if config.split else torch.softmax(attn_maps / 8, dim=-1)
+            all_scores = slice_softmax(attn_maps / 8) if config.per_view else torch.softmax(attn_maps / 8, dim=-1)
             #all_scores = torch.softmax(attn_maps / 8, dim=-1)
         elif mode == "attention":
             query, key = resize_tok(gt_query, target_size=H), resize_tok(gt_key, target_size=W),
@@ -127,7 +127,7 @@ def main(nframe, cond_num, inference_view_range,
             gt_attn_logit = slice_attnmap(gt_attn_logit, query_idx=query_idx, key_idx=key_idx)
             attn_maps = gt_attn_logit.mean(dim=1) # average over head
             attn_maps = attn_maps.squeeze()
-            all_scores = slice_softmax(attn_maps / 8) if config.split else torch.softmax(attn_maps / 8, dim=-1)
+            all_scores = slice_softmax(attn_maps / 8) if config.per_view else torch.softmax(attn_maps / 8, dim=-1)
         elif mode == "pointmap":
             def distance_softmax(query_points, ref_points, temperature=1.0, cross_only=True):
                 """
@@ -439,6 +439,7 @@ def main(nframe, cond_num, inference_view_range,
             else:
                 key_idx = list(range(nframe))
             unet_attn_logit = slice_attnmap(unet_attn_logit, query_idx=query_idx, key_idx=key_idx) # [B, H, Q, K]
+            import pdb; pdb.set_trace()
             # average over head
             unet_attn_logit = unet_attn_logit.mean(dim=1)   # [B, Q, K]
             unet_attn_logit = unet_attn_logit[0]                  # take batch 0 → [Q, K]
@@ -482,7 +483,7 @@ def main(nframe, cond_num, inference_view_range,
             # combined_img.save(f"{outdir}/attn{unet_layer}.png")
 
             score_vggt = score_vggt.to(device)
-            if config.split: 
+            if config.per_view: 
                 pass
                 if config.similarity_measure == "cross_entropy":
                     eps = 1e-12

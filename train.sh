@@ -2,14 +2,14 @@
 
 # export WANDB_API_KEY='4ab8d4a0db9aec6c80956ccf58616de15392a463'
 export WANDB_API_KEY='3177b4c2c8cf009d18dc8cfc41cfa1d2fc813f67'
-CUDA_VISIBLE_DEVICES=4 accelerate launch --mixed_precision="fp16" \
+CUDA_VISIBLE_DEVICES=1 accelerate launch --mixed_precision="fp16" \
                   --num_processes=1 \
                   --num_machines 1 \
                   --main_process_port 29443 \
                   --config_file configs/deepspeed/acc_zero2.yaml train.py \
                   --tracker_project_name "nvs-vggt-distill" \
-                  --config_file="configs/cat3d_distill.yaml" \
-                  --output_dir="check_points/cat3d_distill" \
+                  --config_file="configs/cat3d_repa.yaml" \
+                  --output_dir="check_points/repa_debug" \
                   --train_log_interval=500000000000 \
                   --val_interval=200 \
                   --val_cfg=2.0 \
@@ -17,7 +17,7 @@ CUDA_VISIBLE_DEVICES=4 accelerate launch --mixed_precision="fp16" \
                   --log_every 1 \
                   --seed 0 \
                   --no_val \
-                  --run_name debugging \
+                  --run_name repa_debug \
                 #   --use_ema \
                 #   --ema_decay_step=30 \
                 #   --ema_decay=0.9995 \
