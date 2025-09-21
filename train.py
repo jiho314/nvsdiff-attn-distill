@@ -1452,6 +1452,7 @@ def main():
                         pred_feat = unet.repa_feat_head[str(unet_layer)](pred_feat)
                         pred_feat, gt_feat = torch.nn.functional.normalize(pred_feat, dim=-1), torch.nn.functional.normalize(gt_feat, dim= -1)
                         repa_loss_dict[f"train/repa/unet{unet_layer}"] = - (gt_feat * pred_feat).sum(dim=-1).mean()
+                        import pdb ; pdb.set_trace()
                     repa_loss = sum(repa_loss_dict.values()) / len(repa_loss_dict.values()) if len(repa_loss_dict) >0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
                     loss = loss + repa_loss * config.repa_config.distill_loss_weight
 
@@ -1518,6 +1519,8 @@ def main():
                                 accelerator.log({f"train/distill/vggt{vggt_layer}_temp": vggt_layer_logit_head.softmax_temp}, step=global_step)
                     if do_repa:
                         accelerator.log({"train/repa_loss": repa_loss.item()}, step = global_step)
+                        accelerator.log(repa_loss_dict, step = global_step)
+                        
                     # logger.info(f"Loss: {train_loss}")
 
                 if (global_step % args.train_log_interval == 0 or first_batch) and accelerator.is_main_process:

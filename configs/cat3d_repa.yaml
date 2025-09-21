@@ -2,10 +2,15 @@
 
 # Distill 
 distill_config:
-  distill_pairs:  [] # student(unet)(down_blocks(6), mid_block(1), up_blocks(9)), teacher(vggt)(0~23, "track_head", "point_head")
-  distill_pair_num: null
+  distill_pairs:  [
+    [2, "point_map"],
+    [4, "point_map"],
+    [7, "point_map"],
+    [10, "point_map"],
+  ] # student(unet)(down_blocks(6), mid_block(1), up_blocks(9)), teacher(vggt)(0~23, "track_head", "point_head")
+  distill_pair_num: 1
   # unet: [64,64,32,32,16,16] [8] [16,16,16,32,32,32,64,64,64]
-  distill_loss_weight: 0.0 # 0.05 per layer 
+  distill_loss_weight: 0.02 # 0.05 per layer 
   distill_loss_fn: "cross_entropy"  # "cross_entropy", "l1", ...
   vggt_logit_head: "softmax_headmean"  # "softmax_headmean", "identity", "softmax_headmlp"
   vggt_logit_head_kwargs: {"per_view":True, "softmax_temp": 0.01}

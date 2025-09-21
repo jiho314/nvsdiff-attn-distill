@@ -12,7 +12,6 @@ from my_diffusers.models.attention_processor import AttnProcessor2_0
 # Attn Head Num: [5,5,10,10,20,20] [20] [20,20,20, 10,10,10, 5,5,5]
 
 SDXL_ATTN_DIM = [320, 320, 640, 640, 1280, 1280, 1280, 1280, 1280, 1280, 640, 640, 640, 320, 320, 320]
-SDXL_FEAT_DIM = []
 SDXL_ATTN_HEAD_NUM = [5,5,10,10,20,20, 20, 20,20,20,10,10,10,5,5,5]
 
 def print_attn_cache_setting(unet):
