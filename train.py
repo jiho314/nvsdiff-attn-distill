@@ -46,6 +46,7 @@ from utils import get_lpips_score, _seq_name_to_seed
 from src.distill_utils.attn_logit_head import cycle_consistency_checker
 from src.distill_utils.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache, set_feat_cache, unset_feat_cache, pop_cached_feat, clear_feat_cache
 from src.modules.timestep_sample import truncated_normal
+
 logger = get_logger(__name__, log_level="INFO")
 
 
@@ -561,6 +562,7 @@ def main():
         distill_cost_fn = COST_METRIC_FN[distill_config.cost_metric.lower()]
         
         from src.distill_utils.attn_distill_loss import ATTN_LOSS_FN
+        from src.distill_utils.attn_distill_loss import cosine_loss_weight_scheduler
         distill_loss_fn = ATTN_LOSS_FN[distill_config.distill_loss_fn.lower()]
         distill_loss_weight = config.distill_config.distill_loss_weight
         distill_loss_fn_config = config.distill_config.get('distill_loss_fn_config', {})
@@ -1180,7 +1182,8 @@ def main():
                             # 2. Mask
                             # mask_per_view = torch.ones((B,Head,Q,F)).bool().to(device)
                             # (Option 1) Consistency Checker
-                            if config.distill_config.get("consistency_check", False):
+                            assert config.distill_config.get("consistency_check", True) is True
+                            if config.distill_config.get("consistency_check", True):
                                 def get_consistency_mask(logit):
                                     # assert config.distill_config.distill_query == "target", "consistency check only support distill_query to target"
                                     B, Head, F1HW, F2HW = logit.shape  
@@ -1416,6 +1419,12 @@ def main():
                             #     continue
                             # distill_loss_dict[f"train/distill/unet{unet_layer}_vggt{vggt_layer}"] = distill_loss_fn(pred.float(), gt.float(), **distill_loss_fn_config)
                         distill_loss = sum(distill_loss_dict.values()) / len(distill_loss_dict.values()) if len(distill_loss_dict) > 0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
+                    
+                    if config.distill_config.get("distill_loss_weight_scheduling", None) is not None:
+                        if config.distill_config.distill_loss_weight_scheduling == "cosine":
+                            distill_loss_weight = cosine_loss_weight_scheduler(global_step, **config.distill_config.distill_loss_weight_scheduling_config )
+                        else:
+                            raise NotImplementedError
                     loss = loss + distill_loss * distill_loss_weight
                 
                 if do_repa:
@@ -1452,7 +1461,6 @@ def main():
                         pred_feat = unet.repa_feat_head[str(unet_layer)](pred_feat)
                         pred_feat, gt_feat = torch.nn.functional.normalize(pred_feat, dim=-1), torch.nn.functional.normalize(gt_feat, dim= -1)
                         repa_loss_dict[f"train/repa/unet{unet_layer}"] = - (gt_feat * pred_feat).sum(dim=-1).mean()
-                        import pdb ; pdb.set_trace()
                     repa_loss = sum(repa_loss_dict.values()) / len(repa_loss_dict.values()) if len(repa_loss_dict) >0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
                     loss = loss + repa_loss * config.repa_config.distill_loss_weight
 

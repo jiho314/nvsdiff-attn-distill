@@ -38,8 +38,13 @@ def cosine_similarity(query, key):
     raise NotImplementedError("cosine similarity not implemented yet")
 
 
-def one_hot(query, key):
-    
+def l2_norm_onehot(query, key):
+    '''
+    query: (B, Head, Q, C) or (..., Q, C)
+    key:   (B, Head, K, C) or (..., K, C)
+    '''
+    diff = query.unsqueeze(-2) - key.unsqueeze(-3)
+    dist = torch.norm(diff, dim=-1)
     pass
 
 COST_METRIC_FN ={

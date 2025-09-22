@@ -5,11 +5,11 @@ export WANDB_API_KEY='5e4d6a67a9287ff9ad9b05ccc97582fcb1d48dfe' # seonghu, for d
 # Temporary visualize config for attention map visualization
 
 # Allow passing multiple checkpoints as comma-separated list via CKPTS env var
-CKPTS="${CKPTS:-2000,4000,8000,10000,12000,16000}"
+CKPTS="${CKPTS:-2000,4000,8000,16000,32000,64000}"
 
 for ckpt in $(echo "$CKPTS" | tr ',' ' '); do
     CKPT_NAME="checkpoint-${ckpt}"
-    RUN_NAME="EXP_val_run_${ckpt}_$(date +%Y%m%d_%H%M%S)"
+    RUN_NAME="FINAL_NAIVE_VAL${ckpt}_$(date +%Y%m%d_%H%M%S)"
     export RUN_NAME
     CUDA_VISIBLE_DEVICES=2 accelerate launch --mixed_precision="fp16" \
                         --num_processes=1 \
@@ -20,7 +20,7 @@ for ckpt in $(echo "$CKPTS" | tr ',' ' '); do
                         --seed 0 \
                         --run_name "$RUN_NAME" \
                         --viz_config_file "configs/visualize_val.yaml" \
-                        --val_path="/mnt/data2/nvs-data/diff-distill/check_points/distill_0917_point_3sharpmlp" \
+                        --val_path="/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/0919_naive_b3_lr2.5" \
                         --validation_checkpoint="$CKPT_NAME" \
                         --val_cfg=2.0 \
                         --visualize_attention_maps

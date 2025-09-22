@@ -28,3 +28,17 @@ ATTN_LOSS_FN = {
     "kl_divergence": kl_divergence,
     # "soft_argmax": soft_argmax,
 }
+
+import math
+def cosine_loss_weight_scheduler(step: int, start_w: float, end_w: float, end_step: int) -> float:
+    """
+    Cosine interpolation from start_w -> end_w over [0, end_step].
+    For step >= end_step returns end_w.
+    """
+    if end_step is None or end_step <= 0:
+        return end_w
+    if step >= end_step:
+        return end_w
+    t = step / float(end_step)  # in [0,1)
+    # classic cosine: at t=0 -> start_w, at t=1 -> end_w
+    return end_w + 0.5 * (start_w - end_w) * (1.0 + math.cos(math.pi * t))

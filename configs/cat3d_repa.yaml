@@ -40,7 +40,7 @@ repa_config:
   
 
 # vggt
-vggt_on_fly : true
+vggt_on_fly : false
 use_vggt_camera : false
 
 nframe: 4

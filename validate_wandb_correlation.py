@@ -631,7 +631,7 @@ def compute_and_save_correlation(history_df, out_path, output_postfix=None):
     return good_cols, numeric
 
 
-def collect_and_organize_runs_summary(project_name="jsh0423_/nvs-vggt-distill", run_name_prefixes=["EXP_val_run"]):
+def collect_and_organize_runs_summary(project_name="jsh0423_/nvs-vggt-distill", run_name_prefixes=["FINAL_NAIVE_VAL"]):
     """
     WandB에서 지정된 prefix(distill, naive)로 시작하는 모든 run을 가져와서 
     summary 데이터를 run별로 정리하여 반환하는 함수

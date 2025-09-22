@@ -63,12 +63,22 @@ def concat_vertical(pil_images):
         y += im.size[1]
     return canvas
 
+def seed_everything(seed):
+    import random
+
+    import numpy as np
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed % (2**32))
+    random.seed(seed)
+
 def main(nframe, cond_num, inference_view_range, 
          caching_unet_attn_layers, noise_timestep, 
          resume_checkpoint, config, rank = 0):
     # args, _, cfg = parse_args()
 
-    set_seed(0)
+    seed_everything(0)
     device= f"cuda"
     # 1) model
     vae = AutoencoderKL.from_pretrained(f"{config.pretrained_model_name_or_path}", subfolder="vae").to(device)
@@ -102,8 +112,9 @@ def main(nframe, cond_num, inference_view_range,
     # checkpoint load
     
     # reload weights for unet here
-    weights = torch.load(f"{resume_checkpoint}/pytorch_model/mp_rank_00_model_states.pt", map_location="cpu")
-    unet.load_state_dict(weights['module'], strict=False)  # we usually need to resume partial weights here
+    if not config.unet_visualize.is_scratch:
+        weights = torch.load(f"{resume_checkpoint}/pytorch_model/mp_rank_00_model_states.pt", map_location="cpu")
+        unet.load_state_dict(weights['module'], strict=False)  # we usually need to resume partial weights here
     
     # if args.use_ema:
     #     if os.path.exists(f"{resume_checkpoint}/ema_unet.pt"):
@@ -200,7 +211,7 @@ def main(nframe, cond_num, inference_view_range,
 
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-        inputs = noisy_latents  # [B,F,4,h,w]
+        inputs = latents * (1 - latent_masks) + noisy_latents * latent_masks  # [B,F,4,h,w]
         add_inputs = torch.cat([masks, camera_embedding], dim=2)  # [B,F,1+6,H,W]
 
         # get class label (domain switcher)
@@ -331,14 +342,15 @@ def main(nframe, cond_num, inference_view_range,
                         key_idx = list(range(nframe))               # refs + all frames
 
                     sliced = slice_attnmap(unet_attn_logit, query_idx=query_idx, key_idx=key_idx)  # [B, H, Q, K]
-                    attn_maps = sliced.mean(dim=1)[0]  # [Q, K] head-avg, take batch 0
+                    # attn_maps = sliced.mean(dim=1)[0]  # [Q, K] head-avg, take batch 0
+                    attn_maps = sliced[0] # softmax -> head-mean
 
-                    query_size = int(math.sqrt(attn_maps.shape[0]))
+                    query_size = int(math.sqrt(attn_maps.shape[1]))
                     y_feat_cost = int((y_coord / 512) * query_size)
                     x_feat_cost = int((x_coord / 512) * query_size)
                     query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
 
-                    all_scores = torch.softmax(attn_maps[query_token_idx_cost], dim=-1)  # [K]
+                    all_scores = torch.softmax(attn_maps[:, query_token_idx_cost], dim=-1).mean(dim=0)  # [K]
                     tokens_per_img = query_size * query_size
                     scores_split = all_scores.split(tokens_per_img)
                     # Concatenate attention maps horizontally for each key frame

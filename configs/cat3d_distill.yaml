@@ -24,6 +24,12 @@ distill_config:
   distill_key_for_reference_query: [ "reference","target" ] # ["reference", "target", "self"] 
   distill_key_for_target_query: [  "reference","target"] # ["reference", "target", "self"]
 
+  distill_loss_weight_scheduling: "cosine"
+  distill_loss_weight_scheduling_config: 
+    start_w: 0.02
+    end_w: 0.01
+    end_step: 10000
+
   # masking option
   mask_per_view : False  # if logit_head using per_view, mask_per_view should be applied 
 

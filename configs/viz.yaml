@@ -158,11 +158,16 @@ unet_visualize:
   noise_timestep: 999 #(0, 999)
   inference_view_range: 25
   cond_num: 2 #reference num
-  resume_checkpoint: '/mnt/data2/nvs-data/diff-distill/check_points/naive_0915/checkpoint-20000'
+  # resume_checkpoint: '/mnt/data2/nvs-data/diff-distill/check_points/naive_0915/checkpoint-20000'
+  # resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/0919_naive_b3_lr2.5/checkpoint-70000'
+  # resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/0919_distill_perview_Lfull/checkpoint-70000'
+  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/0920_distill_perview_mlp_3/checkpoint-60000'
   save_originals: false
   save_stack: true
   per_view: false
   ref_tgt_split_softmax: false
   start_data_idx: 51
   end_data_idx: 100
-  idx_set: [0] #[0, 5, 14, 29, 55, 60] # if empty, use all indices in the dataset
+  is_scratch: false
+  idx_set: [0, 13, 36, 41, 65, 73, 75, 80, 90] # if empty, use all indices in the dataset
+  # good example: 0, 36, 73
