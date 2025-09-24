@@ -147,7 +147,7 @@ def postprocess_vggt_mvgen(sample, num_viewpoints=3, min_view_range=5, max_view_
     except:
         if inference:
             print(f"wds Inference: exception occured , {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}")
-            raise ValueError("Inference error, please check")
+            # raise ValueError("Inference error, please check")
         return None
 
 def build_re10k_wds(

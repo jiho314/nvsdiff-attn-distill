@@ -47,6 +47,8 @@ from src.distill_utils.attn_logit_head import cycle_consistency_checker
 from src.distill_utils.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache, set_feat_cache, unset_feat_cache, pop_cached_feat, clear_feat_cache
 from src.modules.timestep_sample import truncated_normal
 
+from src.datasets import shuffle_batch, uniform_push_batch
+
 logger = get_logger(__name__, log_level="INFO")
 
 
@@ -80,42 +82,6 @@ logger = get_logger(__name__, log_level="INFO")
 
 #     return batch
 
-
-def shuffle_batch(batch):
-    ''' Caution data_name with "key" is not shuffled
-    '''
-    img = batch["image"]  # [B,F,3,H,W]
-    B,F,_,H,W = img.shape
-    perm = torch.randperm(F)
-    
-    # for key in data_keys:
-    #     batch[key] = batch[key][:, perm]
-    # batch["image"] = img[:, perm]
-    # batch["intrinsic"] = batch["intrinsic"][:, perm]
-    # batch["extrinsic"] = batch["extrinsic"][:, perm]
-    return batch
-
-def uniform_push_batch(batch, random_cond_num=0):
-    ''' Caution data_name with "key" is not applied
-     1) uniformly sample target idx
-     2) push target views to last
-    '''
-    if random_cond_num == 1:
-        return batch
-    img = batch["image"]  # [B,F,3,H,W]
-    B,F,_,H,W = img.shape
-    target_num = F - random_cond_num
-    idx = torch.arange(F)
-    tgt_idx = torch.linspace(1, F-2, target_num, dtype=torch.long)
-    ref_idx = idx[~torch.isin(idx, tgt_idx)]
-    new_idx = torch.cat([ref_idx, tgt_idx], dim=0)[:F]  # in case target_num +2 > F
-
-    for k in batch.keys():
-        data = batch[k]
-        if torch.is_tensor(data):
-            if data.ndim >= 2:
-                batch[k] = batch[k][:, new_idx]
-    return batch
 
 def slice_vae_encode(vae, image, sub_size):  # vae fails to encode large tensor directly, we need to slice it
     with torch.no_grad(), torch.autocast("cuda", enabled=True):

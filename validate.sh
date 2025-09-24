@@ -5,7 +5,7 @@ export WANDB_API_KEY='5e4d6a67a9287ff9ad9b05ccc97582fcb1d48dfe' # seonghu, for d
 # Temporary visualize config for attention map visualization
 
 # Allow passing multiple checkpoints as comma-separated list via CKPTS env var
-CKPTS="${CKPTS:-2000,4000,8000,16000,32000,64000}"
+CKPTS="${CKPTS:-64000}"
 
 for ckpt in $(echo "$CKPTS" | tr ',' ' '); do
     CKPT_NAME="checkpoint-${ckpt}"

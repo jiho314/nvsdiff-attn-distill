@@ -232,16 +232,19 @@ def main(nframe, cond_num, inference_view_range,
     
     
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    parent_name = os.path.basename(os.path.dirname(resume_checkpoint))   # lr1_cosine_noema
+    ckpt_name = os.path.basename(resume_checkpoint)                     # checkpoint-30000
+    outdir_root = os.path.join("outputs_unet_attn", timestamp, parent_name, ckpt_name, f"{noise_timestep}")
+    os.makedirs(outdir_root, exist_ok=True)
 
     for idx, batch in enumerate(val_dataloader):
+        if config.unet_visualize.idx_set:
+            end_idx = config.unet_visualize.idx_set[-1]
         if config.unet_visualize.idx_set and idx not in config.unet_visualize.idx_set:
             continue
         elif config.unet_visualize.idx_set is None and idx < config.unet_visualize.start_data_idx:
             continue
-        parent_name = os.path.basename(os.path.dirname(resume_checkpoint))   # lr1_cosine_noema
-        ckpt_name = os.path.basename(resume_checkpoint)                     # checkpoint-30000
-        outdir_root = os.path.join("outputs_unet_attn", timestamp, parent_name, ckpt_name, f"{noise_timestep}", f"sample{idx}")
-        os.makedirs(outdir_root, exist_ok=True)
+
         
         images = batch['image'].to(device)  # B V C H W  (V == nframe)
         Bv, V, C, H, W = images.shape
@@ -255,7 +258,7 @@ def main(nframe, cond_num, inference_view_range,
             for t in range(cond_num, nframe):  # <<< CHANGED >>>
                 tgt_image_t = images.squeeze()[t]  # [C,H,W]
                 overlay_grid_and_save(tgt_image_t, spacing=64,
-                                      out_path=os.path.join(outdir_root, f"VIS_OVERLAY_t{t}.png"))
+                                      out_path=os.path.join(outdir_root, f"VIS_OVERLAY_target.png"))
             save_image(images.squeeze()[:cond_num], os.path.join(outdir_root, "VIS_REFERENCE.png"))
             while True:
                 answer = input("Do you want to visualize? (yes/no): ").strip().lower()
@@ -289,6 +292,9 @@ def main(nframe, cond_num, inference_view_range,
         with open(os.path.join(outdir_root, "coords.json"), "w") as f:
             json.dump(coords, f, indent=4) 
 
+        os.makedirs(os.path.join(outdir_root, f"sample_{idx}"), exist_ok=True)
+        outdir_root = os.path.join(outdir_root, f"sample_{idx}")
+
         # ---------- run UNet once to fill attention cache ----------
         _ = unet_inference(batch)
         unet_attn_cache = pop_cached_attn(unet)
@@ -298,8 +304,6 @@ def main(nframe, cond_num, inference_view_range,
         # Targets are frames [cond_num, nframe)
         for unet_layer in caching_unet_attn_layers:
         
-            # outdir = os.path.join(outdir_root, f"tgt_{t}")  # separate folder per target
-            # os.makedirs(outdir, exist_ok=True)
             stacked_images = []
             for t in range(0, nframe):  # <<< CHANGED >>>
                 tgt_image = images.squeeze()[t]  # [C, H, W]  (this target)
@@ -329,32 +333,51 @@ def main(nframe, cond_num, inference_view_range,
                         F = nframe
                         HW = Q_ // F
                         attnmap = einops.rearrange(attnmap, 'B Head (F1 HW1) (F2 HW2) -> B Head F1 HW1 F2 HW2',
-                                                   B=B_, Head=Head, F1=F, HW1=HW, F2=F, HW2=HW)
+                                                B=B_, Head=Head, F1=F, HW1=HW, F2=F, HW2=HW)
                         attnmap = attnmap[:, :, query_idx][:, :, :, :, key_idx]
                         attnmap = einops.rearrange(attnmap, 'B Head f1 HW1 f2 HW2 -> B Head (f1 HW1) (f2 HW2)',
-                                                   B=B_, Head=Head, f1=len(query_idx), f2=len(key_idx), HW1=HW, HW2=HW)
+                                                B=B_, Head=Head, f1=len(query_idx), f2=len(key_idx), HW1=HW, HW2=HW)
                         return attnmap
 
-                    query_idx = [t]  # <<< CHANGED >>>
+                    query_idx = [t]
                     if config.unet_visualize.cross_only:
-                        key_idx = [i for i in range(nframe) if i not in query_idx]             # <<< CHANGED >>> refs only
+                        key_idx = [i for i in range(nframe) if i not in query_idx]   # refs only
                     else:
-                        key_idx = list(range(nframe))               # refs + all frames
+                        key_idx = list(range(nframe))                                # refs + all frames
 
                     sliced = slice_attnmap(unet_attn_logit, query_idx=query_idx, key_idx=key_idx)  # [B, H, Q, K]
-                    # attn_maps = sliced.mean(dim=1)[0]  # [Q, K] head-avg, take batch 0
-                    attn_maps = sliced[0] # softmax -> head-mean
+                    # We'll handle head-mean either before or after softmax depending on per_view.
+                    # Keep full heads for correct per-view softmax on logits:
+                    attn_maps = sliced[0]  # [Head, Q, K]
 
                     query_size = int(math.sqrt(attn_maps.shape[1]))
                     y_feat_cost = int((y_coord / 512) * query_size)
                     x_feat_cost = int((x_coord / 512) * query_size)
                     query_token_idx_cost = y_feat_cost * query_size + x_feat_cost
 
-                    all_scores = torch.softmax(attn_maps[:, query_token_idx_cost], dim=-1).mean(dim=0)  # [K]
+                    # logits for the chosen query token across all keys: [Head, K] where K = V * HW
+                    head_logits = attn_maps[:, query_token_idx_cost]  # [Head, K]
                     tokens_per_img = query_size * query_size
-                    scores_split = all_scores.split(tokens_per_img)
+                    V_keys = head_logits.shape[-1] // tokens_per_img
+
+                    if config.unet_visualize.per_view:
+                        # Softmax PER VIEW on logits (not on concatenated keys)
+                        # Split into V chunks (each length HW), softmax per chunk, then concat.
+                        chunks = head_logits.split(tokens_per_img, dim=-1)           # list of V tensors, each [Head, HW]
+                        probs_chunks = [torch.softmax(c, dim=-1) for c in chunks]    # each [Head, HW], softmax per view
+                        # Head-mean after per-view softmax, then concat back to [K]
+                        all_scores = torch.cat([pc.mean(dim=0) for pc in probs_chunks], dim=-1)  # [K]
+                    else:
+                        # Original behavior: one softmax over all concatenated keys, then head-mean
+                        probs = torch.softmax(head_logits, dim=-1)  # [Head, K]
+                        all_scores = probs.mean(dim=0)              # [K]
+
+                    scores_split = all_scores.split(tokens_per_img)  # V tensors, each [HW]
                     # Concatenate attention maps horizontally for each key frame
-                    score = torch.cat([s.reshape(query_size, query_size) for s in scores_split], dim=-1)
+                    # score = torch.cat([s.reshape(query_size, query_size) for s in scores_split], dim=-1)
+                    score = torch.cat([F.interpolate(s.reshape(query_size, query_size).unsqueeze(0).unsqueeze(0), size=(16, 16), mode='bilinear').squeeze(0).squeeze(0)
+                                for s in scores_split], dim=-1)
+
 
                 combined_img = save_image_jinhk(images, t, x_coord, y_coord, score)
                 stacked_images.append(combined_img)
@@ -364,7 +387,10 @@ def main(nframe, cond_num, inference_view_range,
         if config.unet_visualize.save_stack:
             # Save stacked images (ref + tgt)
             save_image(images.squeeze(), os.path.join(outdir_root, f"VIS_STACKED.png"))
- 
+        print(f"Saved sample {idx}")
+        if config.unet_visualize.idx_set:
+            if idx >= end_idx:
+                break
         if config.unet_visualize.idx_set is None and idx >= config.unet_visualize.end_data_idx:
             break
         

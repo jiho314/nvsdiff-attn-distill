@@ -83,6 +83,8 @@ def get_attn_map_whole(attn_layer: torch.Tensor, background: np.ndarray) -> np.n
     background_uint8 = background.astype(np.uint8).copy()
     blended_map = cv2.addWeighted(background_uint8, 0.3, heatmap, 0.7, 0)
 
+    return blended_map # if no marking point
+
     # 5. Find the max attention location in the original small map
     attn_small = attn_layer.cpu().detach().numpy()
     max_idx_y, max_idx_x = np.unravel_index(np.argmax(attn_small), attn_small.shape)
@@ -92,8 +94,8 @@ def get_attn_map_whole(attn_layer: torch.Tensor, background: np.ndarray) -> np.n
     max_y = int((max_idx_y + 0.5) * (H_large / H_small))
 
     # 7. Draw a circle at the max point
-    final_map = cv2.circle(blended_map, (max_x, max_y), 10, (255, 255, 255), -1)
-    final_map = cv2.circle(final_map, (max_x, max_y), 6, (255, 0, 0), -1)
+    final_map = cv2.circle(blended_map, (max_x, max_y), 14, (255, 255, 255), -1)
+    final_map = cv2.circle(blended_map, (max_x, max_y), 10, (255, 0, 0), -1)
 
     return final_map
 
@@ -113,7 +115,7 @@ def mark_point_on_img(tgt_img, x, y, radius=6):
 
     # Draw white outer circle + blue inner circle
     img = cv2.circle(img, (int(x), int(y)), radius+4, (255, 255, 255), -1)  # white
-    img = cv2.circle(img, (int(x), int(y)), radius, (0, 0, 255), -1)        # blue (BGR)
+    img = cv2.circle(img, (int(x), int(y)), radius, (255, 0, 0), -1)        # red
 
     return img
 
@@ -172,7 +174,7 @@ def save_image_jinhk(images, target_idx, x_coord, y_coord, score):
     # Target image with marked point
     if images is not None: 
         tgt_image = images[target_idx]
-        tgt_image = mark_point_on_img(tgt_image, x_coord, y_coord)
+        tgt_image = mark_point_on_img(tgt_image, x_coord, y_coord, radius=14)
         vis_list.append(Image.fromarray(tgt_image))
 
     V_images, _, _, _ = images.shape

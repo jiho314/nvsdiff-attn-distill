@@ -1,9 +1,9 @@
-
+# Basic Dataset
 re10k_wds_test:
   cls_name: re10k_wds
   config:
     url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
-    dataset_length: 100
+    dataset_length: 281
     resampled: False
     shardshuffle: False
     inference: true
@@ -33,3 +33,123 @@ dtu_test:
       image_size: 512
       scene_scale_factor: 1.35 # TODO... if not vggt. how?
       num_tgt_views: 4
+
+# 
+re10k_wds_test_4_4:
+  cls_name: re10k_wds
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 280
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 6
+    process_kwargs:
+      get_square_extrinsic: true
+
+re10k_wds_test_4_6:
+  cls_name: re10k_wds
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 280
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 6
+    process_kwargs:
+      get_square_extrinsic: true
+
+re10k_wds_test_4_7:
+  cls_name: re10k_wds
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 280
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 7
+    process_kwargs:
+      get_square_extrinsic: true
+
+re10k_wds_test_4_8:
+  cls_name: re10k_wds
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 280
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 8
+    process_kwargs:
+      get_square_extrinsic: true
+
+re10k_wds_test_4_10:
+  cls_name: re10k_wds
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 280
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 10
+    process_kwargs:
+      get_square_extrinsic: true
+
+re10k_wds_test_4_12:
+  cls_name: re10k_wds
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 280
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 12
+    process_kwargs:
+      get_square_extrinsic: true
+
+re10k_wds_test_4_14:
+  cls_name: re10k_wds
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 280
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 14
+    process_kwargs:
+      get_square_extrinsic: true
+
+
+re10k_wds_test_4_16:
+  cls_name: re10k_wds
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 280
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 16
+    process_kwargs:
+      get_square_extrinsic: true
+
+
+re10k_wds_test_4_18:
+  cls_name: re10k_wds
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 280
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 18
+    process_kwargs:
+      get_square_extrinsic: true

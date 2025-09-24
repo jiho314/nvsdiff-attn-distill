@@ -4,8 +4,8 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from functools import partial
 from torchvision import transforms
 logger = get_logger(__name__, log_level="INFO")
-
-
+from filelock import FileLock
+import pandas  as pd
 
 @torch.no_grad()
 def log_test(accelerator, config, args, pipeline, dataloader, step, device,
@@ -35,41 +35,48 @@ def log_test(accelerator, config, args, pipeline, dataloader, step, device,
     nframe = args.test_nframe
     cfg = args.test_cfg
     num_inference_steps = args.test_num_inference_steps
+    log_prefix = f"test/{args.test_dataset}"
     with torch.no_grad(), torch.autocast("cuda"):
         for batch in tqdm(dataloader, desc=f"Validation rank{accelerator.process_index}..."):
             batch = process_batch_fn(batch)
             # unbatchify
-            image, intri_, extri_ = batch['image'][0], batch['intrinsic'][0], batch['extrinsic'][0]
-            f, _, h, w = image.shape
+            # image, intri_, extri_ = batch['image'][0], batch['intrinsic'][0], batch['extrinsic'][0]
+            image, intri_, extri_ = batch['image'], batch['intrinsic'], batch['extrinsic']
+            b, f, _, h, w = image.shape
             assert f == nframe, f"args.test_nframe({args.test_nframe}) doesn't match with data nframe({f}), image_shape({image.shape}) "
             image_normalized = image * 2.0 - 1.0
 
             extrinsic, intrinsic = extri_, intri_
             # import pdb ; pdb.set_trace()
             tag, sequence_name, depth = None, None , None
-            preds = pipeline(images=image_normalized, nframe=nframe, cond_num=cond_num,
-                             height=image_normalized.shape[2], width=image_normalized.shape[3],
+            preds = pipeline.batch_call(images=image_normalized, nframe=nframe, cond_num=cond_num,
+                             height=image_normalized.shape[-2], width=image_normalized.shape[-1],
                              intrinsics=intrinsic, extrinsics=extrinsic,
                              num_inference_steps=num_inference_steps, guidance_scale=cfg,
                              output_type="np", config=config, tag=tag,
-                             sequence_name=sequence_name, depth=depth, vae=kwargs['vae']).images  # [f,h,w,c]
+                             sequence_name=sequence_name, depth=depth, vae=kwargs['vae']).images  # [bf,h,w,c]
             color_warps = None
 
             # if batch['tag'][0] not in show_save_dict or show_save_dict[batch['tag'][0]] < 10:  # 每个dataset显示10个
                 # show_save_dict[batch['tag'][0]] += 1
             if val_iter < viz_len:
+                image_viz = einops.rearrange(image, 'b f c h w -> (b f) c h w')
+                preds_viz = preds
                 if depth is not None:
-                    show_image = get_show_images(image, torch.tensor(preds).permute(0,3,1,2), cond_num, batch["depth"])
+                    show_image = get_show_images(image_viz, torch.tensor(preds_viz).permute(0,3,1,2), cond_num, batch["depth"])
                 else:
-                    show_image = get_show_images(image, torch.tensor(preds).permute(0,3,1,2), cond_num)
+                    show_image = get_show_images(image_viz, torch.tensor(preds_viz).permute(0,3,1,2), cond_num)
 
                 if color_warps is not None:
-                    h, w = image.shape[2], image.shape[3]
+                    h, w = image.shape[-2], image.shape[-1]
                     show_image[h:h * 2, cond_num * w:] = color_warps[0][:, cond_num * w:]
                 show_images.append(show_image)
-
-            gt_images = (image_normalized[cond_num:].permute(0, 2, 3, 1).cpu().numpy() + 1) / 2 # -1 1 → 0 1
-            preds = preds[cond_num:]
+            # slice gt/pred, channel to last, to numpy
+            gt_images = einops.rearrange(image_normalized[:, cond_num:], 'b f c h w -> (b f) h w c')
+            gt_images= (gt_images.cpu().numpy() + 1 ) / 2
+            # gt_images = (image_normalized[:, cond_num:].permute(0, 2, 3, 1).cpu().numpy() + 1) / 2 # -1 1 → 0 1
+            preds = einops.rearrange(preds, '(b f) h w c -> b f h w c', f= nframe)[:, cond_num:]
+            preds = einops.rearrange(preds, 'b f h w c -> (b f) h w c')
             if eval_size != h:
                 gt_images = resize_fn(gt_images)
                 preds = resize_fn(preds)
@@ -102,7 +109,7 @@ def log_test(accelerator, config, args, pipeline, dataloader, step, device,
     psnr_score = accelerator.gather(psnr_score).mean().item()
     ssim_score = accelerator.gather(ssim_score).mean().item()
     lpips_score = accelerator.gather(lpips_score).mean().item()
-    log_value_dict.update({"test/psnr": psnr_score, "test/ssim": ssim_score, "test/lpips": lpips_score})
+    log_value_dict.update({f"psnr": psnr_score, f"ssim": ssim_score, f"lpips": lpips_score})
     accelerator.print("test/psnr: ", psnr_score)
     accelerator.print("test/ssim: ", ssim_score)
     accelerator.print("test/lpips: ", lpips_score)
@@ -121,9 +128,11 @@ def log_test(accelerator, config, args, pipeline, dataloader, step, device,
             accelerator.print("test/fid_real_num: ", real_num)
             accelerator.print("test/fid_fake_num: ", fake_num)
 
-            log_value_dict.update({"test/fid": fid_val, "test/fid_real_num": real_num, "test/fid_fake_num": fake_num})
+            log_value_dict.update({f"fid": fid_val, f"fid_real_num": real_num, f"fid_fake_num": fake_num})
+        
     
-    accelerator.log(log_value_dict, step=step)
+    wandb_log = {f"{log_prefix}/{k}": v for k,v in log_value_dict.items()}
+    accelerator.log(wandb_log, step=step)
 
     show_images_full = torch.cat(show_images, dim=1).to(device)
     show_images_full = accelerator.gather(show_images_full).reshape(-1,*show_images_full.shape).permute(1,0,2,3).flatten(1,2)
@@ -133,6 +142,28 @@ def log_test(accelerator, config, args, pipeline, dataloader, step, device,
         #         show_images[j] = cv2.resize(show_images[j], None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
             # accelerator.log({f"test/gt_masked_pred_images{j}": wandb.Image(show_images[j])}, step=step)
         accelerator.log({"test/show_images": wandb.Image(show_images_full)}, step=step)
+        if args.test_save_csv_path is not None:
+            data = {
+                'run_name': args.run_name,
+                'cond_num': args.test_cond_num,
+                'dataset_full' : args.test_dataset,
+                'dataset': args.test_dataset.split("_")[0],
+                'view_range': args.test_dataset.split('_')[-1],
+                "train_step" : args.test_train_step
+            }
+            data.update(log_value_dict)
+            data = pd.DataFrame([data])
+            save_csv_path = args.test_save_csv_path
+            lock = FileLock(save_csv_path +".lock")
+            with lock:    
+                if not os.path.exists(save_csv_path):
+                    data.to_csv(save_csv_path, mode="w", header=True, index=False)
+                else:
+                    data.to_csv(save_csv_path, mode="a", header=False, index=False)     
+
+
+
+
 
     del loss_fn_alex
     torch.cuda.empty_cache()
@@ -186,7 +217,8 @@ def parse_args():
 
     parser.add_argument("--log_every", type=int, default=20)
     
-    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--run_name", type=str, required=True)
+    parser.add_argument("--run_base_path", type=str, default="check_points") # 'check_points'
     # test data
     parser.add_argument("--test_dataset_config", type=str, required=True)
     parser.add_argument("--test_dataset", type=str, required=True)
@@ -194,7 +226,6 @@ def parse_args():
     parser.add_argument("--test_cond_num", type=int, required=True)
     parser.add_argument("--test_use_vggt_camera", action="store_true")
     # test model
-    parser.add_argument("--test_run_path", type=str, required=True)
     parser.add_argument("--test_train_step", type=int, required=True)
     # test inference setting
     parser.add_argument("--test_cfg", type=float, required=True)
@@ -204,6 +235,16 @@ def parse_args():
     parser.add_argument("--test_viz_num", type=int, default=15)
     parser.add_argument("--test_compute_fid", action="store_true")
     parser.add_argument("--test_eval_size", type=int, default = 512)
+
+    # test gist
+    parser.add_argument("--test_remote", action="store_true")
+    parser.add_argument("--test_remote_base_path", type=str , default=None)
+    parser.add_argument("--test_remote_remove_ckpt", action='store_true')
+    parser.add_argument("--test_save_csv_path",type=str, default= None)
+
+    parser.add_argument("--test_batch_size", type=int, default=1)
+
+    
     
 
     args = parser.parse_args()
@@ -211,22 +252,50 @@ def parse_args():
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    if args.config_file is not None:
-        config = EasyDict(OmegaConf.load(args.config_file))
-    else:
-        args.config_file = os.path.join(args.test_run_path, "config.yaml")
-        config = EasyDict(OmegaConf.load(args.config_file))
-
-    cfg = None
-
     # Sanity checks
     # assert config.dataset_names is not None and len(config.dataset_names) > 0
 
-    return args, config, cfg
+    return args
 
 
 def main():
-    args, config, cfg = parse_args()
+    args = parse_args()
+
+    if args.test_remote:
+        if int(os.environ.get("RANK", "0")) == 0 :
+            # down path (remote)
+            remote_ckpt_path = os.path.join(args.test_remote_base_path, args.run_name, f"checkpoint-{args.test_train_step}", 'pytorch_model/mp_rank_00_model_states.pt')
+            remote_config_path = os.path.join(args.test_remote_base_path, args.run_name, "config.yaml")
+            # run path (local)
+            os.makedirs(os.path.join(args.run_base_path, args.run_name, f"checkpoint-{args.test_train_step}", 'pytorch_model'), exist_ok=True)
+            ckpt_path = os.path.join(args.run_base_path, args.run_name, f"checkpoint-{args.test_train_step}", 'pytorch_model/mp_rank_00_model_states.pt')
+            config_path = os.path.join(args.run_base_path, args.run_name, "config.yaml")
+            if os.path.isfile(ckpt_path) and  os.path.isfile(config_path):
+                print('ckpt/config already exists skip downloading')
+                ckpt_already_downloaded = True
+            else:
+                ckpt_already_downloaded = False
+                print('downloading : ' , remote_ckpt_path)
+                print('downloading : ' , remote_config_path)
+                import paramiko
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                ssh.connect("210.125.69.5", username="kaist-cvlab", password="Cvlab@123!", port=51015)
+                sftp = ssh.open_sftp()
+                sftp.get(remote_config_path, config_path)
+                sftp.get(remote_ckpt_path, ckpt_path)
+                sftp.close()
+                ssh.close()
+
+
+    if args.config_file is not None:
+        config = EasyDict(OmegaConf.load(args.config_file))
+    else:
+        args.config_file = os.path.join(args.run_base_path, args.run_name, "config.yaml")
+        config = EasyDict(OmegaConf.load(args.config_file))
+
+    
+
     # logging_dir = os.path.join(args.output_dir, "logs")
     # accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
@@ -279,8 +348,8 @@ def main():
                                                 ignore_mismatched_sizes=True)
 
 
-    if config.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
+    # if config.gradient_checkpointing:
+    #     unet.enable_gradient_checkpointing()
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -292,17 +361,15 @@ def main():
         print("Loading weight only...")
 
 
-    run_path = args.test_run_path
-    ckpt_dir = f"checkpoint-{args.test_train_step}"
-    ckpt_path = os.path.join(run_path, ckpt_dir)
+    ckpt_dir = os.path.join(args.run_base_path, args.run_name, f"checkpoint-{args.test_train_step}")
 
     if args.use_ema:
-        ema_path = os.path.join(ckpt_path, "ema_unet.pt")
+        ema_path = os.path.join(ckpt_dir, "ema_unet.pt")
         weights = torch.load(ema_path, map_location="cpu")
         # here the weights are different from ema_unet (maybe some new weights are in ema_unet/unet)
         unet.load_state_dict(weights, strict=False)  # unet load first
     else:
-        model_path = os.path.join(ckpt_path,"pytorch_model", "mp_rank_00_model_states.pt" )
+        model_path = os.path.join(ckpt_dir,"pytorch_model", "mp_rank_00_model_states.pt" )
         weights = torch.load(model_path, map_location="cpu")
         unet.load_state_dict(weights['module'], strict=False)  # we usually need to resume partial weights here
 
@@ -322,10 +389,12 @@ def main():
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
+    config.run_name = args.run_name
     if accelerator.is_main_process:
         accelerator.init_trackers(
             project_name=args.tracker_project_name,
             init_kwargs={"wandb": {"name": args.run_name}} if args.run_name is not None else {},
+            config = config
         )
 
 
@@ -346,11 +415,12 @@ def main():
         test_dataset,
         shuffle=False,
         sampler=None,
-        batch_size=1,
+        batch_size=args.test_batch_size,
         num_workers=0,
         drop_last=True,
         # num_workers=accelerator.num_processes,
     )
+    
     assert len(test_dataloader) % (accelerator.num_processes * 1) == 0, "Please make sure testidation dataset length is divisible by num_processes"
 
     logger.info("***** Running Test *****")
@@ -363,6 +433,8 @@ def main():
         if dataset_class == "re10k_wds":
             '''re10k_wds: ordered frames'''
             batch = uniform_push_batch(batch, cond_num)
+            # TODO: extrapolate idx
+
         elif dataset_class == "lvsm_dataset":
             '''lvsm_dataset: cond + tgt ordered (modified from original code)'''
             pass
@@ -391,6 +463,11 @@ def main():
     del pipeline
     torch.cuda.empty_cache()
     gc.collect()
+
+    if args.test_remote_remove_ckpt and accelerator.is_main_process:
+        os.remove(ckpt_path)
+        print(f"{ckpt_path} deleted successfully.")
+
 
 if __name__ == "__main__":
     main()

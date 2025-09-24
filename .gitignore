@@ -11,8 +11,16 @@ outputs/
 demo/
 outputs_unet_attn/
 outputs_vggt/
+outputs_vggt_map/
 
 validation_metrics_correlation_wandb_per_metric/
 *.png
 outputs_comparison/
+
+view_range_viz/
+test_results_local/
+extracted_first_views/
 a.py
+outputs_unet_attn/
+outputs_vggt_map/
+check_points/
