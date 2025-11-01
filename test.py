@@ -6,169 +6,13 @@ from torchvision import transforms
 logger = get_logger(__name__, log_level="INFO")
 from filelock import FileLock
 import pandas  as pd
+from warp import render_points_pytorch3d
+from train import log_test
+# from torchmetrics.image.psnr import PeakSignalNoiseRatio
+# from torchmetrics.image.ssim import StructuralSimilarityIndexMeasure
+# from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-@torch.no_grad()
-def log_test(accelerator, config, args, pipeline, dataloader, step, device,
-             process_batch_fn = lambda x: x,
-             eval_size = 512,
-             **kwargs):
-    ''' Caution, batch=1 !
-    '''
-    loss_fn_alex = lpips.LPIPS(net='alex').to(device).eval()
-
-    compute_fid = args.test_compute_fid 
-    viz_len = args.test_viz_num
-    if compute_fid:
-        if accelerator.is_main_process:
-            fid_calculator = FrechetInceptionDistance(normalize=True).to(device)
-            fid_calculator.reset()
-
-    resize_fn = transforms.Resize(eval_size, interpolation=transforms.InterpolationMode.BICUBIC)
-    psnr_scores = []
-    ssim_scores = []
-    lpips_scores = []
-    show_images = []
-    # show_save_dict = collections.defaultdict(int)
-    val_iter = 0
-
-    cond_num = args.test_cond_num
-    nframe = args.test_nframe
-    cfg = args.test_cfg
-    num_inference_steps = args.test_num_inference_steps
-    log_prefix = f"test/{args.test_dataset}"
-    with torch.no_grad(), torch.autocast("cuda"):
-        for batch in tqdm(dataloader, desc=f"Validation rank{accelerator.process_index}..."):
-            batch = process_batch_fn(batch)
-            # unbatchify
-            # image, intri_, extri_ = batch['image'][0], batch['intrinsic'][0], batch['extrinsic'][0]
-            image, intri_, extri_ = batch['image'], batch['intrinsic'], batch['extrinsic']
-            b, f, _, h, w = image.shape
-            assert f == nframe, f"args.test_nframe({args.test_nframe}) doesn't match with data nframe({f}), image_shape({image.shape}) "
-            image_normalized = image * 2.0 - 1.0
-
-            extrinsic, intrinsic = extri_, intri_
-            # import pdb ; pdb.set_trace()
-            tag, sequence_name, depth = None, None , None
-            preds = pipeline.batch_call(images=image_normalized, nframe=nframe, cond_num=cond_num,
-                             height=image_normalized.shape[-2], width=image_normalized.shape[-1],
-                             intrinsics=intrinsic, extrinsics=extrinsic,
-                             num_inference_steps=num_inference_steps, guidance_scale=cfg,
-                             output_type="np", config=config, tag=tag,
-                             sequence_name=sequence_name, depth=depth, vae=kwargs['vae']).images  # [bf,h,w,c]
-            color_warps = None
-
-            # if batch['tag'][0] not in show_save_dict or show_save_dict[batch['tag'][0]] < 10:  # 每个dataset显示10个
-                # show_save_dict[batch['tag'][0]] += 1
-            if val_iter < viz_len:
-                image_viz = einops.rearrange(image, 'b f c h w -> (b f) c h w')
-                preds_viz = preds
-                if depth is not None:
-                    show_image = get_show_images(image_viz, torch.tensor(preds_viz).permute(0,3,1,2), cond_num, batch["depth"])
-                else:
-                    show_image = get_show_images(image_viz, torch.tensor(preds_viz).permute(0,3,1,2), cond_num)
-
-                if color_warps is not None:
-                    h, w = image.shape[-2], image.shape[-1]
-                    show_image[h:h * 2, cond_num * w:] = color_warps[0][:, cond_num * w:]
-                show_images.append(show_image)
-            # slice gt/pred, channel to last, to numpy
-            gt_images = einops.rearrange(image_normalized[:, cond_num:], 'b f c h w -> (b f) h w c')
-            gt_images= (gt_images.cpu().numpy() + 1 ) / 2
-            # gt_images = (image_normalized[:, cond_num:].permute(0, 2, 3, 1).cpu().numpy() + 1) / 2 # -1 1 → 0 1
-            preds = einops.rearrange(preds, '(b f) h w c -> b f h w c', f= nframe)[:, cond_num:]
-            preds = einops.rearrange(preds, 'b f h w c -> (b f) h w c')
-            if eval_size != h:
-                gt_images = resize_fn(gt_images)
-                preds = resize_fn(preds)
-            if compute_fid:
-                gt_imgs_fid, preds_fid = torch.tensor(gt_images).permute(0, 3, 1, 2).to(device),  torch.tensor(preds).permute(0, 3, 1, 2).to(device)
-                gt_imgs_fid, preds_fid = accelerator.gather(gt_imgs_fid), accelerator.gather(preds_fid)
-                if accelerator.is_main_process:
-                    gt_imgs_fid = einops.rearrange(gt_imgs_fid,'... c h w -> (...) c h w').to(device)
-                    preds_fid = einops.rearrange(preds_fid,'... c h w -> (...) c h w').to(device)
-                    fid_calculator.update(gt_imgs_fid, real=True)
-                    fid_calculator.update(preds_fid, real=False)
-
-            for i in range(preds.shape[0]):
-                psnr_ = peak_signal_noise_ratio(gt_images[i], preds[i], data_range=1.0)
-                psnr_scores.append(psnr_)
-                ssim_ = structural_similarity(cv2.cvtColor(gt_images[i], cv2.COLOR_RGB2GRAY),
-                                              cv2.cvtColor(preds[i], cv2.COLOR_RGB2GRAY), data_range=1.0)
-                ssim_scores.append(ssim_)
-                lpips_ = get_lpips_score(loss_fn_alex, gt_images[i], preds[i], device)
-                lpips_scores.append(lpips_)
-            
-            val_iter += 1
-    
-    # unify all results
-    log_value_dict = {}
-    psnr_score = torch.tensor(np.mean(psnr_scores), device=device, dtype=torch.float32)
-    ssim_score = torch.tensor(np.mean(ssim_scores), device=device, dtype=torch.float32)
-    lpips_score = torch.tensor(np.mean(lpips_scores), device=device, dtype=torch.float32)
-
-    psnr_score = accelerator.gather(psnr_score).mean().item()
-    ssim_score = accelerator.gather(ssim_score).mean().item()
-    lpips_score = accelerator.gather(lpips_score).mean().item()
-    log_value_dict.update({f"psnr": psnr_score, f"ssim": ssim_score, f"lpips": lpips_score})
-    accelerator.print("test/psnr: ", psnr_score)
-    accelerator.print("test/ssim: ", ssim_score)
-    accelerator.print("test/lpips: ", lpips_score)
-    if compute_fid:
-        if accelerator.is_main_process:
-            print("fid compute start")
-            import time
-            st = time.time()
-            fid_val = fid_calculator.compute()
-            real_num, fake_num = fid_calculator.real_features_num_samples, fid_calculator.fake_features_num_samples
-            fid_calculator.reset()
-            del fid_calculator
-            torch.cuda.empty_cache()
-            print(f"fid compute end: {time.time() - st}" )
-            accelerator.print("test/fid: ", fid_val)
-            accelerator.print("test/fid_real_num: ", real_num)
-            accelerator.print("test/fid_fake_num: ", fake_num)
-
-            log_value_dict.update({f"fid": fid_val, f"fid_real_num": real_num, f"fid_fake_num": fake_num})
-        
-    
-    wandb_log = {f"{log_prefix}/{k}": v for k,v in log_value_dict.items()}
-    accelerator.log(wandb_log, step=step)
-
-    show_images_full = torch.cat(show_images, dim=1).to(device)
-    show_images_full = accelerator.gather(show_images_full).reshape(-1,*show_images_full.shape).permute(1,0,2,3).flatten(1,2)
-    if accelerator.is_main_process:
-        # for j in range(len(show_image)):
-        #     if config.image_size > 256:
-        #         show_images[j] = cv2.resize(show_images[j], None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-            # accelerator.log({f"test/gt_masked_pred_images{j}": wandb.Image(show_images[j])}, step=step)
-        accelerator.log({"test/show_images": wandb.Image(show_images_full)}, step=step)
-        if args.test_save_csv_path is not None:
-            data = {
-                'run_name': args.run_name,
-                'cond_num': args.test_cond_num,
-                'dataset_full' : args.test_dataset,
-                'dataset': args.test_dataset.split("_")[0],
-                'view_range': args.test_dataset.split('_')[-1],
-                "train_step" : args.test_train_step
-            }
-            data.update(log_value_dict)
-            data = pd.DataFrame([data])
-            save_csv_path = args.test_save_csv_path
-            lock = FileLock(save_csv_path +".lock")
-            with lock:    
-                if not os.path.exists(save_csv_path):
-                    data.to_csv(save_csv_path, mode="w", header=True, index=False)
-                else:
-                    data.to_csv(save_csv_path, mode="a", header=False, index=False)     
-
-
-
-
-
-    del loss_fn_alex
-    torch.cuda.empty_cache()
-
-    return lpips_score
+from src.metrics import compute_psnr, compute_ssim, compute_lpips
 
 
 
@@ -222,7 +66,7 @@ def parse_args():
     # test data
     parser.add_argument("--test_dataset_config", type=str, required=True)
     parser.add_argument("--test_dataset", type=str, required=True)
-    parser.add_argument("--test_nframe", type=int, required=True)
+    # parser.add_argument("--test_nframe", type=int, required=True) # nframe from config
     parser.add_argument("--test_cond_num", type=int, required=True)
     parser.add_argument("--test_use_vggt_camera", action="store_true")
     # test model
@@ -235,6 +79,7 @@ def parse_args():
     parser.add_argument("--test_viz_num", type=int, default=15)
     parser.add_argument("--test_compute_fid", action="store_true")
     parser.add_argument("--test_eval_size", type=int, default = 512)
+    parser.add_argument("--test_eval_w_mask", action="store_true")
 
     # test gist
     parser.add_argument("--test_remote", action="store_true")
@@ -271,7 +116,7 @@ def main():
             ckpt_path = os.path.join(args.run_base_path, args.run_name, f"checkpoint-{args.test_train_step}", 'pytorch_model/mp_rank_00_model_states.pt')
             config_path = os.path.join(args.run_base_path, args.run_name, "config.yaml")
             if os.path.isfile(ckpt_path) and  os.path.isfile(config_path):
-                print('ckpt/config already exists skip downloading')
+                print(f'ckpt-{args.test_train_step}/config already exists skip downloading')
                 ckpt_already_downloaded = True
             else:
                 ckpt_already_downloaded = False
@@ -294,7 +139,6 @@ def main():
         args.config_file = os.path.join(args.run_base_path, args.run_name, "config.yaml")
         config = EasyDict(OmegaConf.load(args.config_file))
 
-    
 
     # logging_dir = os.path.join(args.output_dir, "logs")
     # accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -410,7 +254,12 @@ def main():
     # Dataset
     from src import datasets
     test_dataset_config = EasyDict(OmegaConf.load(args.test_dataset_config))[args.test_dataset]
-    test_dataset = datasets.__dict__[test_dataset_config.cls_name](**test_dataset_config.config)
+    # dataset_kwargs = OmegaConf.to_container(test_dataset_config.config, resolve=True)
+    # dataset_kwargs["use_vggt_camera"] = args.test_use_vggt_camera
+    # test_dataset_config.config = dataset_kwargs
+    dataset_kwargs = test_dataset_config.config
+    # test_dataset = datasets.__dict__[test_dataset_config.cls_name](num_viewpoints=args.test_nframe, **dataset_kwargs)
+    test_dataset = datasets.__dict__[test_dataset_config.cls_name](**dataset_kwargs)
     test_dataloader = DataLoader(
         test_dataset,
         shuffle=False,
@@ -434,7 +283,9 @@ def main():
             '''re10k_wds: ordered frames'''
             batch = uniform_push_batch(batch, cond_num)
             # TODO: extrapolate idx
-
+        elif dataset_class == "co3d_wds":
+            '''co3d_wds: ordered frames'''
+            batch = uniform_push_batch(batch, cond_num)
         elif dataset_class == "lvsm_dataset":
             '''lvsm_dataset: cond + tgt ordered (modified from original code)'''
             pass
@@ -454,21 +305,33 @@ def main():
 
     # unset_attn_cache(unet)
     pipeline = get_pipeline(accelerator, config, vae, unet, weight_dtype)
+    cond_num = args.test_cond_num
+    # nframe = args.test_nframe
+    nframe = dataset_kwargs.get('num_viewpoints')
+    cfg = args.test_cfg
+    num_inference_steps = args.test_num_inference_steps
     res = log_test(accelerator=accelerator, config=config, args=args,
                             pipeline=pipeline, dataloader=test_dataloader, process_batch_fn=process_batch_fn_1,
                             step=args.test_train_step, device=accelerator.device, vae=vae,
-                            eval_size = args.test_eval_size)
+                            cond_num = cond_num, nframe = nframe, cfg = cfg, num_inference_steps = num_inference_steps,
+                            compute_fid = args.test_compute_fid,
+                            viz_len = args.test_viz_num,
+                            eval_size = args.test_eval_size,
+                            eval_w_mask = args.test_eval_w_mask,
+                            save_csv_path= args.test_save_csv_path,
+                            test_dataset_name = args.test_dataset,
+                            )
     # set_attn_cache(unet, distill_student_unet_attn_layers, print_=False)
     
     del pipeline
     torch.cuda.empty_cache()
     gc.collect()
 
-    if args.test_remote_remove_ckpt and accelerator.is_main_process:
-        os.remove(ckpt_path)
-        print(f"{ckpt_path} deleted successfully.")
+    if args.test_remote_remove_ckpt and args.test_remote and accelerator.is_main_process:
+        if not ckpt_already_downloaded:
+            os.remove(ckpt_path)
+            print(f"{ckpt_path} deleted successfully.")
 
 
 if __name__ == "__main__":
     main()
-

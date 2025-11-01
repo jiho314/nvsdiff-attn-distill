@@ -19,7 +19,7 @@ vggt_on_fly : false
 use_vggt_camera : false
 
 
-# nframe: 4
+nframe: 4
 fix_cond_num: null
 min_cond_num: 2
 max_cond_num: 3
@@ -149,24 +149,33 @@ opt_cfg:
   adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
 
-vggt_visualize:
-  out_root: 'vis_vggt_re10k'
-  exp_name: 'naive_100k_square'
-  mode: "pointmap" # "attention", "track_head", "pointmap"
-  temperature: 0.0001
+unet_visualize:
+  out_root: 'vis_full_perview'
+  exp_name: 'full_40k'
+  perturb_attn: false
+  perturb_layers: null
+  cache_attn: false
+  caching_unet_attn_layers: [2,3,4,5,6,7,8,9,10,11,12]
   view_select: false # select scene
   coord_select: false # select coordinate
   coord_per_frame: true
-  reproduce_coords_dir: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/vis_attn_re10k/2025-10-15_16-13-21/naive_100k/full/999'
   nframe: 3
   cross_only: false
+  noise_timestep: 250 #(0, 999)
+  cfg_scale: 2.0
+  cfg_rescale: 0.0
   inference_view_range: 25
-  cond_num: 2 #reference num
-  save_originals: false
-  save_stack: false
-  per_view: true
+  cond_num: 1 # reference num
+  # resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points_re10k/0919_naive_b3_lr2.5/checkpoint-100000'
+  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/1015_distill_b7_fullperview_mlp1_L10_lw01/checkpoint-30000'
+  reproduce_coords_dir: #'/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/vis_attn_re10k/2025-10-15_16-13-21/naive_100k/full/999'
+  per_view: false
   ref_tgt_split_softmax: false
-  start_data_idx: 51
+  save_stack: true
+  start_data_idx: 
   end_data_idx: 100
-  idx_set: [33, 39, 58, 63, 67, 120, 130] #[0, 13, 36, 41, 65, 73, 75, 80, 90] # if empty, use all indices in the dataset
-  # good example: 0, 36, 73
+  is_scratch: false
+  idx_set: null #[3, 4, 24, 29, 34, 55, 74, 78, 81, 82, 86, 100] # set null to use start_data_idx, end_data_idx
+  # [33, 58, 67, 120] cfg + pipe
+  # [33, 39, 58, 63, 67, 120, 130] without cfg
+  # [0, 13, 36, 41, 65, 73, 75, 80, 90]

@@ -4,14 +4,14 @@
 # NEW FILE CONTENTS
 loss_query: all # all, target, reference
 loss_key: all
-loss_steps: []
+loss_steps: [0, 5, 10, 15, 30, 49]
 
 viz_query: all
 viz_key: all
 # viz_steps: [0, 5, 10, 15, 30, 49]
-viz_steps: [0,1,2,3,5,10,15,30,49]
-viz_log_wandb: true
-viz_alpha: 0.8
+viz_steps: []
+viz_log_wandb: false
+viz_alpha: 0.6
 viz_query_xy: null
 viz_query_index: 342
 
@@ -47,19 +47,4 @@ no_camera_emb: false
 # For testing: disable camera embeddings starting at a denoising step index (inclusive).
 # If both are provided, `no_camera_emb_after_step` takes precedence.
 # Example: no_camera_emb_after_step: 10
-# no_camera_emb_after_step: 
-
-# --- Dataset-related hints (used by validate.py when provided) ---
-# If you prefer to drive validation dataset selection from this file, set
-# `dataset_config` to a path loaded by validate.py and `dataset_key` to the
-# dataset entry key inside that YAML. These are optional — validate.py also
-# accepts command-line args `--val_dataset_config` and `--val_dataset`.
-dataset_config: "configs/datasets/test.yaml"
-dataset_key: "re10k_wds_test"
-
-nframe: 4
-fix_cond_num: 2
-
-# Validation dataloader defaults
-batch_size: 1
-use_vggt_camera: False
+no_camera_emb_after_step: 30

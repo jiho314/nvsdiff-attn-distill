@@ -188,7 +188,7 @@ class StableDiffusionMultiViewPipeline(
     model_cpu_offload_seq = "text_encoder->image_encoder->unet->vae"
     _optional_components = ["safety_checker", "feature_extractor", "image_encoder"]
     _exclude_from_cpu_offload = ["safety_checker"]
-    _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
+    _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds", "latent_model_input", "noise_pred"]
 
     def __init__(
             self,
@@ -950,7 +950,8 @@ class StableDiffusionMultiViewPipeline(
         self._guidance_rescale = guidance_rescale
         self._clip_skip = clip_skip
         self._cross_attention_kwargs = cross_attention_kwargs
-        self._interrupt = False
+        # self._interrupt = False
+        self._interrupt = kwargs.pop("interrupt", False)
 
         # 2. Define call parameters
         batch_size = 1
@@ -965,12 +966,23 @@ class StableDiffusionMultiViewPipeline(
 
         ### encode cameras ###
         no_camera_emb = kwargs['config'].model_cfg.get("no_camera_emb", False)
-        if no_camera_emb:
-            camera_embedding = None
-        else:
-            camera_embedding = get_camera_embedding(intrinsics, extrinsics,
-                                                    batch_size, nframe, height, width,
+        
+        #### seonghu 10/26: 
+        ### when no_camera_emb is True, disable camera embeddings at pipeline/runtime. 
+        ### If set true, the pipeline will set camera_embedding to zeros, instead of None.
+        ### below is the original code, and modified for compatibility of our model
+        # if no_camera_emb:
+        #     camera_embedding = None
+        # else:
+        #     camera_embedding = get_camera_embedding(intrinsics, extrinsics,
+        #                                             batch_size, nframe, height, width,
+        #                                             config=kwargs['config']).to(device=device)
+        
+        camera_embedding = get_camera_embedding(intrinsics, extrinsics,
+                                                  batch_size, nframe, height, width,
                                                     config=kwargs['config']).to(device=device)
+        if no_camera_emb:
+            camera_embedding = torch.zeros_like(camera_embedding)
         ### build masks (random visible frames), valid:0, mask:1 ###
         masks = torch.ones((batch_size, nframe, 1, height, width), device=device, dtype=dtype)
         latent_masks = torch.ones((batch_size, nframe, 1, height // self.vae_scale_factor, width // self.vae_scale_factor),
@@ -1089,6 +1101,15 @@ class StableDiffusionMultiViewPipeline(
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
         self._num_timesteps = len(timesteps)
+        
+        #### seonghu 10/26: 
+        # Support disabling camera embeddings after a specified denoising step.
+        # Config keys supported in config.model_cfg:
+        # - no_camera_emb_after_step: int (disable at and after this step index)
+        # - no_camera_emb_after_frac: float in (0,1) (disable after fraction of steps)
+        disable_after_step = None
+        if 'no_camera_emb_after_step' in kwargs['config'].model_cfg:
+            disable_after_step = int(kwargs['config'].model_cfg.get('no_camera_emb_after_step'))
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -1097,6 +1118,16 @@ class StableDiffusionMultiViewPipeline(
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
                 latent_model_input = scheduler.scale_model_input(latent_model_input, t)
+
+                #### seonghu 10/26: 
+                # Determine whether to disable camera embeddings at this denoise step.
+                # print(f"[DEBUG] i: {i}, disable_after_step: {disable_after_step}, num_inference_steps: {num_inference_steps}")
+                if disable_after_step is not None:
+                    if i >= disable_after_step:
+                        add_inputs = torch.cat([masks, torch.zeros_like(camera_embedding)], dim=2)
+                        if self.do_classifier_free_guidance:
+                            add_inputs = torch.cat([negative_inputs, add_inputs], dim=0)
+                        print(f"[DEBUG] Camera embeddings disabled at step {i}")
 
                 # predict the noise residual
                 noise_pred = self.unet(

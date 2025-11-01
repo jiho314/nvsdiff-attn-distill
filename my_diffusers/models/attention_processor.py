@@ -1361,16 +1361,22 @@ class AttnProcessor2_0:
     Processor for implementing scaled dot-product attention (enabled by default if you're using PyTorch 2.0).
     """
 
-    def __init__(self, cache_attn = False, cache_feat = False):
+    def __init__(self, cache_attn = False, cache_feat = False, cache_qk = False ):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
         
         self.cache_attn = cache_attn
         self.cache_feat = cache_feat
+        self.cache_qk = cache_qk
+        # ## seonghu 1019: add q/k lists for optional Q/K caching
         self.cache = {
             'attn': [],
-            'feat': []
+            'feat': [],
+            'q': [],
+            'k': []
         }
+        # 10/22 jinhyeok: attention perturbation
+        self.perturb = False
 
     def __call__(
             self,
@@ -1469,9 +1475,36 @@ class AttnProcessor2_0:
             # key:[b,nhead,length,dim]
             hw = key.shape[2] // nframe
             key[:, :, :hw * cond_num] *= key_rescale
-        
-        # jiho TODO 
-        if not self.cache_attn:
+
+        # -- Attention --
+        # ## seonghu 1019: optional Q/K caching when cache_qk is enabled -> jiho 1024: caching w/o detach
+        if self.cache_qk:
+            # No detach : (previously, store detached clones to avoid keeping computation graph
+            self.cache['q'].append(query)
+            self.cache['k'].append(key)
+
+        # 10/22 jinhyeok: attention perturbation
+        if self.perturb:
+            # identity attention map
+            hidden_states = value
+            # query: (b, head, fhw, dim)
+            # value: (b, head, fhw, dim)
+            # hw = query.shape[2] // nframe
+            # identity_attn = torch.eye(hw, dtype=query.dtype, device=query.device) # (hw, hw)
+            # full = torch.zeros((query.shape[2], query.shape[2]), dtype=query.dtype, device=query.device) # (fhw, fhw)
+            # full = full.unsqueeze(0).unsqueeze(0).repeat(query.shape[0], query.shape[1], 1, 1)  # (b, head, fhw, fhw)
+            # scale_factor = 1 / math.sqrt(query.size(-1))
+            # attn_logit = query @ key.transpose(-2, -1) * scale_factor
+            # ref_attn = attn_logit[..., :hw, :hw]  # (b, head, hw, hw)
+
+            # for i in range(nframe):
+            #     # full[i*hw:(i+1)*hw, :hw] = identity_attn
+            #     full[:, :, i*hw:(i+1)*hw, :hw] = ref_attn.clone()
+            # # attn_logit = full.unsqueeze(0).unsqueeze(0).expand(query.shape[0], query.shape[1], -1, -1) # (b, head, fhw, fhw)
+            # attn_prob = torch.softmax(full, dim=-1)
+            # hidden_states = attn_prob @ value
+        # jiho TODO
+        elif not self.cache_attn:
             if xformers is not None:  # format: B tok Head dim
                 assert attention_mask is None, "w/ xformers, attention_mask not supported yet "
                 # Ensure all tensors have the same dtype before xformers attention
@@ -1499,11 +1532,18 @@ class AttnProcessor2_0:
             # attn_logit = attn_logit + attn_bias
             attn_prob = torch.softmax(attn_logit, dim=-1)
             hidden_states = attn_prob @ value
-
+            
             self.cache['attn'].append(attn_logit)
+            
+        
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
+        
+        if self.cache_feat: # jiho TODO: encoder_hidden_states check, feat shape check!
+            # expected shape: B N D [B (f hw) c]
+            self.cache['feat'].append(hidden_states)
+
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
@@ -1518,9 +1558,9 @@ class AttnProcessor2_0:
 
         hidden_states = hidden_states / attn.rescale_output_factor
         
-        if self.cache_feat: # jiho TODO: encoder_hidden_states check, feat shape check!
-            # expected shape: B N D [B (f hw) c]
-            self.cache['feat'].append(hidden_states)
+        # if self.cache_feat: # jiho TODO: encoder_hidden_states check, feat shape check!
+        #     # expected shape: B N D [B (f hw) c]
+        #     self.cache['feat'].append(hidden_states)
 
         if nframe is not None and attn.inner_dim != 320 and not is_cross_attn:
             hidden_states = einops.rearrange(hidden_states, "b (f hw) c -> (b f) hw c", f=nframe)    

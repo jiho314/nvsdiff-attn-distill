@@ -150,24 +150,39 @@ opt_cfg:
   max_grad_norm: 1.0
 
 unet_visualize:
-  caching_unet_attn_layers: [10] #[2,3,4,5,6,7,8,9,10,11,12] # [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
-  view_select: true # select scene
-  coord_select: true # select coordinate
+  out_root: 'vis_attn_re10k'
+  exp_name: 'distill_100k_recon_grid'
+
+  perturb_attn: false
+  perturb_layers:
+  cache_attn: true
+  caching_unet_attn_layers: [2,3,4,5,6,7,8,9,10,11,12]
+
+  view_select: false # select scene
+  coord_select: false # select coordinate
+  coord_per_frame: true
   nframe: 3
   cross_only: false
-  noise_timestep: 300 #(0, 999)
+  noise_timestep: 999 #(0, 999)
+  cfg_scale: 2.0
+  cfg_rescale: 0.0
   inference_view_range: 25
-  cond_num: 2 #reference num
-  # resume_checkpoint: '/mnt/data2/nvs-data/diff-distill/check_points/naive_0915/checkpoint-20000'
-  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/0919_naive_b3_lr2.5/checkpoint-70000'
-  # resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/0919_distill_perview_Lfull/checkpoint-70000'
-  # resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points/0920_distill_perview_mlp_3/checkpoint-60000'
-  save_originals: false
-  save_stack: false
+  cond_num: 1 # reference num
+  # resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points_re10k/0919_naive_b3_lr2.5/checkpoint-100000'
+  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points_re10k/0922_distill_perview_lr25_mlp1_L10_lw02/checkpoint-100000'
+  # reproduce_coords_dir: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/vis_attn_re10k/2025-10-24_11-15-13/naive_100k_inpainting/per_view/999'
+  reproduce_coords_dir: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/vis_attn_re10k/2025-10-27_11-22-51/naive_100k_recon/per_view/999'
+  
+  grid_query: true
   per_view: true
   ref_tgt_split_softmax: false
-  start_data_idx: 0
-  end_data_idx: 100
+  save_stack: true
+  
+  start_data_idx: 
+  end_data_idx:
   is_scratch: false
-  idx_set: [4] #[0, 13, 36, 41, 65, 73, 75, 80, 90] # if empty, use all indices in the dataset
-  # good example: 0, 36, 73
+  idx_set: [2, 16, 38, 60,    27, 33, 49, 58, 66, 80, 88] # set null to use start_data_idx, end_data_idx
+
+  # inpainting: [3, 4, 24, 29, 34, 55, 74, 78,   54, 81, 82, 86, 100]
+  # recon: [2, 16, 38, 60,    27, 33, 49, 58, 66, 80, 88]
+  # [... good case,    bad case, ...]

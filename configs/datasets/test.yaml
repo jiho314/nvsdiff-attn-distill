@@ -20,7 +20,10 @@ re10k_pixelsplat_test:
       use_idx_file: true
       idx_file_path:  /mnt/data2/nvs-data/re10k/re10k_lvsm/assets/evaluation_index_re10k.json
       image_size: 512
-      scene_scale_factor: 1.35 # TODO... if not vggt. how?
+      scene_scale_factor:
+        default: 1.0
+        vggt: 1.35
+      use_vggt_camera: false
       num_tgt_views: 4
 
 dtu_test:
@@ -31,9 +34,150 @@ dtu_test:
       use_idx_file: true
       idx_file_path: /mnt/data2/nvs-data/dtu/dtu_lvsm/assets/evaluation_index_dtu.json
       image_size: 512
-      scene_scale_factor: 1.35 # TODO... if not vggt. how?
+      scene_scale_factor:
+        default: 1.0
+        vggt: 1.35
+      use_vggt_camera: false
       num_tgt_views: 4
 
+
+co3d_wds_test: # unseen scene 
+  cls_name: co3d_wds
+  config:
+    url_paths: [ "/mnt/data2/minseop/co3d_wds_val/unseen_scene" ]  # /mnt/data2/minseop/co3d_wds_val/unseen_category
+    dataset_length: 100 # 2938
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 6
+    process_kwargs:
+      get_square_extrinsic: true
+
+
+# co3d
+# co3d_wds_val_subset:
+#   cls_name: co3d_wds
+#   config:
+#     url_paths:
+#     - /mnt/data2/minseop/co3d_wds_val_subset
+#     dataset_length: 50
+#     resampled: false
+#     shardshuffle: false
+#     inference: true
+#     inference_view_range: 4
+#     process_kwargs:
+#       get_square_extrinsic: true
+
+co3d_wds_val_subset_unseen_scene_3_3: # unseen scene 
+  cls_name: co3d_wds
+  config:
+    url_paths: 
+    - /mnt/data4/minseop/co3d_wds_val_subset/unseen_scene # /mnt/data2/minseop/co3d_wds_val/unseen_category: 54 scenes
+    dataset_length: 50 # not sure how many
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 3
+    inference_view_range: 3
+    process_kwargs:
+      get_square_extrinsic: true
+
+co3d_wds_val_subset_unseen_scene_3_6: # unseen scene 
+  cls_name: co3d_wds
+  config:
+    url_paths: 
+    - /mnt/data4/minseop/co3d_wds_val_subset/unseen_scene # /mnt/data2/minseop/co3d_wds_val/unseen_category: 54 scenes
+    dataset_length: 50 # not sure how many
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 3
+    inference_view_range: 6
+    process_kwargs:
+      get_square_extrinsic: true
+
+co3d_wds_val_subset_unseen_scene_100_3_6: # unseen scene 
+  cls_name: co3d_wds
+  config:
+    url_paths: 
+    - /mnt/data4/minseop/co3d_wds_val_subset/unseen_scene # /mnt/data2/minseop/co3d_wds_val/unseen_category: 54 scenes
+    dataset_length: 100 # not sure how many
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 3
+    inference_view_range: 6
+    process_kwargs:
+      get_square_extrinsic: true
+
+co3d_wds_val_subset_unseen_category_3_3: # unseen category
+  cls_name: co3d_wds
+  config:
+    url_paths: 
+    - /mnt/data4/minseop/co3d_wds_val_subset/unseen_category # /mnt/data2/minseop/co3d_wds_val/unseen_category: 54 scenes
+    dataset_length: 50  # 240
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 3
+    inference_view_range: 3
+    process_kwargs:
+      get_square_extrinsic: true      
+
+co3d_wds_val_subset_unseen_category_3_6: # unseen category
+  cls_name: co3d_wds
+  config:
+    url_paths: 
+    - /mnt/data4/minseop/co3d_wds_val_subset/unseen_category # /mnt/data2/minseop/co3d_wds_val/unseen_category: 54 scenes
+    dataset_length: 50  # 240
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 3
+    inference_view_range: 6
+    process_kwargs:
+      get_square_extrinsic: true
+
+co3d_wds_val_subset_unseen_category_100_3_6: # unseen category
+  cls_name: co3d_wds
+  config:
+    url_paths: 
+    - /mnt/data4/minseop/co3d_wds_val_subset/unseen_category # /mnt/data2/minseop/co3d_wds_val/unseen_category: 54 scenes
+    dataset_length: 100  # 240
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 3
+    inference_view_range: 6
+    process_kwargs:
+      get_square_extrinsic: true
+
+co3d_wds_test_subset_4_6: # unseen scene 
+  cls_name: co3d_wds
+  config:
+    url_paths: [ "/mnt/data2/minseop/co3d_wds_val_subset/unseen_scene" ]  # /mnt/data2/minseop/co3d_wds_val/unseen_category: 54 scenes
+    dataset_length: 240
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 6
+    process_kwargs:
+      get_square_extrinsic: true
+
+co3d_wds_test_subset_4_8: # unseen scene 
+  cls_name: co3d_wds
+  config:
+    url_paths: [ "/mnt/data2/minseop/co3d_wds_val_subset/unseen_scene" ]  # /mnt/data2/minseop/co3d_wds_val/unseen_category: 54 scenes
+    dataset_length: 240 # 2938
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 8
+    process_kwargs:
+      get_square_extrinsic: true
 # 
 re10k_wds_test_4_4:
   cls_name: re10k_wds
@@ -153,3 +297,76 @@ re10k_wds_test_4_18:
     inference_view_range: 18
     process_kwargs:
       get_square_extrinsic: true
+
+# jinhyeok: for qual
+re10k_wds_test_farview:
+  cls_name: re10k_wds_jinhk
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 281
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 3
+    inference_view_range: 15
+    process_kwargs:
+      get_square_extrinsic: true
+      far_view_qual: true
+
+
+# dtu
+dtu_test_interpolate_tgt2_0:
+  cls_name: lvsm_dataset
+  config:
+    config:
+      dataset_path:  /mnt/data2/nvs-data/dtu/dtu_lvsm/test/full_list.txt
+      use_idx_file: true
+      idx_file_path: /mnt/data2/nvs-data/dtu/dtu_lvsm/assets/evaluation_index_dtu_01.json
+      image_size: 512
+      scene_scale_factor: 1.35
+        # default: 1.0
+        # vggt: 1.35
+      # use_vggt_camera: false
+      num_tgt_views: 2
+
+dtu_test_interpolate_tgt2_1:
+  cls_name: lvsm_dataset
+  config:
+    config:
+      dataset_path:  /mnt/data2/nvs-data/dtu/dtu_lvsm/test/full_list.txt
+      use_idx_file: true
+      idx_file_path: /mnt/data2/nvs-data/dtu/dtu_lvsm/assets/evaluation_index_dtu_23.json
+      image_size: 512
+      scene_scale_factor: 1.35
+        # default: 1.0
+        # vggt: 1.35
+      # use_vggt_camera: false
+      num_tgt_views: 2
+
+dtu_test_interpolate_tgt1_0:
+  cls_name: lvsm_dataset
+  config:
+    config:
+      dataset_path:  /mnt/data2/nvs-data/dtu/dtu_lvsm/test/full_list.txt
+      use_idx_file: true
+      idx_file_path: /mnt/data2/nvs-data/dtu/dtu_lvsm/assets/evaluation_index_dtu_01.json
+      image_size: 512
+      scene_scale_factor: 1.35
+        # default: 1.0
+        # vggt: 1.35
+      # use_vggt_camera: false
+      num_tgt_views: 1
+
+dtu_test_interpolate_tgt1_1:
+  cls_name: lvsm_dataset
+  config:
+    config:
+      dataset_path:  /mnt/data2/nvs-data/dtu/dtu_lvsm/test/full_list.txt
+      use_idx_file: true
+      idx_file_path: /mnt/data2/nvs-data/dtu/dtu_lvsm/assets/evaluation_index_dtu_23.json
+      image_size: 512
+      scene_scale_factor: 1.35
+        # default: 1.0
+        # vggt: 1.35
+      # use_vggt_camera: false
+      num_tgt_views: 1

@@ -1,7 +1,6 @@
 # Distill 
 distill_config:
-  distill_pairs:  [] # student(unet)(down_blocks(6), mid_block(1), up_blocks(9)), teacher(vggt)(0~23, "track_head", "point_head")
-  # unet: [64,64,32,32,16,16] [8] [16,16,16,32,32,32,64,64,64]
+  distill_pairs:  [ ] # student(flux), teacher(vggt)(0~23, "track_head", "point_head")
   distill_loss_weight: 0.00 # 0.05 per layer 
   distill_loss_fn: "cross_entropy"  # "cross_entropy", "l1", ...
   vggt_logit_head: "softmax_headmean"  # "softmax_headmean", "identity", "softmax_headmlp"
@@ -9,19 +8,16 @@ distill_config:
   unet_logit_head: "softmax_headmean"  # "softmax_headmean", "identity", "softmax_headmlp"
   unet_logit_head_kwargs: {"softmax_temp": 1.0} 
 
-  distill_query: "target" # "target", "all"
-  distill_key: "reference" # "reference", "all", (TODO: "cross")
-  consistency_check: false
-  
+  distill_query: "target" # "reference", "target", "all"
+  distill_key: "reference" # "reference", "target", "self" "all"
 
 # vggt
 vggt_on_fly : false
 use_vggt_camera : false
 
-
-# nframe: 4
+nframe: 4
 fix_cond_num: null
-min_cond_num: 2
+min_cond_num: 1
 max_cond_num: 3
 
 # eval: 20 -> 6 min / 4gpu = 1.5min
@@ -37,24 +33,24 @@ train_timestep_schedule_config:
 train_batch_size: 4 # Batch size (per device) for the training dataloader，必须是n_frames_per_seq的倍数
 shuffle_train_rate: 0.5 # the rate to shuffle frames in training dataset
 
-# wds_dataset_config:
-#   url_paths: [ "/scratch/kaist-cvlab/dataset/re10k", "/scratch/kaist-cvlab/dataset/re10k_2"  ] # "/mnt/data2/minseop/realestate_train_wds"
-#   dataset_length: 38034
-#   resampled: True
-#   shardshuffle: True
-#   min_view_range: 8
-#   max_view_range: 10
-#   process_kwargs:
-#     get_square_extrinsic: true
 
+wds_dataset_config:
+  url_paths: [ "/mnt/data1/minseop/realestate_wds" ,  "/mnt/data2/minseop/realestate_train_wds" ] # "/mnt/data2/minseop/realestate_train_wds"
+  dataset_length: 38034
+  resampled: True
+  shardshuffle: True
+  min_view_range: 6
+  max_view_range: 10
+  process_kwargs:
+    get_square_extrinsic: true
 
 val_wds_dataset_config:
-  url_paths: [ "/mnt/data2/minseop/realestate_val_wds" ] 
+  url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
   dataset_length: 100
   resampled: False
   shardshuffle: False
-  inference: True
-  inference_view_range: 6
+  min_view_range: 6
+  max_view_range: 8
   process_kwargs:
     get_square_extrinsic: true
 
@@ -148,25 +144,3 @@ opt_cfg:
   adam_weight_decay: 0.01
   adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
-
-vggt_visualize:
-  out_root: 'vis_vggt_re10k'
-  exp_name: 'naive_100k_square'
-  mode: "pointmap" # "attention", "track_head", "pointmap"
-  temperature: 0.0001
-  view_select: false # select scene
-  coord_select: false # select coordinate
-  coord_per_frame: true
-  reproduce_coords_dir: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/vis_attn_re10k/2025-10-15_16-13-21/naive_100k/full/999'
-  nframe: 3
-  cross_only: false
-  inference_view_range: 25
-  cond_num: 2 #reference num
-  save_originals: false
-  save_stack: false
-  per_view: true
-  ref_tgt_split_softmax: false
-  start_data_idx: 51
-  end_data_idx: 100
-  idx_set: [33, 39, 58, 63, 67, 120, 130] #[0, 13, 36, 41, 65, 73, 75, 80, 90] # if empty, use all indices in the dataset
-  # good example: 0, 36, 73
