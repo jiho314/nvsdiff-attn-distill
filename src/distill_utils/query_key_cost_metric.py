@@ -35,7 +35,9 @@ def neg_log_l2_norm(query, key, eps=1e-6):
     return - torch.log(dist + eps)
 
 def cosine_similarity(query, key):
-    raise NotImplementedError("cosine similarity not implemented yet")
+    query = query / query.norm(dim=-1, keepdim=True)
+    key = key / key.norm(dim=-1, keepdim=True)
+    return query @ key.transpose(-1, -2)
 
 
 def l2_norm_onehot(query, key):
@@ -52,5 +54,6 @@ COST_METRIC_FN ={
     "neg_l2": neg_l2_norm,
     "inverse_l2": inverse_l2_norm,
     "neg_log_l2": neg_log_l2_norm,
+    "cosine_similarity": cosine_similarity,
 }
 

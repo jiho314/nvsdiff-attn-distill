@@ -160,7 +160,7 @@ def save_image_total(images, x_coord, y_coord, score):
 
     return combined_img
 
-def save_image_jinhk(images, target_idx, x_coord, y_coord, score):
+def save_image_jinhk(tgt_gt_image, images, target_idx, x_coord, y_coord, score):
     """
     images: torch.Tensor [B, V, 3, 512, 512], values in [0,1] or None
     x, y: int coordinates to mark (0–511)
@@ -172,10 +172,12 @@ def save_image_jinhk(images, target_idx, x_coord, y_coord, score):
     vis_list = []
 
     # Target image with marked point
-    if images is not None: 
+    if tgt_gt_image is not None:
+        tgt_image = tgt_gt_image
+    else:
         tgt_image = images[target_idx]
-        tgt_image = mark_point_on_img(tgt_image, x_coord, y_coord, radius=14)
-        vis_list.append(Image.fromarray(tgt_image))
+    tgt_image = mark_point_on_img(tgt_image, x_coord, y_coord, radius=14)
+    vis_list.append(Image.fromarray(tgt_image))
 
     V_images, _, _, _ = images.shape
     fHW, VfHW = score.shape

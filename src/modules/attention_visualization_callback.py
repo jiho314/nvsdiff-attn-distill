@@ -8,15 +8,22 @@ from src.distill_utils.query_key_cost_metric import COST_METRIC_FN
 from torch import nn
 
 
+import os
+import math
+import numpy as np
+import torch.nn.functional as FNN
+import time
+import uuid
+from PIL import Image as _PILImage, ImageDraw as _PILDraw
+import pandas as pd
+
+
 class Softmax(nn.Module):
     def __init__(self, 
-                 softmax_temp=1.0, num_view_for_per_view=None, **kwargs):
+                 softmax_temp=1.0, num_view_for_per_view=None, per_view=False):
         super(Softmax, self).__init__()
         self.num_view = num_view_for_per_view
-        if num_view_for_per_view is not None:
-            self.per_view = True
-        else:
-            self.per_view = False
+        self.per_view = per_view
         self.softmax_temp = softmax_temp
     
     def forward(self, x, **kwargs):
@@ -38,15 +45,6 @@ class Softmax_HeadMean(Softmax):
         return x.mean(dim=1, keepdim=True)
 
 
-import os
-import math
-import numpy as np
-import torch
-import torch.nn.functional as FNN
-import time
-import uuid
-from PIL import Image as _PILImage, ImageDraw as _PILDraw
-import pandas as pd
 
 
 
@@ -56,7 +54,8 @@ class AttentionVisualizationCallback(PipelineCallback):
     매 denoising step마다 호출되어 attention logit을 수집하고 distillation loss를 계산합니다.
     """
     
-    tensor_inputs = ["latents"]
+    # Request exactly the tensors we need from the pipeline callback: current x_t and noise prediction
+    tensor_inputs = ["latents", "latent_model_input", "noise_pred"]
     
     def __init__(
         self,
@@ -66,7 +65,8 @@ class AttentionVisualizationCallback(PipelineCallback):
         cond_num: int,
         device: torch.device,
         do_attn_visualize: bool = True,
-        accelerator=None
+        accelerator=None,
+        vae=None,
     ):
         """
         Args:
@@ -88,12 +88,21 @@ class AttentionVisualizationCallback(PipelineCallback):
         self.device = device
         self.do_attn_visualize = do_attn_visualize
         self.accelerator = accelerator  # accelerator 객체 저장
+        # Tweedie background support
+        self.vae = vae
+        self._use_tweedie_bg = str(self.visualize_config.get('viz_pred_bg_source', 'final')).lower() == 'tweedie'
+        self._tweedie_views_by_step = {}
         self.visualize_loss_dict = {}
         self.step_losses = []
         self.step_layer_losses = {}  # step별 layer별 loss 저장
         self.layer_losses = {}  # layer별 누적 loss 저장
         # detailed per-(sample,step,layer,head,loss_fn) rows for export
         self._detailed_rows = []
+        
+        self._pending_viz = []   
+        self.viz_use_gpu = bool(self.visualize_config.get('viz_use_gpu', True))
+        self.viz_dtype   = torch.float16 if self.visualize_config.get('viz_dtype','fp16')=='fp16' else torch.float32
+
         
         # VGGT attention cache 미리 계산
         if self.do_attn_visualize and self.vggt_model is not None:
@@ -278,6 +287,495 @@ class AttentionVisualizationCallback(PipelineCallback):
         #     print(f"Using loss_fn: {key}")
         # else:
         #     raise ValueError(f"Unsupported loss_fn type: {type(loss_fn)}")
+        
+    @staticmethod
+    def _skew(v):
+        vx, vy, vz = v
+        return np.array([
+            [0, -vz, vy],
+            [vz, 0, -vx],
+            [-vy, vx, 0]
+        ], dtype=np.float32)
+
+    @staticmethod
+    def _fundamental_from_w2c(Ks, Kt, w2c_s, w2c_t):
+        """
+        Ks, Kt: (3,3) or (4,4)
+        w2c_s, w2c_t: (4,4) world->cam
+        returns F: (3,3)
+        """
+        Ks = np.array(Ks, dtype=np.float32)
+        Kt = np.array(Kt, dtype=np.float32)
+        w2c_s = np.array(w2c_s, dtype=np.float32)
+        w2c_t = np.array(w2c_t, dtype=np.float32)
+
+        Rs = w2c_s[:3, :3]
+        ts = w2c_s[:3, 3:4]
+        Rt = w2c_t[:3, :3]
+        tt = w2c_t[:3, 3:4]
+
+        # relative pose source -> target
+        R_ts = Rt @ Rs.T
+        t_ts = tt - R_ts @ ts
+
+        E = AttentionVisualizationCallback._skew(t_ts.reshape(3)) @ R_ts
+
+        Ks_inv = np.linalg.inv(Ks[:3, :3])
+        Kt_inv_T = np.linalg.inv(Kt[:3, :3]).T
+        F = Kt_inv_T @ E @ Ks_inv
+        return F
+
+    @staticmethod
+    def _epiline_in_image(F, pt, W, H):
+        """
+        F: (3,3), pt: (u,v) in source image (pixel coords)
+        returns two image-border points ((x1,y1),(x2,y2)) or None if not intersecting
+        """
+        p = np.array([float(pt[0]), float(pt[1]), 1.0], dtype=np.float32)
+        l = F @ p
+        a, b, c = float(l[0]), float(l[1]), float(l[2])
+
+        pts = []
+        # x = 0 -> y = -c/b
+        if abs(b) > 1e-6:
+            y0 = -c / b
+            if 0 <= y0 <= H - 1:
+                pts.append((0.0, float(y0)))
+        # x = W-1 -> y = -(c + a*(W-1))/b
+        if abs(b) > 1e-6:
+            yW = -(c + a * (W - 1)) / b
+            if 0 <= yW <= H - 1:
+                pts.append((float(W - 1), float(yW)))
+        # y = 0 -> x = -c/a
+        if abs(a) > 1e-6:
+            x0 = -c / a
+            if 0 <= x0 <= W - 1:
+                pts.append((float(x0), 0.0))
+        # y = H-1 -> x = -(c + b*(H-1))/a
+        if abs(a) > 1e-6:
+            xH = -(c + b * (H - 1)) / a
+            if 0 <= xH <= W - 1:
+                pts.append((float(xH), float(H - 1)))
+
+        if len(pts) < 2:
+            return None
+        return pts[0], pts[1]
+
+    @staticmethod
+    def _draw_epiline_pil(img_pil, pt_src, F, color=(0, 255, 0), width=2):
+        W, H = img_pil.size
+        seg = AttentionVisualizationCallback._epiline_in_image(F, pt_src, W, H)
+        if seg is None:
+            return img_pil
+        (x1, y1), (x2, y2) = seg
+        d = _PILDraw.Draw(img_pil)
+        d.line((x1, y1, x2, y2), fill=color, width=width)
+        return img_pil
+
+    def _pack_viz_record(self, *, step_index, layer_key,
+                         pred_mean, gt_mean,  # (1, num_qv, per_q, num_kv, per_k) on cpu
+                         F, per_q, per_k, q_side, k_side,
+                         query_idx_list, key_idx_list, q_in_views, grid_cols, seq):
+        # 나중에 렌더에 필요한 최소 메타/텐서만 저장
+        q_abs_list = []
+        for vp in query_idx_list:
+            for q_in in q_in_views:
+                q_abs_list.append(int(vp)*per_q + int(q_in))
+        # Store compact CPU half tensors to avoid repeated GPU<->CPU transfers
+        try:
+            pred_cpu = pred_mean.detach().to(device='cpu', dtype=torch.float16)
+            gt_cpu = gt_mean.detach().to(device='cpu', dtype=torch.float16)
+        except Exception:
+            # fallback to original detach if conversion fails
+            pred_cpu = pred_mean.detach()
+            gt_cpu = gt_mean.detach()
+
+        return dict(
+            step_index=int(step_index), layer_key=layer_key, F=int(F),
+            per_q=int(per_q), per_k=int(per_k), q_side=int(q_side), k_side=int(k_side),
+            query_idx=list(query_idx_list), key_idx=list(key_idx_list),
+            q_in_views=list(q_in_views), q_abs_list=q_abs_list,
+            grid_cols=int(grid_cols), seq=seq,
+            pred_mean=pred_cpu, gt_mean=gt_cpu
+        )
+
+    def _render_viz_record(self, rec, *, pred_views=None, cond_num=None, replace_targets_in_unet=True):
+        # --- config / device / dtype ---
+        use_gpu = bool(self.visualize_config.get('viz_use_gpu', True))
+        dev = self.device if (use_gpu and torch.cuda.is_available()) else torch.device('cpu')
+        viz_dtype = torch.float16 if str(self.visualize_config.get('viz_dtype', 'fp16')).lower() == 'fp16' else torch.float32
+        alpha = float(self.visualize_config.get('viz_alpha', 0.6))
+
+        # ✅ 항상 포인트를 찍도록 강제
+        draw_points = True
+
+        # --- unpack geometry / meta ---
+        per_q   = int(rec['per_q'])
+        per_k   = int(rec['per_k'])
+        q_side  = int(rec['q_side'])
+        k_side  = int(rec['k_side'])
+        q_idx   = list(rec['query_idx'])
+        k_idx   = list(rec['key_idx'])
+        q_in    = list(rec['q_in_views'])
+        grid_cols = max(1, int(rec.get('grid_cols', len(k_idx))))
+        seq     = str(rec.get('seq', 'sample'))
+        step_index = int(rec.get('step_index', 0))
+        layer_key  = str(rec.get('layer_key', 'layer'))
+        cond_num = int(self.cond_num if cond_num is None else cond_num)
+
+        # --- viz_softmax_mode: Pred만 적용, GT는 항상 per_view ---
+        def _parse_layer_key(s):
+            u, v = None, None
+            try:
+                parts = s.split('_')
+                for p in parts:
+                    if p.startswith('unet'):
+                        u = int(p[4:])
+                    elif p.startswith('vggt'):
+                        v = int(p[4:])
+            except Exception:
+                pass
+            return u, v
+
+        pred_norm_mode = None
+        u_id, v_id = _parse_layer_key(layer_key)
+        for p in self.visualize_config.get('pairs', []):
+            if isinstance(p, dict) and ('unet_layer' in p and 'vggt_layer' in p):
+                if str(p['unet_layer']) == str(u_id) and str(p['vggt_layer']) == str(v_id):
+                    pred_norm_mode = p.get('viz_softmax_mode', pred_norm_mode)
+                    break
+        if pred_norm_mode is None:
+            pred_norm_mode = self.visualize_config.get('viz_softmax_mode', 'global')
+        pred_norm_mode = str(pred_norm_mode).lower()  # 'per_view' or 'global'
+        gt_norm_mode = 'per_view'  # ✅ GT는 항상 per-view
+
+        # --- move packed tensors to render device ---
+        with torch.inference_mode():
+            pm_t = rec['pred_mean'].to(device=dev, dtype=viz_dtype)  # (1, nqv, per_q, nkv, per_k)
+            gm_t = rec['gt_mean'  ].to(device=dev, dtype=viz_dtype)
+        B, nqv, pq, nkv, pk = pm_t.shape
+        assert B == 1 and pq == per_q and pk == per_k
+
+        # flatten to (Qtot, Ktot)
+        pm = pm_t.reshape(1, nqv * pq, nkv * pk)[0]
+        gm = gm_t.reshape(1, nqv * pq, nkv * pk)[0]
+
+        # --- prepare GT views (0..1) ---
+        imgs = self.batch['image'][0]  # [F,3,H,W]
+        if imgs.min() < 0:
+            imgs = (imgs + 1.0) / 2.0
+        gt_views_t = imgs.to(device=dev, dtype=viz_dtype).clamp_(0, 1)  # (F,3,H,W)
+        F_total = gt_views_t.shape[0]
+        assert max(q_idx + k_idx) < F_total
+
+        # --- optional: pred_views to torch ---
+        def _to_torch_views(x):
+            if x is None:
+                return None
+            if isinstance(x, np.ndarray):
+                t = torch.as_tensor(x, device=dev)
+                if t.ndim == 4 and t.shape[-1] == 3:
+                    t = t.permute(0, 3, 1, 2)
+                if t.dtype not in (torch.float16, torch.float32):
+                    t = t.float()
+                if t.max() > 1.0:
+                    t = t / 255.0
+                return t.to(viz_dtype).clamp_(0, 1)
+            if isinstance(x, (list, tuple)):
+                ts = []
+                for arr in x:
+                    t = torch.as_tensor(arr, device=dev)
+                    if t.ndim == 3 and t.shape[-1] == 3: t = t.permute(2, 0, 1)
+                    if t.ndim == 2: t = t.unsqueeze(0).repeat(3, 1, 1)
+                    t = t.float() if t.max() <= 1.0 else (t.float()/255.0)
+                    ts.append(t.to(viz_dtype).clamp_(0, 1).unsqueeze(0))
+                return torch.cat(ts, dim=0)
+            if torch.is_tensor(x):
+                t = x.to(device=dev)
+                if t.ndim == 4 and t.shape[-1] == 3: t = t.permute(0, 3, 1, 2)
+                t = t.float() if t.max() <= 1.0 else (t.float()/255.0)
+                return t.to(dtype=viz_dtype).clamp_(0, 1)
+            return None
+
+        pred_views_t = _to_torch_views(pred_views)
+
+        # --- LUT 준비 ---
+        if not hasattr(self, '_viz_lut'):
+            try:
+                lut_len = int(self.visualize_config.get('viz_lut_len', 256))
+            except Exception:
+                lut_len = 256
+            try:
+                import matplotlib as mpl
+                cmap = mpl.cm.get_cmap('turbo', lut_len)
+                lut_rgb_np = (cmap(np.linspace(0.0, 1.0, lut_len))[:, :3].astype('float32'))
+                lut_rgb = torch.as_tensor(lut_rgb_np, device=self.device, dtype=self.viz_dtype)
+            except Exception:
+                lut_x = torch.linspace(0.0, 1.0, steps=lut_len, device=self.device, dtype=self.viz_dtype)
+                lut_rgb = torch.stack([lut_x, lut_x, lut_x], dim=1).to(device=self.device, dtype=self.viz_dtype)
+            self._viz_lut = lut_rgb
+
+        def _attn_gray_to_rgb_torch(gray_nhw):
+            L = self._viz_lut.shape[0]
+            idx = (gray_nhw.clamp(0.0, 1.0) * (L - 1)).to(dtype=torch.long)
+            rgb = self._viz_lut[idx.view(-1)].view(*idx.shape, 3)
+            return rgb.permute(0, 3, 1, 2).to(dtype=viz_dtype, device=gray_nhw.device)
+
+        def _make_key_backgrounds(use_pred_for_targets):
+            srcs = []
+            for vidx in k_idx:
+                if use_pred_for_targets and pred_views_t is not None and vidx >= cond_num:
+                    src = pred_views_t[vidx] if vidx < pred_views_t.shape[0] else gt_views_t[vidx]
+                else:
+                    src = gt_views_t[vidx]
+                srcs.append(src.unsqueeze(0))
+            return torch.cat(srcs, dim=0)  # (K,3,H,W)
+
+        def _resize_like(x, H, W, mode='bilinear'):
+            if x.shape[-2] == H and x.shape[-1] == W:
+                return x
+            return torch.nn.functional.interpolate(x, size=(H, W), mode=mode, align_corners=False if mode == 'bilinear' else None)
+
+        # ✅ 공통: CHW torch → PIL로 파란/빨간 점(흰테두리) 찍고 다시 torch로
+        def _draw_dot_chw(img_chw: torch.Tensor, cx: int, cy: int, r: int, fill_rgb: tuple, outline_rgb: tuple):
+            # img_chw: (3,H,W) float[0..1]
+            arr = (img_chw.clamp(0,1).mul(255).byte()).permute(1,2,0).cpu().numpy()  # HWC uint8
+            pil = _PILImage.fromarray(arr)
+            d = _PILDraw.Draw(pil)
+            # 흰 테두리(바깥): r+2, 안쪽: r
+            d.ellipse((cx-(r+2), cy-(r+2), cx+(r+2), cy+(r+2)), fill=outline_rgb)
+            d.ellipse((cx-r, cy-r, cx+r, cy+r), fill=fill_rgb)
+            out = torch.from_numpy(np.array(pil)).permute(2,0,1).to(device=img_chw.device, dtype=viz_dtype) / 255.0
+            return out
+
+        # --- 정규화 범위를 인자로 받아 per_view/global 선택 + 포인트 그리기 ---
+        def _rows_from_prob(prob_2d, q_panel_use_pred, bg_keys_t, norm_mode: str, draw_query_points: bool, draw_max_points: bool):
+            rows = []
+            K, _, Hc, Wc = bg_keys_t.shape
+            per = k_side * k_side
+            ncols = max(1, grid_cols)
+
+            for vp in q_idx:
+                for q_local in q_in:
+                    q_abs = int(vp) * per_q + int(q_local)
+                    seg = prob_2d[q_abs]                                 # (K*per,)
+                    tiles = seg.view(K, per).view(K, k_side, k_side)     # (K,ks,ks)
+
+                    # ▶ 정규화: 타일 min-max는 유지, 범위만 다르게
+                    if norm_mode == 'per_view':
+                        tmin = tiles.amin(dim=(1, 2), keepdim=True)
+                        tmax = tiles.amax(dim=(1, 2), keepdim=True)
+                        tiles_norm = torch.where(
+                            (tmax > tmin),
+                            (tiles - tmin) / (tmax - tmin + 1e-12),
+                            torch.zeros_like(tiles)
+                        )
+                    else:
+                        gmin = tiles.amin()
+                        gmax = tiles.amax()
+                        tiles_norm = (tiles - gmin) / (gmax - gmin + 1e-12) if (gmax > gmin) else torch.zeros_like(tiles)
+
+                    # ▶ 키 타일별 argmax 좌표(타일 좌표계) 미리 계산
+                    argmax_xy = []
+                    if draw_max_points:
+                        flat = tiles.view(K, -1)
+                        idxs = flat.argmax(dim=1).tolist()
+                        for i, idx in enumerate(idxs):
+                            my, mx = divmod(int(idx), k_side)  # (y,x)
+                            argmax_xy.append((mx, my))
+
+                    # colorize + upsample
+                    color = _attn_gray_to_rgb_torch(tiles_norm)                             # (K,3,ks,ks)
+                    color_up = torch.nn.functional.interpolate(color, size=(Hc, Wc), mode='nearest')  # (K,3,H,W)
+
+                    # blend
+                    blended = (1.0 - alpha) * bg_keys_t + alpha * color_up                  # (K,3,H,W)
+
+                    # ▶ 각 키 이미지에 "빨간 점(흰테두리)" 찍기
+                    if draw_max_points:
+                        r_k = max(3, min(Hc, Wc) // 80)
+                        for ki in range(K):
+                            mx, my = argmax_xy[ki]
+                            cx = int(round((mx + 0.5) * (Wc / float(k_side))))
+                            cy = int(round((my + 0.5) * (Hc / float(k_side))))
+                            blended[ki] = _draw_dot_chw(blended[ki], cx, cy, r_k,
+                                                        fill_rgb=(255, 0, 0), outline_rgb=(255, 255, 255))  # 🔴+흰
+
+                    # ===== Epipolar line 그리기 (필요한 경우) =====
+                    # 조건: 배치에 intrinsic/extrinsic 정보가 있어야 함 (B, F, ...)
+                    intr_batch = self.batch.get('intrinsic', None)
+                    extr_batch = self.batch.get('extrinsic', None)
+                    if intr_batch is None or extr_batch is None:
+                        raise RuntimeError("Epipolar drawing requested but 'intrinsic'/'extrinsic' missing in batch")
+
+                    # intr_batch/extr_batch may be tensors or numpy arrays
+                    intr_arr = intr_batch[0].detach().cpu().numpy() if torch.is_tensor(intr_batch) else np.array(intr_batch[0])
+                    extr_arr = extr_batch[0].detach().cpu().numpy() if torch.is_tensor(extr_batch) else np.array(extr_batch[0])
+
+                    # source pixel center in the background tile coordinate system
+                    qy = q_local // q_side
+                    qx = q_local % q_side
+                    u_src = (qx + 0.5) * (Wc / float(q_side))
+                    v_src = (qy + 0.5) * (Hc / float(q_side))
+
+                    # source camera matrices
+                    Ks = intr_arr[int(vp)]
+                    if Ks.shape[0] == 4:
+                        Ks = Ks[:3, :3]
+                    w2c_s = extr_arr[int(vp)]
+
+                    # 각 key view 별로 epipolar 라인 그리기
+                    for ki in range(K):
+                        tgt_view_idx = int(k_idx[ki]) if ki < len(k_idx) else int(k_idx[0])
+                        Kt = intr_arr[tgt_view_idx]
+                        if Kt.shape[0] == 4:
+                            Kt = Kt[:3, :3]
+                        w2c_t = extr_arr[tgt_view_idx]
+
+                        Fmat = self._fundamental_from_w2c(Ks, Kt, w2c_s, w2c_t)
+
+                        # PIL로 변환해서 라인 그림
+                        tgt_img_chw = blended[ki]
+                        tgt_img = (tgt_img_chw.clamp(0,1).mul(255).byte()).permute(1,2,0).cpu().numpy()
+                        tgt_pil = _PILImage.fromarray(tgt_img)
+
+                        line_width = max(1, min(Hc, Wc) // 200)
+                        tgt_pil = self._draw_epiline_pil(tgt_pil, (u_src, v_src), Fmat, color=(0,255,0), width=line_width)
+
+                        blended[ki] = torch.from_numpy(np.array(tgt_pil)).permute(2,0,1).to(device=dev, dtype=viz_dtype) / 255.0
+
+                    # make K→grid
+                    grid_rows = []
+                    for s in range(0, K, ncols):
+                        row = blended[s:s + ncols]
+                        if row.shape[0] < ncols:
+                            pad = torch.zeros((ncols - row.shape[0], 3, Hc, Wc), device=dev, dtype=blended.dtype)
+                            row = torch.cat([row, pad], dim=0)
+                        row = row.permute(1, 2, 0, 3).reshape(3, Hc, ncols * Wc)
+                        grid_rows.append(row)
+                    grid = torch.cat(grid_rows, dim=1)  # (3, H*rows, W*ncols)
+
+                    # query panel (left)
+                    if q_panel_use_pred and pred_views_t is not None and vp >= cond_num and vp < pred_views_t.shape[0]:
+                        qsrc = pred_views_t[vp]
+                    else:
+                        qsrc = gt_views_t[vp]
+                    qsrc = _resize_like(qsrc.unsqueeze(0), Hc, Wc).squeeze(0)
+
+                    # ▶ 쿼리 포인트: 파란 점(흰테두리)
+                    if draw_query_points:
+                        qy, qx = divmod(int(q_local), q_side)
+                        cx = int(round((qx + 0.5) * (Wc / float(q_side))))
+                        cy = int(round((qy + 0.5) * (Hc / float(q_side))))
+                        r_q = max(3, min(Hc, Wc) // 90)
+                        qsrc = _draw_dot_chw(qsrc, cx, cy, r_q,
+                                                fill_rgb=(0, 120, 255), outline_rgb=(255, 255, 255))  # 🔵+흰
+
+                    # concat query panel and grid horizontally
+                    panel = torch.cat([qsrc, grid], dim=2)
+                    rows.append(panel)
+            return rows
+
+        # backgrounds
+        bg_unet = _make_key_backgrounds(use_pred_for_targets=replace_targets_in_unet)
+        bg_gt   = _make_key_backgrounds(use_pred_for_targets=False)
+
+        # ★ Pred는 config 모드, GT는 항상 per_view
+        pred_rows = _rows_from_prob(pm, True,  bg_unet, norm_mode=pred_norm_mode, draw_query_points=draw_points, draw_max_points=draw_points)
+        gt_rows   = _rows_from_prob(gm, False, bg_gt,   norm_mode=gt_norm_mode,  draw_query_points=draw_points, draw_max_points=draw_points)
+
+        # stack rows vertically
+        pred_mat = torch.cat(pred_rows, dim=1) if len(pred_rows) else torch.zeros((3, 1, 1), device=dev, dtype=viz_dtype)
+        gt_mat   = torch.cat(gt_rows,   dim=1) if len(gt_rows)   else torch.zeros((3, 1, 1), device=dev, dtype=viz_dtype)
+
+        # width pad to equal
+        Wmax = max(pred_mat.shape[2], gt_mat.shape[2])
+        def _pad_w(x, W):
+            if x.shape[2] >= W: return x
+            pad = torch.zeros((x.shape[0], x.shape[1], W - x.shape[2]), device=x.device, dtype=x.dtype)
+            return torch.cat([x, pad], dim=2)
+        pred_mat = _pad_w(pred_mat, Wmax)
+        gt_mat   = _pad_w(gt_mat, Wmax)
+
+        # separator
+        sep_h = max(8, int(min(pred_mat.shape[1], pred_mat.shape[2]) * 0.05))
+        sep = torch.zeros((3, sep_h, Wmax), device=dev, dtype=viz_dtype)
+
+        # final canvas (top: UNet/pred, bottom: VGGT/gt)
+        canvas = torch.cat([pred_mat, sep, gt_mat], dim=1)
+
+        # to PIL
+        with torch.inference_mode():
+            canvas = canvas.clamp(0, 1)
+            canvas_uint8 = (canvas.mul(255).byte()).permute(1, 2, 0).cpu().numpy()
+        final_canvas = _PILImage.fromarray(canvas_uint8)
+
+        # save (optional)
+        save_dir = self.visualize_config.get('viz_save_dir', None)
+        q_abs_list = rec.get('q_abs_list', None)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            if q_abs_list is None:
+                q_abs_list = []
+                for vp in q_idx:
+                    for q_local in q_in:
+                        q_abs_list.append(int(vp) * per_q + int(q_local))
+            q_suffix = "-".join([str(int(x)) for x in q_abs_list])
+            out_path = os.path.join(save_dir, f"attn_step{step_index}_{layer_key}_q{q_suffix}.png")
+            final_canvas.save(out_path)
+
+        # cache for wandb logging
+        if not hasattr(self, 'attention_images_list'):
+            self.attention_images_list = []
+        if q_abs_list is None:
+            q_abs_list = []
+            for vp in q_idx:
+                for q_local in q_in:
+                    q_abs_list.append(int(vp) * per_q + int(q_local))
+        # background source info for logging
+        bg_source = 'final'
+        if self._use_tweedie_bg and int(step_index) in self._tweedie_views_by_step:
+            bg_source = 'tweedie'
+        key = f"attn/{seq}/step{step_index}/{layer_key}/q{'-'.join([str(int(x)) for x in q_abs_list])}"
+        caption = f"{seq} | {layer_key} | step {step_index} | bg:{bg_source} | qs:{'-'.join([str(int(x)) for x in q_abs_list])}"
+        self.attention_images_list.append({
+            'key': key,
+            'image': final_canvas,
+            'caption': caption,
+        })
+
+
+
+
+        
+    def finalize_visualizations(self, pred_images=None, cond_num=None):
+        if not self._pending_viz:
+            return
+        # pred_images → [F,H,W,C] float(0~1) → uint8 HWC 리스트로 변환
+        pred_views_final = None
+        if pred_images is not None:
+            arr = np.array(pred_images)
+            pred_views_final = [ (arr[f]*255).clip(0,255).astype('uint8') for f in range(arr.shape[0]) ]
+
+        if cond_num is None:
+            cond_num = self.cond_num
+
+        for rec in self._pending_viz:
+            step_idx = int(rec.get('step_index', -1))
+            if self._use_tweedie_bg and step_idx in self._tweedie_views_by_step:
+                print(f"[INFO] finalize_visualizations: using Tweedie bg for step {step_idx}")
+                self._render_viz_record(
+                    rec, pred_views=self._tweedie_views_by_step[step_idx],
+                    cond_num=cond_num, replace_targets_in_unet=True
+                )
+            else:
+                reason = self._tweedie_store_reasons.get(step_idx, 'no_reason_recorded')
+                print(f"[INFO] finalize_visualizations: using final pred bg for step {step_idx} (tweedie_reason={reason})")
+                self._render_viz_record(
+                    rec, pred_views=pred_views_final,
+                    cond_num=cond_num, replace_targets_in_unet=True
+                )
+        self._pending_viz.clear()
     
     def _prepare_vggt_cache(self):
         """VGGT attention cache를 미리 계산"""
@@ -367,10 +865,120 @@ class AttentionVisualizationCallback(PipelineCallback):
             return probs.view(*leading, K)
 
         raise ValueError(f"Unsupported softmax mode: {mode}")
+
+    def _alpha_sigma_from_scheduler(self, scheduler, timestep):
+        # DDIM: alphas_cumprod[t] = \bar{\alpha}_t
+        t_idx = int(timestep.item() if torch.is_tensor(timestep) else timestep)
+        if isinstance(scheduler.alphas_cumprod, torch.Tensor):
+            alpha_bar_t = float(scheduler.alphas_cumprod[t_idx].item())
+        else:
+            alpha_bar_t = float(scheduler.alphas_cumprod[t_idx])
+        alpha_t = math.sqrt(alpha_bar_t)
+        sigma_t = math.sqrt(max(0.0, 1.0 - alpha_bar_t))
+        return alpha_t, sigma_t
+
+    @torch.no_grad()
+    def _maybe_store_tweedie_bg(self, pipeline, step_index, timestep, callback_kwargs):
+        if not self._use_tweedie_bg:
+            return
+        if self.vae is None:
+            raise RuntimeError(f"Tweedie background requested but callback has no VAE (step {step_index})")
+
+        x_t = callback_kwargs.get('latent_model_input', None)
+        eps_or_v = callback_kwargs.get('noise_pred', None)
+        if x_t is None or eps_or_v is None:
+            missing = []
+            if x_t is None:
+                missing.append('latent_model_input')
+            if eps_or_v is None:
+                missing.append('noise_pred')
+            raise RuntimeError(f"Tweedie background requested but missing tensors for step {step_index}: {','.join(missing)}")
+
+        # Normalize batch/frame shapes between latent_model_input and noise_pred
+        # Determine base batch (B) and number of frames (F) from provided batch images if available
+        try:
+            B = int(self.batch['image'].shape[0])
+            F = int(self.batch['image'].shape[1])
+        except Exception:
+            B = None
+            F = None
+
+        epsN = eps_or_v.shape[0]
+        is_eps_per_frame = (B is not None and F is not None and epsN == B * F)
+
+        if is_eps_per_frame:
+            # ensure x_t becomes per-frame with shape (B*F, ...)
+            if x_t.shape[0] == 2 * B * F:
+                x_t = x_t[B * F :]
+            elif x_t.shape[0] == 2 * B:
+                # CFG doubled per-sample: take second half (B,) then expand to per-frame
+                x_t = x_t[B:]
+                # expand per-sample to per-frame
+                x_t = x_t.unsqueeze(1).repeat(1, F, *([1] * (x_t.dim() - 1)))
+                x_t = x_t.view(B * F, *x_t.shape[2:])
+            elif x_t.shape[0] == B:
+                # expand per-sample to per-frame
+                x_t = x_t.unsqueeze(1).repeat(1, F, *([1] * (x_t.dim() - 1)))
+                x_t = x_t.view(B * F, *x_t.shape[2:])
+            elif x_t.shape[0] == B * F:
+                pass
+            else:
+                # diagnostic
+                try:
+                    print(f"[ERROR] Tweedie batch/frame mismatch at step {step_index}: x_t.shape={tuple(x_t.shape)}, eps.shape={tuple(eps_or_v.shape)}, inferred B,F={B},{F}")
+                except Exception:
+                    pass
+                raise RuntimeError(f"Tweedie background requested but could not align latent_model_input to per-frame shape at step {step_index}")
+
+        else:
+            # treat eps as per-sample (epsN == B or unknown). Align x_t per-sample
+            base = epsN
+            if x_t.shape[0] == 2 * base:
+                x_t = x_t[base:]
+            elif x_t.shape[0] != base:
+                # diagnostic
+                lat = callback_kwargs.get('latents', None)
+                try:
+                    print(f"[ERROR] Tweedie batch mismatch at step {step_index}: x_t.shape={tuple(x_t.shape) if hasattr(x_t,'shape') else type(x_t)}, noise_pred_firstdim={epsN}")
+                    print(f"[ERROR] latents shape: {tuple(lat.shape) if hasattr(lat,'shape') else None}")
+                except Exception:
+                    pass
+                raise RuntimeError(f"Tweedie background requested but batch size mismatch at step {step_index}: x_t={x_t.shape[0]}, noise_pred={epsN}")
+
+        sched = pipeline.scheduler
+        try:
+            alpha_t, sigma_t = self._alpha_sigma_from_scheduler(sched, timestep)
+        except Exception as e:
+            raise RuntimeError(f"Failed to compute alpha/sigma for step {step_index}: {e}")
+
+        pred_type = str(getattr(sched.config, 'prediction_type', 'epsilon') or 'epsilon').lower()
+
+        if pred_type in ('epsilon', 'eps'):
+            x0_latents = (x_t - sigma_t * eps_or_v) / max(alpha_t, 1e-12)
+        elif pred_type in ('v', 'v_prediction', 'v-prediction'):
+            x0_latents = alpha_t * x_t - sigma_t * eps_or_v
+        elif pred_type in ('sample', 'x0'):
+            x0_latents = eps_or_v
+        else:
+            raise RuntimeError(f"Unsupported scheduler prediction_type for Tweedie restore: {pred_type}")
+
+        if x0_latents.dim() == 5:
+            x0_latents = x0_latents[0]
+
+        scaling = float(getattr(self.vae.config, 'scaling_factor', 0.18215))
+        x0_latents = x0_latents.to(device=self.device, dtype=torch.float32)
+        imgs = self.vae.decode(x0_latents / scaling).sample
+        imgs = (imgs.clamp(-1, 1) + 1) / 2.0
+        imgs = (imgs * 255.0).clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy()
+        self._tweedie_views_by_step[int(step_index)] = [imgs[i] for i in range(imgs.shape[0])]
+        try:
+            print(f"[DEBUG] stored tweedie bg for step {step_index}: {len(self._tweedie_views_by_step[int(step_index)])} views")
+        except Exception:
+            pass
     
 
 
-    def _resolve_heads(self, pair: Dict[str, Any]):
+    def _resolve_heads(self, pair: Dict[str, Any], F: int):
         """
         Return a (unet_head, vggt_head) tuple by instantiating from per-pair
         overrides or falling back to the global `visualize_config` settings.
@@ -384,6 +992,29 @@ class AttentionVisualizationCallback(PipelineCallback):
             raise RuntimeError("Unified logit head class 'softmax' not found")
         if viz_head_cls is None:
             raise RuntimeError("Unified viz head class 'softmax_headmean' not found")
+        
+        ## view 수
+        
+        loss_keys = self.visualize_config.get('loss_key', None) ## target, reference, all
+        if loss_keys == "target":
+            loss_num_view = 1
+        elif loss_keys == "reference":
+            loss_num_view = F - 1
+        elif loss_keys == "all":
+            loss_num_view = F
+        else:
+            raise ValueError(f"visualize_config['loss_key'] {loss_keys} not implemented")
+        
+        vis_keys = self.visualize_config.get('viz_key', None) ## target, reference, all
+        if vis_keys == "target":
+            viz_num_view = 1
+        elif vis_keys == "reference":
+            viz_num_view = F - 1
+        elif vis_keys == "all":
+            viz_num_view = F
+        else:
+            raise ValueError(f"visualize_config['viz_key'] {vis_keys} not implemented")
+        
 
         # kwargs resolution: prefer per-pair kwargs, then global visualize_config
         unet_kwargs = pair.get('unet_logit_head_kwargs', None) if isinstance(pair, dict) else None
@@ -392,10 +1023,12 @@ class AttentionVisualizationCallback(PipelineCallback):
         mode_loss = str(pair.get('loss_softmax_mode', 'global')).lower()
         mode_viz = str(pair.get('viz_softmax_mode', 'global')).lower()
         # dict + dict 연산 오류 수정: dict.update() 또는 {**dict1, **dict2} 사용
-        unet_loss_kwargs = {**(unet_kwargs or {}), 'per_view': mode_loss == 'per_view'}
-        vggt_loss_kwargs = {**(vggt_kwargs or {}), 'per_view': mode_loss == 'per_view'}
-        unet_viz_kwargs = {**(unet_kwargs or {}), 'per_view': mode_viz == 'per_view'}
-        vggt_viz_kwargs = {**(vggt_kwargs or {}), 'per_view': mode_viz == 'per_view'}
+        unet_loss_kwargs = {**(unet_kwargs or {}), 'per_view': mode_loss == 'per_view', 'num_view_for_per_view': loss_num_view}
+        vggt_loss_kwargs = {**(vggt_kwargs or {}), 'per_view': mode_loss == 'per_view', 'num_view_for_per_view': loss_num_view}
+        unet_viz_kwargs = {**(unet_kwargs or {}), 'per_view': mode_viz == 'per_view', 'num_view_for_per_view': viz_num_view}
+        # vggt_viz_kwargs = {**(vggt_kwargs or {}), 'per_view': mode_viz == 'per_view', 'num_view_for_per_view': viz_num_view}
+        vggt_viz_kwargs = {**(vggt_kwargs or {}), 'per_view': True, 'num_view_for_per_view': viz_num_view}
+
         
         unet_loss_head = logit_head_cls(**unet_loss_kwargs)
         vggt_loss_head = logit_head_cls(**vggt_loss_kwargs)
@@ -469,19 +1102,40 @@ class AttentionVisualizationCallback(PipelineCallback):
     
     ##### VISUALIZATION UTILS #####
     def _attn_gray_to_rgb(self, gray: np.ndarray) -> np.ndarray:
-        """Map normalized [0,1] gray heatmap to RGB uint8 (simple HSV-like colormap)."""
-        h = (1.0 - gray) * (2.0 / 3.0)
-        s = np.ones_like(gray)
-        v = np.ones_like(gray)
+        """Map normalized [0,1] gray heatmap to RGB uint8 (simple HSV-like colormap).
+
+        Accepts either a numpy array or a torch tensor. Preserves dtype/device for
+        torch inputs by converting to CPU numpy for processing and returning a
+        uint8 numpy array suitable for PIL.
+        """
+        # Accept torch tensors as input (convert to numpy)
+        is_torch = False
+        try:
+            if isinstance(gray, torch.Tensor):
+                is_torch = True
+                gray_arr = gray.detach().cpu().numpy()
+            else:
+                gray_arr = np.array(gray)
+        except Exception:
+            gray_arr = np.array(gray)
+
+        # Ensure float in [0,1]
+        gray_arr = gray_arr.astype(np.float32)
+        # clamp defensively
+        gray_arr = np.clip(gray_arr, 0.0, 1.0)
+
+        h = (1.0 - gray_arr) * (2.0 / 3.0)
+        s = np.ones_like(gray_arr)
+        v = np.ones_like(gray_arr)
         hp = (h * 6.0)
-        i = np.floor(hp).astype(np.int32) % 6
+        i = (np.floor(hp).astype(np.int32)) % 6
         f = hp - np.floor(hp)
-        p = np.zeros_like(gray)
+        p = np.zeros_like(gray_arr)
         q = 1.0 - f
         t = f
-        r = np.empty_like(gray)
-        g = np.empty_like(gray)
-        b = np.empty_like(gray)
+        r = np.empty_like(gray_arr)
+        g = np.empty_like(gray_arr)
+        b = np.empty_like(gray_arr)
         mask = (i == 0)
         r[mask], g[mask], b[mask] = v[mask], t[mask], p[mask]
         mask = (i == 1)
@@ -521,8 +1175,9 @@ class AttentionVisualizationCallback(PipelineCallback):
         max_y, max_x = np.unravel_index(max_idx, attention_tile.shape)
 
         # compute softargmax (expectation) on the tile for consistency with debug
+        # NOTE: softargmax display disabled per user request; we still compute hard argmax
+        # for fallback but do not draw the soft-argmax marker.
         xs = np.arange(tile_side)
-        # note: attention_tile shape is (tile_side, tile_side)
         total = attention_tile.sum()
         if total > 0:
             pred_sx = (attention_tile * xs.reshape(1, tile_side)).sum(axis=(0, 1)) / (total + 1e-12)
@@ -546,10 +1201,6 @@ class AttentionVisualizationCallback(PipelineCallback):
         r_small = max(2, r_in // 2)
         d.ellipse((cx_hard - (r_small+2), cy_hard - (r_small+2), cx_hard + (r_small+2), cy_hard + (r_small+2)), fill=(255,255,255))
         d.ellipse((cx_hard - r_small, cy_hard - r_small, cx_hard + r_small, cy_hard + r_small), fill=(255,0,0))
-
-        # draw softargmax (yellow) with black border for contrast
-        d.ellipse((cx_soft - (r_in+2), cy_soft - (r_in+2), cx_soft + (r_in+2), cy_soft + (r_in+2)), fill=(0,0,0))
-        d.ellipse((cx_soft - r_in, cy_soft - r_in, cx_soft + r_in, cy_soft + r_in), fill=(255,255,0))
 
         return img
 
@@ -583,205 +1234,258 @@ class AttentionVisualizationCallback(PipelineCallback):
             F: int,
             query_idx_list: List[int],
             key_idx_list: List[int],
-
     ) -> None:
-        """Save attention overlay image similar to example, if configured.
+        """Save attention overlay image. Pred (위), GT (아래), 내부는 키-뷰 오버레이 그리드(기본 3x3)."""
 
-        Rules:
-        - Target (query) view is last frame (index F-1).
-        - Query point can be specified via visualize_config['viz_query_xy'] (x,y) or
-          visualize_config['viz_query_index'] (int). Otherwise a random point inside the
-          target view is sampled each time this function is called.
-        """
+        # ---------- helpers ----------
+        def preprocess_image(img: torch.Tensor) -> np.ndarray:
+            if img.min() < 0:
+                img = (img + 1.0) / 2.0
+            img = torch.clamp(img, 0, 1).detach().cpu()
+            return (img.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+
+        def _select_query_indices(qxy_cfg, qindex_cfg, num_queries_cfg, per_q, q_side=32):
+            """우선순위: 좌표 > 인덱스 > 개수 > 중앙토큰. 좌표는 canonical 32-grid 기준으로 스케일."""
+            q_in_views = []
+            base_q_side = 32
+            try:
+                scale = float(q_side) / float(base_q_side)
+            except Exception:
+                scale = 1.0
+
+            def _scale_and_clamp_coord(raw_x, raw_y):
+                try:
+                    rx = float(raw_x); ry = float(raw_y)
+                except Exception:
+                    rx = int(raw_x); ry = int(raw_y)
+                sx = int(round(rx * scale)); sy = int(round(ry * scale))
+                sx = max(0, min(q_side - 1, sx))
+                sy = max(0, min(q_side - 1, sy))
+                return sx, sy
+
+            if qxy_cfg is not None:
+                # (x, y) or [(x,y), ...]
+                if (isinstance(qxy_cfg, (list, tuple))
+                    and len(qxy_cfg) > 0
+                    and not isinstance(qxy_cfg[0], (int, float))):
+                    for pair in qxy_cfg:
+                        qx_raw, qy_raw = pair[0], pair[1]
+                        qx, qy = _scale_and_clamp_coord(qx_raw, qy_raw)
+                        q_in_views.append(qy * q_side + qx)
+                else:
+                    qx_raw, qy_raw = qxy_cfg[0], qxy_cfg[1]
+                    qx, qy = _scale_and_clamp_coord(qx_raw, qy_raw)
+                    q_in_views.append(qy * q_side + qx)
+            elif qindex_cfg is not None:
+                if isinstance(qindex_cfg, (list, tuple)):
+                    for qi in qindex_cfg:
+                        q_in_views.append(int(qi) % per_q)
+                else:
+                    q_in_views.append(int(qindex_cfg) % per_q)
+            elif num_queries_cfg is not None:
+                try:
+                    num_queries = int(num_queries_cfg)
+                except Exception:
+                    num_queries = 1
+                num_queries = max(1, num_queries)
+                max_indices = per_q
+                if num_queries >= max_indices:
+                    q_in_views = list(range(max_indices))
+                else:
+                    rand_indices = torch.randperm(max_indices, device=torch.device('cpu'))[:num_queries].tolist()
+                    q_in_views = [int(idx) for idx in rand_indices]
+            else:
+                q_in_views = [per_q // 2]
+            return q_in_views
+
+        # def tiles_from_vec(vec: torch.Tensor, num_views: int, side: int) -> List[np.ndarray]:
+        #     """1D 벡터 -> per-view 정규화된 side×side 타일 리스트."""
+        #     tiles: List[np.ndarray] = []
+        #     vec_np = vec.detach().cpu().numpy()
+        #     per = side * side
+        #     for v in range(num_views):
+        #         seg = vec_np[v * per:(v + 1) * per]
+        #         m = seg.min(); M = seg.max()
+        #         if M > m:
+        #             seg = (seg - m) / (M - m)
+        #         else:
+        #             seg = np.zeros_like(seg)
+        #         tiles.append(seg.reshape(side, side))
+        #     return tiles
+
+        # def build_grid(tiles: List[np.ndarray], backgrounds: List[np.ndarray], ncols: int = 3) -> _PILImage.Image:
+        #     """타일들을 배경 위에 블렌딩해 ncols 격자로 배치. 부족분은 패딩."""
+        #     assert len(tiles) == len(backgrounds), f"#tiles({len(tiles)}) != #bgs({len(backgrounds)})"
+        #     blended_imgs = []
+        #     for tile, bg in zip(tiles, backgrounds):
+        #         Hc, Wc = bg.shape[:2]
+        #         color = self._attn_gray_to_rgb(tile)
+        #         color_img = _PILImage.fromarray(color).resize((Wc, Hc), _PILImage.NEAREST)
+        #         alpha = float(self.visualize_config.get('viz_alpha', 0.6))
+        #         blended = (bg.astype(np.float32) * (1 - alpha) + np.array(color_img).astype(np.float32) * alpha)
+        #         blended = blended.clip(0, 255).astype(np.uint8)
+        #         blended_pil = _PILImage.fromarray(blended)
+        #         blended_pil = self._draw_max_attention_point(blended_pil, tile, k_side)
+        #         blended_imgs.append(np.array(blended_pil))
+
+        #     n = len(blended_imgs)
+        #     ncols = max(1, int(self.visualize_config.get('viz_grid_cols', ncols)))  # 기본 3열, 설정 가능
+        #     nrows = int(math.ceil(n / ncols))
+        #     H0, W0 = blended_imgs[0].shape[:2]
+        #     pad = np.zeros((H0, W0, 3), dtype=np.uint8)
+        #     rows = []
+        #     for r in range(nrows):
+        #         row_imgs = blended_imgs[r*ncols:(r+1)*ncols]
+        #         while len(row_imgs) < ncols:
+        #             row_imgs.append(pad.copy())
+        #         rows.append(np.concatenate(row_imgs, axis=1))
+        #     grid = np.concatenate(rows, axis=0)
+        #     return _PILImage.fromarray(grid)
+
+        # ---------- I/O ----------
         save_dir = self.visualize_config.get('viz_save_dir', None)
-       
-
         if save_dir is not None:
             os.makedirs(save_dir, exist_ok=True)
 
-        # Move to CPU float32 for visualization
-        pred = pred_logits.detach().to(dtype=torch.float32, device='cpu')  # [B,H,Q,K]
-        gt = gt_logits.detach().to(dtype=torch.float32, device='cpu')
+        # ---------- tensors to CPU float ----------
+        _target_dtype = torch.float16 if self.visualize_config.get('viz_dtype','fp16') == 'fp16' else torch.float32
+        pred_orig = pred_logits.detach().to(dtype=_target_dtype)   # device 유지
+        gt_orig   = gt_logits.detach().to(dtype=_target_dtype)
 
-        B, Hh, Q, K = pred.shape
-        
-        # token geometry
-        num_q_views = max(1, len(query_idx_list))
-        
-        q_hw = Q // num_q_views
-        q_side = int(math.sqrt(q_hw))
-        assert q_side * q_side == q_hw, f"Q per-view must be square, got {q_hw}"
+
+
         
         num_k_views = max(1, len(key_idx_list))
-        k_hw = K // num_k_views
-        k_side = int(math.sqrt(k_hw))
-        assert k_side * k_side == k_hw, f"K per-view must be square, got {k_hw}"
+        num_q_views = max(1, len(query_idx_list))
 
-        # choose query token inside target view (F-1)
-        assert (F - 1) in query_idx_list, "Target view (last) must be included in query indices."
-        tgt_q_view_pos = query_idx_list.index(F - 1)
-        
-        # query point 선택
-        qxy = self.visualize_config.get('viz_query_xy', None)
-        qindex = self.visualize_config.get('viz_query_index', None)
-        if qxy is not None:
-            qx, qy = int(qxy[0]), int(qxy[1])
-            q_in_view = int(qy) * q_side + int(qx)
-        elif qindex is not None:
-            q_in_view = int(qindex) % (q_side * q_side)
-            qy, qx = divmod(q_in_view, q_side)
+        # ---------- reshape & sanity checks ----------
+        if pred_orig.dim() == 5:  # [B, H, num_q_views*per_q, num_k_views, per_k]
+            Bp, Hp, Qp, num_k_from_shape_p, per_k_p = pred_orig.shape
+            if num_k_from_shape_p != num_k_views:
+                raise ValueError(f"UNet num_k_from_shape ({num_k_from_shape_p}) != num_k_views ({num_k_views})")
+            per_q_p = Qp // num_q_views
+            if Qp % num_q_views != 0:
+                raise ValueError(f"UNet per_q ({per_q_p}) != num_q_views ({num_q_views}) * per_q ({per_q_p})")
+            pred = pred_orig.view(Bp, Hp, num_q_views, per_q_p, num_k_views, per_k_p)
+
+        elif pred_orig.dim() == 4:  # [B, H, num_q_views*per_q, num_k_views*per_k]
+            Bp, Hp, Qp, Kp = pred_orig.shape
+            
+            per_q_p = Qp // num_q_views
+            per_k_p = Kp // num_k_views
+            
+            if Kp % num_k_views != 0:
+                raise ValueError(f"UNet K ({Kp}) not divisible by num_k_views ({num_k_views})")
+            if Qp % num_q_views != 0:
+                raise ValueError(f"UNet per_q ({per_q_p}) != num_q_views ({num_q_views}) * per_k ({per_k_p})")
+            pred = pred_orig.view(Bp, Hp, num_q_views, per_q_p, num_k_views, per_k_p)
         else:
-            q_in_view = int(torch.randint(0, q_side * q_side, (1,), device=torch.device('cpu')).item())
-            qy, qx = divmod(q_in_view, q_side)
-        q_idx = tgt_q_view_pos * q_hw + q_in_view
+            raise ValueError(f"UNet unsupported pred_logits shape: {pred_orig.shape}")
 
-        # `pred` and `gt` are expected to already be probabilities (softmax applied
-        # by the logit head used upstream). Use them directly and average over heads
-        # for aggregated visualization.
-        pred_prob = pred.mean(dim=1)[0]  # [Q,K]
-        gt_prob = gt.mean(dim=1)[0]      # [Q,K]
+        if gt_orig.dim() == 5:  # [B, H, num_q_views*per_q, num_k_views, per_k]
+            Bg, Hg, Qg, num_k_from_shape_g, per_k_g = gt_orig.shape
+            if num_k_from_shape_g != num_k_views:
+                raise ValueError(f"VGGT num_k_from_shape ({num_k_from_shape_g}) != num_k_views ({num_k_views})")
+            per_q_g = Qg // num_q_views
+            if Qg % num_q_views != 0:
+                raise ValueError(f"VGGT per_q ({per_q_g}) != num_q_views ({num_q_views}) * per_k ({per_k_g})")
+            gt = gt_orig.view(Bg, Hg, num_q_views, per_q_g, num_k_views, per_k_g)
 
-        # select query row
-        pred_vec = pred_prob[q_idx]  # [K]
-        gt_vec = gt_prob[q_idx]      # [K]
+        elif gt_orig.dim() == 4:   # [B, H, num_q_views*per_q, num_k_views*per_k]
+            Bg, Hg, Qg, Kg = gt_orig.shape
+            if Kg % num_k_views != 0:
+                raise ValueError(f"VGGT K ({Kg}) not divisible by num_k_views ({num_k_views})")
+            per_k_g = Kg // num_k_views
+            per_q_g = Qg // num_q_views
+            if Qg % num_q_views != 0:
+                raise ValueError(f"VGGT per_q ({per_q_g}) != num_q_views ({num_q_views}) * per_k ({per_k_g})")
+            gt = gt_orig.view(Bg, Hg, num_q_views, per_q_g, num_k_views, per_k_g)
+        else:
+            raise ValueError(f"VGGT unsupported gt_logits shape: {gt_orig.shape}")
 
-        # per key-view heatmap tiles
-        def tiles_from_vec(vec: torch.Tensor, num_views: int, side: int) -> List[np.ndarray]:
-            tiles: List[np.ndarray] = []
-            vec_np = vec.detach().cpu().numpy()
-            for v in range(num_views):
-                seg = vec_np[v * side * side:(v + 1) * side * side]
-                m = seg.min(); M = seg.max()
-                if M > m:
-                    seg = (seg - m) / (M - m)
-                else:
-                    seg = np.zeros_like(seg)
-                tiles.append(seg.reshape(side, side))
-            return tiles
+        # per_q/per_k 확정
+        if per_q_g != per_q_p:
+            raise ValueError(f"per_q_g ({per_q_g}) != per_q_p ({per_q_p})")
+        if per_k_g != per_k_p:
+            raise ValueError(f"per_k_g ({per_k_g}) != per_k_p ({per_k_p})")
+        per_q = int(per_q_g)
+        per_k = int(per_k_g)
 
-        pred_tiles = tiles_from_vec(pred_vec, num_k_views, k_side)
-        gt_tiles = tiles_from_vec(gt_vec, num_k_views, k_side)
+        # 토큰 geometry
+        q_side = int(math.sqrt(per_q))
+        if q_side * q_side != per_q:
+            raise ValueError(f"Q per-view must be square, got {per_q}")
+        k_side = int(math.sqrt(per_k))
+        if k_side * k_side != per_k:
+            raise ValueError(f"K per-view must be square, got {per_k}")
 
-        # backgrounds in the same order as key_idx_list
-        bg_images: List[np.ndarray] = []
-        with torch.no_grad():
-            imgs = self.batch['image'][0]  # [F,3,H,W]
-            for vidx in key_idx_list:
-                t = imgs[vidx].to(dtype=torch.float32, device='cpu')
-                if t.min() < 0:  # [-1,1] → [0,1]
-                    t = (t + 1.0) / 2.0
-                t = torch.clamp(t, 0, 1)
-                arr = (t.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-                bg_images.append(arr)
+        # ---------- config ----------
+        qxy_cfg        = self.visualize_config.get('viz_query_xy', None)
+        qindex_cfg     = self.visualize_config.get('viz_query_index', None)
+        num_queries_cfg= self.visualize_config.get('viz_num_queries', None)
 
-        # target (query) background is last frame F-1
-        q_bg = self.batch['image'][0, F - 1].detach().to(dtype=torch.float32, device='cpu')
-        if q_bg.min() < 0:
-            q_bg = (q_bg + 1.0) / 2.0
-        q_bg = torch.clamp(q_bg, 0, 1)
-        q_bg_np = (q_bg.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+        # ---------- average over heads ----------
+        pred_mean = pred.mean(dim=1)  # (B, num_q_views, per_q, num_k_views, per_k)
+        gt_mean   = gt.mean(dim=1)
 
-        # build canvases (Q image + per-view overlays for pred and gt)
-        def build_row(tiles: List[np.ndarray], backgrounds: List[np.ndarray]) -> _PILImage.Image:
-            assert len(tiles) == len(backgrounds)
-            outs: List[np.ndarray] = []
-            for view_idx, (tile, bg) in enumerate(zip(tiles, backgrounds)):
-                Hc, Wc = bg.shape[0], bg.shape[1]
-                # colorize heatmap and resize to bg size
-                color = self._attn_gray_to_rgb(tile)
-                color_img = _PILImage.fromarray(color).resize((Wc, Hc), _PILImage.NEAREST)
-                color_np = np.array(color_img)
-                alpha = float(self.visualize_config.get('viz_alpha', 0.6))
-                blended = (bg.astype(np.float32) * (1.0 - alpha) + color_np.astype(np.float32) * alpha).clip(0, 255).astype(np.uint8)
-                
-                # 각 view별로 가장 확률이 높은 부분에 파란 점 추가
-                blended_pil = _PILImage.fromarray(blended)
-                blended_pil = self._draw_max_attention_point(blended_pil, tile, k_side)
-                
-                # self attention 영역 (target view)에 특별한 경계선 추가
-                # current_key_view_idx = key_idx_list[view_idx]
-                # if current_key_view_idx == F - 1:  # target view (self attention)
-                #     # 노란색 경계선으로 self attention 영역 표시
-                #     draw = _PILDraw.Draw(blended_pil)
-                #     border_width = 3
-                #     w, h = blended_pil.size
-                #     # 노란색 경계선 그리기
-                #     for i in range(border_width):
-                #         draw.rectangle([i, i, w-1-i, h-1-i], outline=(255, 255, 0), width=1)
-                
-                blended = np.array(blended_pil)
-                outs.append(blended)
-            row = np.concatenate(outs, axis=1)
-            return _PILImage.fromarray(row)
+        # ---------- backgrounds ----------
+        # bg_keys, bg_queries = [], []
+        # with torch.no_grad():
+        #     imgs = self.batch['image'][0]  # [F,3,H,W]
+        #     for vidx in key_idx_list:
+        #         bg_keys.append(preprocess_image(imgs[vidx]))
+        #     for vidx in query_idx_list:
+        #         bg_queries.append(preprocess_image(imgs[vidx]))
 
-        row_pred = build_row(pred_tiles, bg_images)
-        row_gt = build_row(gt_tiles, bg_images)
+        # if len(bg_keys) == 0:
+        #     # 키-뷰가 없으면 시각화 불가
+        #     return
 
-        # build Q panel (with query dot)
-        q_side_px = min(q_bg_np.shape[0], q_bg_np.shape[1])
-        q_panel = _PILImage.fromarray(q_bg_np).resize((q_side_px, q_side_px), _PILImage.NEAREST)
-        q_panel = self._draw_query_point(q_panel, qx, qy, q_side)
+        # ---------- query selection ----------
+        q_in_views = _select_query_indices(qxy_cfg, qindex_cfg, num_queries_cfg, per_q, q_side)
 
-        # compose final image: two rows (Q+Pred) and (Q+GT)
-        header_h = max(18, int(q_side_px * 0.20))
-        gap = 8
-        row_w = q_panel.width + row_pred.width
-        row_h1 = max(q_panel.height, row_pred.height)
-        row_h2 = max(q_panel.height, row_gt.height)
-        canvas_w = row_w
-        canvas_h = header_h + row_h1 + gap + header_h + row_h2
-        canvas = _PILImage.new('RGB', (canvas_w, canvas_h), color=(0, 0, 0))
+        # prepare flattened probability buffers for visualization
+        Bp_, num_qv_p, per_q_chk_p, num_kv_p, per_k_p2 = pred_mean.shape
+        pred_flat = pred_mean.reshape(Bp_, num_qv_p * per_q_chk_p, num_kv_p * per_k_p2)
+        pred_prob = pred_flat[0]
 
-        # headers text (simple)
-        def put_text(img: _PILImage.Image, text: str, xy: Tuple[int, int]):
-            d = _PILDraw.Draw(img)
-            d.text(xy, text, fill=(255, 255, 255))
+        Bg_, num_qv_g2, per_q_chk_g, num_kv_g2, per_k_g2 = gt_mean.shape
+        gt_flat = gt_mean.reshape(Bg_, num_qv_g2 * per_q_chk_g, num_kv_g2 * per_k_g2)
+        gt_prob = gt_flat[0]
+        
+        grid_cols = int(self.visualize_config.get('viz_grid_cols', num_k_views))
 
-        # first row
-        x, y = 0, header_h
-        canvas.paste(q_panel, (x, y)); x += q_panel.width
-        canvas.paste(row_pred, (x, y))
-        put_text(canvas, "Q", (4, 2))
-        put_text(canvas, f"Pred {layer_key}", (q_panel.width + 4, 2))
+        # --- 시퀀스 이름 ---
+        seq = self.visualize_config.get('viz_seq_name', None)
 
-        # second row
-        x, y = 0, header_h + row_h1 + gap + header_h
-        canvas.paste(q_panel, (x, y)); x += q_panel.width
-        canvas.paste(row_gt, (x, y))
-        put_text(canvas, "Q", (4, header_h + row_h1 + gap + 2))
-        put_text(canvas, f"GT {layer_key}", (q_panel.width + 4, header_h + row_h1 + gap + 2))
+        # pred_prob, gt_prob 방금 만든 직후!
+        rec = self._pack_viz_record(
+            step_index=step_index, layer_key=layer_key,
+            pred_mean=pred_mean, gt_mean=gt_mean,
+            F=F, per_q=per_q, per_k=per_k, q_side=q_side, k_side=k_side,
+            query_idx_list=query_idx_list, key_idx_list=key_idx_list,
+            q_in_views=q_in_views, grid_cols=grid_cols, seq=seq
+        )
 
-        # Optional: save to disk if a directory is provided
-        out_path = None
-        if save_dir is not None:
-            out_path = os.path.join(save_dir, f"attn_step{int(step_index)}_{layer_key}_q{int(q_idx)}.png")
-            canvas.save(out_path)
-            if step_index % 10 == 0:
-                print(f"Saved attention overlay: {out_path}")
+        defer = bool(self.visualize_config.get('viz_defer_render', True))
+        if defer:
+            # ✅ 보류: 배경 준비(이미지→numpy) 절대 하지 않음
+            self._pending_viz.append(rec)
+            return
+        else:
+            # ⬇️ 즉시 렌더일 때만 배경 준비가 필요하면 여기서 하거나,
+            #     더 깔끔하게는 _render_viz_record가 알아서 배경을 만들게 두면 됩니다.
+            # (권장) 배경은 _render_viz_record에서 만들도록 두고, 여기선 바로 호출만:
+            self._render_viz_record(
+                rec,
+                pred_views=None,             # 최종 pred 없음
+                cond_num=self.cond_num,
+                replace_targets_in_unet=False
+            )
+            return
 
-        # attention 이미지를 저장만 하고 wandb 로깅은 하지 않음 (메인에서 일괄 처리)
-        if self.visualize_config.get('viz_log_wandb', True):
-            # sequence name: prefer explicit config name then batch
-            seq = self.visualize_config.get('viz_seq_name', None)
-            if seq is None and isinstance(self.batch, dict) and ('sequence_name' in self.batch):
-                seq = self.batch['sequence_name']
-                if isinstance(seq, (list, tuple)):
-                    seq = seq[0]
-            if seq is None:
-                seq = 'sample'
+     
 
-            # attention 이미지를 callback 내부에 저장 (wandb 로깅은 메인에서)
-            # include step in the key so multiple viz steps don't overwrite each other
-            key = f"attn/{seq}/step{int(step_index)}/{layer_key}"
-            # store as a list of entries (preserve history and avoid key collisions)
-            if not hasattr(self, 'attention_images_list'):
-                self.attention_images_list = []
-
-            self.attention_images_list.append({
-                'key': key,
-                'image': canvas,
-                'caption': f"{seq} | {layer_key} | step {int(step_index)}",
-            })
 
     def _roll_gt_map(self, gt_tensor: torch.Tensor) -> torch.Tensor:
         """Circularly roll the GT map along the last dimension if configured.
@@ -1049,25 +1753,30 @@ class AttentionVisualizationCallback(PipelineCallback):
                 gt_query_resized = self._resize_token(gt_query, pred_query_size, F)
                 gt_key_resized = self._resize_token(gt_key, pred_key_size, F)
                 
+                # Compute GT attention logits once (used by both loss and viz branches).
+                # This prevents UnboundLocalError when viz is enabled but loss is not.
+                gt_attn_logit = self._get_gt_costmap(gt_query_resized, gt_key_resized, pair_metric, num_head=pred_attn_logit.shape[1])
                 ### 차원 정리
                 # gt_query_resized: (B, 1, pred_query_size, pred_query_size, C)
                 # gt_key_resized: (B, 1, pred_key_size, pred_key_size, C)
                 # pred_attn_logit: (B, Head, pred_query_size, pred_key_size)
                 
-                unet_softmax_head, vggt_softmax_head, unet_viz_head, vggt_viz_head = self._resolve_heads(pair)
+                unet_softmax_head, vggt_softmax_head, unet_viz_head, vggt_viz_head = self._resolve_heads(pair, F)
                 if unet_softmax_head is None or vggt_softmax_head is None or unet_viz_head is None or vggt_viz_head is None:
                     raise RuntimeError(f"Missing unet/vggt logit head for pair: {pair}")
 
+                # Define layer_key once for both loss and visualization branches to
+                # avoid UnboundLocalError when one branch is disabled.
+                layer_key = f"unet{unet_layer}_vggt{vggt_layer}"
+
                 if loss_enabled:
-                    layer_key = f"unet{unet_layer}_vggt{vggt_layer}"
                     print(f"Calculating loss for step {step_index}, layer {layer_key}")
                     loss_query_idx, loss_key_idx = self._extract_view_indices(F, mode="loss")
                     
-                    # pred_attn_logit_sliced: (B, Head, pred_query_size, pred_key_size) / (2,10,1024,2048)
+                    # pred_attn_logit_sliced: (B, Head, pred_query_size, pred_key_size) / (2,10,3072,3072)
                     pred_attn_logit_sliced = self._slice_attention_map(pred_attn_logit, loss_query_idx, loss_key_idx, F)
                     
                     # gt_attn_logit_sliced: (B, Head, pred_query_size, pred_key_size)
-                    gt_attn_logit = self._get_gt_costmap(gt_query_resized, gt_key_resized, pair_metric, num_head=pred_attn_logit.shape[1])
                     gt_attn_logit_sliced = self._slice_attention_map(gt_attn_logit, loss_query_idx, loss_key_idx, F)
 
                     print(f"[DEBUG] pred_attn_logit_sliced.shape: {pred_attn_logit_sliced.shape}")
@@ -1140,13 +1849,15 @@ class AttentionVisualizationCallback(PipelineCallback):
                     gt_attn_logit_viz = self._slice_attention_map(gt_attn_logit, viz_query_idx, viz_key_idx, F)
 
                     # For visualization, always use Softmax_HeadMean and only consider
-                    viz_mode = pair.get('viz_softmax_mode', None)
+                    # viz_mode = pair.get('viz_softmax_mode', None)
                     # determine number of key-views for viz (prefer pair, then global config)
-                    viz_num_k = pair.get('viz_num_key_views', None)
-                    if viz_num_k is None:
-                        viz_num_k = int(self.visualize_config.get('viz_num_key_views', self.visualize_config.get('loss_num_key_views', 1)))
-                    per_view_flag = str(viz_mode).lower() == 'per_view'
-                    num_view_for_per_view = int(viz_num_k) if per_view_flag else None
+                    # viz_num_k = pair.get('viz_num_key_views', None)
+                    # if viz_num_k is None:
+                    #     viz_num_k = int(self.visualize_config.get('viz_num_key_views', self.visualize_config.get('loss_num_key_views', 1)))
+                    # per_view_flag = str(viz_mode).lower() == 'per_view'
+                    # num_view_for_per_view = int(viz_num_k) if per_view_flag else None
+                    
+                    # import pdb; pdb.set_trace()
 
                     pred_processed_viz = unet_viz_head(pred_attn_logit_viz)
                     gt_processed_viz = vggt_viz_head(gt_attn_logit_viz)
@@ -1154,13 +1865,13 @@ class AttentionVisualizationCallback(PipelineCallback):
                     print(f"[DEBUG] pred_processed_viz.shape: {pred_processed_viz.shape}")
                     print(f"[DEBUG] gt_processed_viz.shape: {gt_processed_viz.shape}")
                     
-                    if len(pred_processed_viz.shape)== 5:
-                        pred_processed_viz = pred_processed_viz.mean(dim=-2)
-                    if len(gt_processed_viz.shape)== 5:
-                        gt_processed_viz = gt_processed_viz.mean(dim=-2)
+                    # if len(pred_processed_viz.shape)== 5:
+                    #     pred_processed_viz = pred_processed_viz.mean(dim=-2)
+                    # if len(gt_processed_viz.shape)== 5:
+                    #     gt_processed_viz = gt_processed_viz.mean(dim=-2)
                         
-                    print(f"[DEBUG] pred_processed_viz.shape: {pred_processed_viz.shape}")
-                    print(f"[DEBUG] gt_processed_viz.shape: {gt_processed_viz.shape}")
+                    # print(f"[DEBUG] pred_processed_viz.shape: {pred_processed_viz.shape}")
+                    # print(f"[DEBUG] gt_processed_viz.shape: {gt_processed_viz.shape}")
 
                     self._maybe_save_attn_overlay(
                         step_index=step_index,
@@ -1217,14 +1928,19 @@ class AttentionVisualizationCallback(PipelineCallback):
             print(f"Error in attention visualization callback at step {step_index}: {e}")
             import traceback
             traceback.print_exc()
-            
-            
         finally:
-            # 각 step 이후 UNet attention cache 정리
-            if hasattr(pipeline, 'unet'):
-                clear_attn_cache(pipeline.unet)
-                if step_index % 10 == 0:  # 10 step마다만 로그 출력
-                    print(f"Cleared UNet attention cache after step {step_index}")
+            # Avoid clearing processor-level attention caches here because cached
+            # tensors are already popped by `pop_cached_attn`. Only free global
+            # GPU memory to avoid surprising removal of cached data across calls.
+            # If tweedie is enabled, let errors propagate (no fallback)
+            if self._use_tweedie_bg:
+                self._maybe_store_tweedie_bg(pipeline, step_index, timestep, callback_kwargs)
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            if step_index % 10 == 0:
+                print(f"Emptied CUDA cache after step {step_index}")
         
         return callback_kwargs
     
@@ -1388,3 +2104,4 @@ class AttentionVisualizationCallback(PipelineCallback):
         finally:
             # do not clear rows here; caller may want to keep in-memory until reset
             pass
+

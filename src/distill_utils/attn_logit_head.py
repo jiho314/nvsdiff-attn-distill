@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import numpy as np
+from einops import rearrange
 '''
 x = [B, Head, Q, K]
 '''
@@ -241,7 +242,95 @@ class HeadMlp_SoftArgmax(HeadMlp_Softmax):
         return x.flatten(-2,-1) # B 1 Q V*2
 
 
+class Conv4D(nn.Module):
+    ''' https://github.com/cvlab-kaist/AM-Adapter/blob/main/src/models/conv4d.py
+    '''
+    def __init__(self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        **kwargs
+    ):
+        super(Conv4D, self).__init__()
+        self.query_conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
+        self.key_conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
 
+    def forward(self, x, num_view, num_view_query, **kwargs):
+        ''' x: B Head Q K = B Head VHW VHW
+        '''
+        B, Head, Q, K = x.shape
+        v_q, h_q, w_q  = num_view_query, int((Q // num_view_query) ** 0.5), int((Q // num_view_query) ** 0.5) 
+        v_k, h_k, w_k  = num_view, int((K // num_view) ** 0.5), int((K // num_view) ** 0.5)
+        assert h_q == h_k and w_q == w_k, "4D conv requires same spatial size between query and key"
+        x_query, x_key = x.clone(), x.clone()
+        x_query = rearrange(x_query, "B Head (v_q h_q w_q) (v_k h_k w_k) -> (B v_q v_k h_k w_k) Head h_q w_q", v_q=v_q, v_k=v_k, h_q=h_q, w_q=w_q, h_k=h_k, w_k=w_k) # (B v1 v2 h_k w_k) Head h_q w_q
+        x_query = self.query_conv(x_query) 
+        x_query = rearrange(x_query, "(B v_q v_k h_k w_k) Head h_q w_q -> B Head (v_q h_q w_q) (v_k h_k w_k)", B=B, v_q=v_q, v_k=v_k, h_k=h_k, w_k=w_k, h_q=h_q, w_q=w_q) # B Head Q K
+
+        x_key = rearrange(x_key, "B Head (v_q h_q w_q) (v_k h_k w_k) -> (B v_q v_k h_q w_q) Head h_k w_k", v_q=v_q, v_k=v_k, h_q=h_q, w_q=w_q, h_k=h_k, w_k=w_k) # (B v1 v2 h_q w_q) Head h_k w_k
+        x_key = self.key_conv(x_key) 
+        x_key = rearrange(x_key, "(B v_q v_k h_q w_q) Head h_k w_k -> B Head (v_q h_q w_q) (v_k h_k w_k)", B=B, v_q=v_q, v_k=v_k, h_k=h_k, w_k=w_k, h_q=h_q, w_q=w_q) # B Head Q K
+
+        x = x_query + x_key
+        return x
+
+class Interpolate4D_HeadConv4D_Softmax(Softmax):
+    def __init__(self, 
+        in_head_num, 
+        conv_dim_ratio, # mid_dim / in_dim
+        group_num, 
+        depth, 
+        out_head_num = 1,
+        target_size = None,
+        interpolate_mode = 'nearest',
+        kernel_size=3, 
+        stride=1, 
+        padding=1, 
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.target_size = target_size
+        self.interpolate_mode = interpolate_mode
+        net = []
+        if depth <= 0:
+            net += [Conv4D(in_head_num, out_head_num, kernel_size=kernel_size, stride=stride, padding=padding)]
+        else:
+            mid_dim = int(in_head_num * conv_dim_ratio)
+            net += [Conv4D(in_head_num, mid_dim, kernel_size=kernel_size, stride=stride, padding=padding),
+                        nn.GroupNorm(group_num, mid_dim),
+                        nn.GELU()]
+            for _ in range(depth - 1):
+                net += [Conv4D(mid_dim, mid_dim, kernel_size=kernel_size, stride=stride, padding=padding),
+                        nn.GroupNorm(group_num, mid_dim),
+                        nn.GELU()]
+            net += [Conv4D(mid_dim, out_head_num, kernel_size=kernel_size, stride=stride, padding=padding)]
+        self.net = nn.Sequential(*net)
+
+    def forward(self, x, num_view, num_view_query, **kwargs):
+        ''' x: B Head Q K = B Head VHW VHW
+        '''
+        # interpolate 4D
+        if self.target_size is not None:
+            B, Head, Q, K = x.shape
+            v_q, h_q, w_q  = num_view_query, int((Q // num_view_query) ** 0.5), int((Q // num_view_query) ** 0.5) 
+            v_k, h_k, w_k  = num_view, int((K // num_view) ** 0.5), int((K // num_view) ** 0.5)
+            x = rearrange(x, "B Head (v_q h_q w_q) (v_k h_k w_k) -> (B v_q v_k h_k w_k) Head h_q w_q", v_q=v_q, v_k=v_k, h_q=h_q, w_q=w_q, h_k=h_k, w_k=w_k) # (B v1 v2 h_k w_k) Head h_q w_q
+            x = nn.functional.interpolate(x, size=self.target_size, mode=self.interpolate_mode)
+            x = rearrange(x, "(B v_q v_k h_k w_k) Head h_q w_q -> (B v_q v_k h_q w_q) Head h_k w_k", B=B, v_q=v_q, v_k=v_k, h_k=h_k, w_k=w_k, h_q=self.target_size, w_q=self.target_size) # (B v1 v2 h_q w_q) Head h_k w_k
+            x = nn.functional.interpolate(x, size=self.target_size, mode=self.interpolate_mode)
+            x = rearrange(x, "(B v_q v_k h_q w_q) Head h_k w_k -> B Head (v_q h_q w_q) (v_k h_k w_k)", B=B, v_q=v_q, v_k=v_k, h_k=self.target_size, w_k=self.target_size, h_q=self.target_size, w_q=self.target_size) # B Head Q K
+        # conv4d
+        for layer in self.net:
+            if isinstance(layer, Conv4D):
+                x = layer(x, num_view=num_view, num_view_query=num_view_query)
+            else:
+                x = layer(x)
+        # softmax
+        x = super().forward(x, num_view)
+        return x
+    
 def cycle_consistency_checker(costmap, pixel_threshold=None):
     ''' costmap : [B, HW, (V-1)*HW]
         cross cost/attn only
@@ -280,6 +369,8 @@ def cycle_consistency_checker(costmap, pixel_threshold=None):
     return final_distance_tensor
 
 
+
+# TODO: onehot
 from einops import rearrange
 class OneHot(nn.Module):
     ''' non-differentiable, just for GT'''
@@ -296,23 +387,6 @@ class OneHot(nn.Module):
         mask_per_view = cycle_consistency_checker(x, consistency_pixel_threshold ) # (B Head F1 F2) HW1 1
 
 
-        
-
-        # mask_per_view = cycle_consistency_checker()
-
-        # def get_consistency_mask(logit):
-        #     # assert config.distill_config.distill_query == "target", "consistency check only support distill_query to target"
-        #     B, Head, F1HW, F2HW = logit.shape  
-        #     assert F1HW == F2HW, "first process full(square) consistency mask"
-        #     # assert Head == 1, "costmap should have only one head, while consistency checking?"
-        #     HW = F1HW // F
-        #     logit = einops.rearrange(logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1 F2) HW1 HW2', B=B,Head=Head, F1=F, F2=F, HW1=HW, HW2=HW)
-        #     mask_per_view = cycle_consistency_checker(logit, **config.distill_config.get("consistency_check_cfg", {}) ) # (B Head F1 F2) HW
-        #     mask_per_view = einops.rearrange(mask_per_view, '(B Head F1 F2) HW 1 -> B Head (F1 HW) (F2 1)', B=B, Head=Head, F1=F, F2=F, HW=HW)
-        #     # mask = mask.any(dim=-1) # B Head Q(F1HW) 
-        #     return mask_per_view # B Head Q(F1HW) F2
-
-
         pass
 
 
@@ -325,6 +399,7 @@ LOGIT_HEAD_CLS = {
     # "headmlp": HeadMlp,
     "headmlp_softargmax": HeadMlp_SoftArgmax,
     "headmean_softargmax": HeadMean_SoftArgmax,
+    "interpolate4d_headconv4d_softmax": Interpolate4D_HeadConv4D_Softmax,
 }
 
 

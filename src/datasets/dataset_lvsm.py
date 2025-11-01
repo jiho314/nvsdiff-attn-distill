@@ -3,6 +3,7 @@
 import random
 import traceback
 import os
+from collections.abc import Mapping
 import numpy as np
 import PIL
 import torch
@@ -13,7 +14,7 @@ import torch.nn.functional as F
 
 
 class Dataset(Dataset):
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         super().__init__()
         self.config = config
 
@@ -25,7 +26,9 @@ class Dataset(Dataset):
         except Exception as e:
             print(f"Error reading dataset paths from '{self.config.dataset_path}'")
             raise e
-        
+
+        self.use_vggt_camera = bool(self.config.get("use_vggt_camera", False))
+        # self.scene_scale_factor = self._resolve_scene_scale_factor()
 
         self.use_idx_file = self.config.use_idx_file
         self.target_view_indices = None
@@ -65,6 +68,25 @@ class Dataset(Dataset):
 
     def __len__(self):
         return len(self.all_scene_paths)
+
+
+    # def _resolve_scene_scale_factor(self):
+    #     raw_value = self.config.get("scene_scale_factor", 1.35)
+    #     if isinstance(raw_value, Mapping):
+    #         key_order = ["vggt", "default"] if self.use_vggt_camera else ["default", "vggt"]
+    #         for key in key_order:
+    #             if key in raw_value:
+    #                 return float(raw_value[key])
+    #         for key in raw_value:
+    #             try:
+    #                 return float(raw_value[key])
+    #             except (TypeError, ValueError):
+    #                 continue
+    #         raise ValueError("scene_scale_factor mapping must contain numeric values")
+    #     try:
+    #         return float(raw_value)
+    #     except (TypeError, ValueError) as exc:
+    #         raise TypeError("scene_scale_factor must be a float or mapping of floats") from exc
 
 
     def build_intrinsic_matrix(self, fxfycxcy):
@@ -182,7 +204,7 @@ class Dataset(Dataset):
         end_frame = start_frame + frame_dist
         sampled_frames = random.sample(range(start_frame + 1, end_frame), N-2)
         image_indices = [start_frame, end_frame] + sampled_frames 
-        image_indices = sorted(image_indices) 
+        image_indices = sorted(image_indices) # modified
         if self.config.shuffle_prob > random.random():
             random.shuffle(image_indices)
         return image_indices

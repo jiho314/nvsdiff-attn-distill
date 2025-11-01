@@ -8,11 +8,11 @@ import torch.nn.functional as F
 from torchvision import transforms as T
 from torchvision import transforms
 
-crop_transform = transforms.Compose([
-    transforms.Resize(512, interpolation=transforms.InterpolationMode.BICUBIC),  # Resize shortest side to 512
-    transforms.CenterCrop(512),  # Center crop to 512x512
-    transforms.ToTensor()    
-])
+# crop_transform = transforms.Compose([
+#     transforms.Resize(512, interpolation=transforms.InterpolationMode.BICUBIC),  # Resize shortest side to 512
+#     transforms.CenterCrop(512),  # Center crop to 512x512
+#     transforms.ToTensor()    
+# ])
 
 # def c2w_to_ray_map(c2w1, c2w2, intrinsics, h, w):
 #     c2w = np.linalg.inv(c2w1) @ c2w2
@@ -26,52 +26,10 @@ crop_transform = transforms.Compose([
 #     ray_map = np.concatenate([ro, rd], axis=-1)
 #     return ray_map
 
-RE10K_MINSEOP_URL1 = "/mnt/data1/minseop/realestate_wds" 
-RE10K_MINSEOP_URL2 = "/mnt/data2/minseop/realestate_train_wds"
+RE10K_MINSEOP_URL1 = "/mnt/data1/minseop/co3d_wds1" 
+RE10K_MINSEOP_URL2 = "/mnt/data2/minseop/co3d_wds2"
 
-def transform_numpy(array):
-    """
-    Transform a NumPy array image by:
-      1. Resizing so the shortest side is 512 pixels (bicubic interpolation).
-      2. Center cropping to 512x512.
-      3. Normalizing pixel values to [0, 1].
-    
-    Args:
-        image (np.ndarray): Input image in shape (H, W, C) or (H, W).
-    
-    Returns:
-        np.ndarray: Transformed image.
-    """
-    # Convert numpy array to PIL Image
-    # Determine new size keeping the aspect ratio,
-    # so that the shortest side becomes 512.
-    array = torch.tensor(array).permute(0,3,1,2)
-    _, _, height, width = array.shape
-    
-    if width < height:
-        new_width = 512
-        new_height = int(512 * height / width)
-    else:
-        new_height = 512
-        new_width = int(512 * width / height)
-
-    # Resize image using bicubic interpolation
-    array_resized = F.interpolate(array, size=(new_height, new_width), mode="bilinear")
-    # im_resized = im.resize((new_width, new_height), resample=Image.BICUBIC)
-
-    # Compute coordinates for center crop of 512x512
-    left = (new_width - 512) // 2
-    top = (new_height - 512) // 2
-    right = left + 512
-    bottom = top + 512
-
-    # Center crop the image
-    array = array_resized[...,top:bottom,left:right]
-
-    return array
-
-
-def postprocess_re10k_mvgen(sample, num_viewpoints=3, min_view_range=5, max_view_range=15, 
+def postprocess_co3d_mvgen(sample, num_viewpoints=3, min_view_range=5, max_view_range=15, 
                            inference=False, inference_view_range=6,
                            get_square_extrinsic=False, **kwargs):
     '''
@@ -79,7 +37,6 @@ def postprocess_re10k_mvgen(sample, num_viewpoints=3, min_view_range=5, max_view
         Then, sample (num_viewpoints) frames among (view_range) frames
     '''
     assert num_viewpoints > 2, "num_viewpoints should be greater than 2"
-    
     try:
         image_list = [obj for obj in sample.keys() if "frame" in obj]
         image_list = sorted(image_list, key=lambda x : int(x.split("_")[-1][:-4]))
@@ -108,15 +65,6 @@ def postprocess_re10k_mvgen(sample, num_viewpoints=3, min_view_range=5, max_view
         points = sample["pointmap.npy"]
         intrinsic = sample["intrinsic.npy"]
         extrinsic = sample["extrinsic.npy"]
-        if points.shape[0] != num_frames:
-            print(f"wds: points shape[0] != num_frames, {points.shape[0]}, {num_frames}, {sample['__key__']}")
-            return None
-        if intrinsic.shape[0] != num_frames:
-            print(f"wds: intrinsic shape[0] != num_frames, {intrinsic.shape[0]}, {num_frames}, {sample['__key__']}")
-            return None
-        if extrinsic.shape[0] != num_frames:
-            print(f"wds: extrinsic shape[0] != num_frames, {extrinsic.shape[0]}, {num_frames}, {sample['__key__']}")
-            return None
         extrinsic = torch.tensor(extrinsic)[idxs]
         if get_square_extrinsic:
             if extrinsic.shape[-2] == 3:
@@ -126,61 +74,41 @@ def postprocess_re10k_mvgen(sample, num_viewpoints=3, min_view_range=5, max_view
                 extrinsic = new_extrinsic
 
         images = []
-        images_original = []
         for i in idxs:
             image_key = image_list[i]
-            images_original.append(sample[image_key])
-            images.append(crop_transform(sample[image_key]))
-
-        # orig_H, orig_W = images_original[0].size[1], images_original[0].size[0] # PIL, assume all resolution are same
+            images.append(sample[image_key])
         
         intri = torch.tensor(intrinsic[idxs])
-        fx, fy, cx, cy = intri[...,0,0], intri[...,1,1], intri[...,0,2], intri[...,1,2]
-        # 1) crop
-        '''not using resolution from image, because of resolution mismatch between image-intrinsic''' 
-        # crop_size = min(orig_H, orig_W)
-        orig_W, orig_H = cx*2, cy*2 
-        crop_size = torch.min(orig_W, orig_H)
-        crop_cx, crop_cy= (orig_W - crop_size) / 2, (orig_H - crop_size) / 2
-        cx -= crop_cx
-        cy -= crop_cy
-        # 2) resize to 512
-        resize_fx = resize_fy = 512 / crop_size
-        fx *= resize_fx
-        fy *= resize_fy
-        cx *= resize_fx
-        cy *= resize_fy
-
-        intri_new = torch.zeros(intri.shape[:-2] + (3, 3))
-        intri_new[..., 0, 0] = fx
-        intri_new[..., 1, 1] = fy
-        intri_new[..., 0, 2] = cx
-        intri_new[..., 1, 2] = cy
-        intri_new[..., 2, 2] = 1.0  # Set the homogeneous coordinate to 1
-        intri = intri_new
         
-        images = torch.stack(images)
-        pts = transform_numpy(points[idxs])
+        images = []
+        for i in idxs:
+            image_key = image_list[i]
+            img = sample[image_key]
+            if not torch.is_tensor(img):
+                img = transforms.ToTensor()(img)
+            images.append(img)
+        images = torch.stack(images)  # (V, 3, H, W), already normalized to [0, 1] by ToTensor()
+        pts = torch.tensor(points[idxs]).permute(0,3,1,2)  # (V, 3, H, W)
+        # print("pts shape: ", pts.shape, " images shape: ", images.shape, " intri shape: ", intri.shape, " extrinsic shape: ", extrinsic.shape, " idxs: ", idxs)
+        # print(f"wds: {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}, min_view_range: {min_view_range}, max_view_range: {max_view_range}")
         output = dict(image=images, point_map=pts, intrinsic=intri, extrinsic=extrinsic, idx=torch.tensor(idxs))
         #   intrinsic_original = intrinsic[
         # print(f"wds Inference: nothing occured , {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}, min_view_range: {min_view_range}, max_view_range: {max_view_range}")
-        
-        # print("ext shape :",  sample["extrinsic.npy"].shape)
         return output
     
     except Exception as e:
         print("Exception type:", type(e))
         print("Exception message:", e)
-        # import traceback
-        # traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         if inference:
-            print(f"wds Inference: exception occured , {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}")
-            # raise ValueError("Inference error, please check")
+            print(f"wds Inference: exception occured , {sample.get('__key__', 'unknown')}")
         else:
-            print(f"wds Training: exception occured , {sample.get('__key__', 'unknown')}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}")
+            print(f"wds Training: exception occured , {sample.get('__key__', 'unknown')}")
         return None
     
-def postprocess_re10k_mvgen_dino(sample, num_viewpoints=3, min_view_range=5, max_view_range=15, 
+    
+def postprocess_co3d_mvgen_dino(sample, num_viewpoints=3, min_view_range=5, max_view_range=15, 
                            inference=False, inference_view_range=6,
                            get_square_extrinsic=False, **kwargs):
     '''
@@ -188,7 +116,6 @@ def postprocess_re10k_mvgen_dino(sample, num_viewpoints=3, min_view_range=5, max
         Then, sample (num_viewpoints) frames among (view_range) frames
     '''
     assert num_viewpoints > 2, "num_viewpoints should be greater than 2"
-    
     try:
         image_list = [obj for obj in sample.keys() if "frame" in obj]
         image_list = sorted(image_list, key=lambda x : int(x.split("_")[-1][:-4]))
@@ -217,15 +144,6 @@ def postprocess_re10k_mvgen_dino(sample, num_viewpoints=3, min_view_range=5, max
         points = sample["pointmap.npy"]
         intrinsic = sample["intrinsic.npy"]
         extrinsic = sample["extrinsic.npy"]
-        if points.shape[0] != num_frames:
-            print(f"wds: points shape[0] != num_frames, {points.shape[0]}, {num_frames}, {sample['__key__']}")
-            return None
-        if intrinsic.shape[0] != num_frames:
-            print(f"wds: intrinsic shape[0] != num_frames, {intrinsic.shape[0]}, {num_frames}, {sample['__key__']}")
-            return None
-        if extrinsic.shape[0] != num_frames:
-            print(f"wds: extrinsic shape[0] != num_frames, {extrinsic.shape[0]}, {num_frames}, {sample['__key__']}")
-            return None
         extrinsic = torch.tensor(extrinsic)[idxs]
         if get_square_extrinsic:
             if extrinsic.shape[-2] == 3:
@@ -235,43 +153,25 @@ def postprocess_re10k_mvgen_dino(sample, num_viewpoints=3, min_view_range=5, max
                 extrinsic = new_extrinsic
 
         images = []
-        images_original = []
         for i in idxs:
             image_key = image_list[i]
-            images_original.append(sample[image_key])
-            images.append(crop_transform(sample[image_key]))
-
-        # orig_H, orig_W = images_original[0].size[1], images_original[0].size[0] # PIL, assume all resolution are same
+            images.append(sample[image_key])
         
         intri = torch.tensor(intrinsic[idxs])
-        fx, fy, cx, cy = intri[...,0,0], intri[...,1,1], intri[...,0,2], intri[...,1,2]
-        # 1) crop
-        '''not using resolution from image, because of resolution mismatch between image-intrinsic''' 
-        # crop_size = min(orig_H, orig_W)
-        orig_W, orig_H = cx*2, cy*2 
-        crop_size = torch.min(orig_W, orig_H)
-        crop_cx, crop_cy= (orig_W - crop_size) / 2, (orig_H - crop_size) / 2
-        cx -= crop_cx
-        cy -= crop_cy
-        # 2) resize to 512
-        resize_fx = resize_fy = 512 / crop_size
-        fx *= resize_fx
-        fy *= resize_fy
-        cx *= resize_fx
-        cy *= resize_fy
-
-        intri_new = torch.zeros(intri.shape[:-2] + (3, 3))
-        intri_new[..., 0, 0] = fx
-        intri_new[..., 1, 1] = fy
-        intri_new[..., 0, 2] = cx
-        intri_new[..., 1, 2] = cy
-        intri_new[..., 2, 2] = 1.0  # Set the homogeneous coordinate to 1
-        intri = intri_new
         
-        images = torch.stack(images)
-        pts = transform_numpy(points[idxs])
-
+        images = []
+        for i in idxs:
+            image_key = image_list[i]
+            img = sample[image_key]
+            if not torch.is_tensor(img):
+                img = transforms.ToTensor()(img)
+            images.append(img)
+        images = torch.stack(images)  # (V, 3, H, W), already normalized to [0, 1] by ToTensor()
+        pts = torch.tensor(points[idxs]).permute(0,3,1,2)  # (V, 3, H, W)
+        # print("pts shape: ", pts.shape, " images shape: ", images.shape, " intri shape: ", intri.shape, " extrinsic shape: ", extrinsic.shape, " idxs: ", idxs)
+        # print(f"wds: {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}, min_view_range: {min_view_range}, max_view_range: {max_view_range}")
         feat = sample.get("dino_tokens", None)
+        
         if feat is not None and not torch.is_tensor(feat):
             feat = torch.from_numpy(feat) # (V, N, D)
             V,N,D = feat.size
@@ -281,26 +181,23 @@ def postprocess_re10k_mvgen_dino(sample, num_viewpoints=3, min_view_range=5, max
             feat = feat[idxs]
             
         output = dict(image=images, point_map=pts, intrinsic=intri, extrinsic=extrinsic, idx=torch.tensor(idxs), dino_feat = feat)
-
+        
         #   intrinsic_original = intrinsic[
         # print(f"wds Inference: nothing occured , {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}, min_view_range: {min_view_range}, max_view_range: {max_view_range}")
-        
-        # print("ext shape :",  sample["extrinsic.npy"].shape)
         return output
     
     except Exception as e:
         print("Exception type:", type(e))
         print("Exception message:", e)
-        # import traceback
-        # traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         if inference:
-            print(f"wds Inference: exception occured , {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}")
-            # raise ValueError("Inference error, please check")
+            print(f"wds Inference: exception occured , {sample.get('__key__', 'unknown')}")
         else:
-            print(f"wds Training: exception occured , {sample.get('__key__', 'unknown')}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}")
+            print(f"wds Training: exception occured , {sample.get('__key__', 'unknown')}")
         return None
 
-def build_re10k_wds(
+def build_co3d_wds(
     # epoch=10000,
     url_paths = [],
     dataset_length=20970,
@@ -331,8 +228,7 @@ def build_re10k_wds(
                 if file.endswith(".tar"):
                     urls.append(os.path.join(root, file))
 
-
-    postprocess_fn = partial(postprocess_re10k_mvgen, num_viewpoints=num_viewpoints, min_view_range=min_view_range, max_view_range=max_view_range, inference= inference, inference_view_range = inference_view_range, **process_kwargs)
+    postprocess_fn = partial(postprocess_co3d_mvgen, num_viewpoints=num_viewpoints, min_view_range=min_view_range, max_view_range=max_view_range, inference= inference, inference_view_range = inference_view_range, **process_kwargs)
     
     dataset = (wds.WebDataset(urls, 
                         resampled=resampled,
@@ -346,5 +242,6 @@ def build_re10k_wds(
                 .with_length(dataset_length)
                 .with_epoch(dataset_length)
         )
+    
     return dataset
 
