@@ -2,7 +2,7 @@ from .dataset_lvsm import Dataset as lvsm_dataset
 from .re10k_wds import build_re10k_wds as re10k_wds
 from .co3d_wds import build_co3d_wds as co3d_wds
 from .multiple_wds import build_multiple_wds as multi_wds
-from .multiple_wds_dino import build_multiple_wds_dino as multi_wds_dino
+# from .multiple_wds_dino import build_multiple_wds_dino as multi_wds_dino
 # from .re10k_wds_jinhk import build_re10k_wds as re10k_wds_jinhk
 import torch
 
