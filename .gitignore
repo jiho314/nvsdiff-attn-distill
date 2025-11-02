@@ -1,4 +1,5 @@
 check_points/
+check_points_re10k/
 wandb/
 
 **/__pycache__/
@@ -24,3 +25,22 @@ a.py
 outputs_unet_attn/
 outputs_vggt_map/
 check_points/
+dtu_qual/
+dtu_qual_new/
+
+iclr_dummy/
+
+pytorch3d/
+test_qual_debug/
+aws.tar.gz
+matt.tar.gz
+
+vis_attn_coords/
+vis_attn_re10k/
+vis_attn_re10k_perturb/
+vis_full_perview
+vis_vggt_re10k/
+
+visualization/
+hpatches/
+final_qual_jinhk/

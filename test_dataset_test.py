@@ -341,7 +341,10 @@ def main():
     # Dataset
     from src import datasets
     test_dataset_config = EasyDict(OmegaConf.load(args.test_dataset_config))[args.test_dataset]
-    test_dataset = datasets.__dict__[test_dataset_config.cls_name](**test_dataset_config.config)
+    dataset_kwargs = OmegaConf.to_container(test_dataset_config.config, resolve=True)
+    dataset_kwargs["use_vggt_camera"] = args.test_use_vggt_camera
+    test_dataset_config.config = dataset_kwargs
+    test_dataset = datasets.__dict__[test_dataset_config.cls_name](**dataset_kwargs)
     test_dataloader = DataLoader(
         test_dataset,
         shuffle=False,
@@ -394,4 +397,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

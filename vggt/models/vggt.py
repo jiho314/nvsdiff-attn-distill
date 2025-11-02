@@ -159,7 +159,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         B, S, _, H, W = images.shape
         assert H == W, "input img should be square"
         if (H,W) != (518, 518):
-            images_vggt = F.interpolate(images.reshape(B*S, 3, H,W), size=(518, 518), mode="bilinear").reshape(B, S, 3, 518, 518)  
+            images_vggt = F.interpolate(images.reshape(B*S, 3, H,W), size=(518, 518), mode="bilinear").reshape(B, S, 3, 518, 518) 
+        else:
+            images_vggt = images
         images_vggt = images_vggt.to(dtype=dtype)
         aggregated_tokens_list, patch_start_idx, dino_feat = self.aggregator(images_vggt)
 
@@ -262,11 +264,20 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             # costmap = torch.matmul(fmap_tgt.transpose(1, 2), fmaps) # B H*W S*H*W 
             # costmap =costmap.unsqueeze(1) # B 1 H*W S*H*W
             # costmap_dict["track_head"] = costmap
-        elif "point_head" in self.cache_costmap_types: 
-            # TODO:
-            raise NotImplementedError("Point head costmap caching is not implemented yet.")
         elif "point_map" in self.cache_costmap_types:
-            pass # already saved in batch
+            pts3d, pts3d_conf = self.point_head(aggregated_tokens_list, images=images_vggt, patch_start_idx=patch_start_idx)
+
+            # Expect pts3d: (B, S, h, w, C)
+            _, _, hp, wp, Cp = pts3d.shape
+            pts3d_resh = pts3d.reshape(B * S, hp, wp, Cp).permute(0, 3, 1, 2)  # (B*S, c, h, w)
+
+            # Resize to target H,W
+            pts3d_res = F.interpolate(pts3d_resh, size=(H, W), mode='bilinear', align_corners=False)  # (B*S, C, H, W)
+            pts3d_res = pts3d_res.permute(0, 2, 3, 1)
+            attn_cache["point_head"] = {
+                'query': pts3d_res.reshape(B, 1, S * H * W, Cp),  # B 1 (S*H*W) C
+                'key': pts3d_res.reshape(B, 1, S * H * W, Cp)
+            }
 
         # for jinhyeok
         elif "refine_track_head" in self.cache_costmap_types:

@@ -1,0 +1,7 @@
+name: aws
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10  # Or any modern version like 3.9, 3.11
+  - boto3

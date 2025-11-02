@@ -89,6 +89,10 @@ def parse_args():
 
     parser.add_argument("--test_batch_size", type=int, default=1)
 
+
+    # test idx setting
+    parser.add_argument("--test_custom_order_batch", type=bool, action='store_true')
+    parser.add_argument("--test_custom_ref_idx", type=int, nargs='+', default=[])
     
     
 
@@ -275,22 +279,28 @@ def main():
     logger.info("***** Running Test *****")
     logger.info(f"  Num Test Dataset = {len(test_dataset)}")
     
+    from src.datasets import custom_order_batch
     @torch.no_grad()
     def process_batch_fn(batch, dataset_class, cond_num = None, 
-                     use_vggt_camera=False, vggt_model = None, device ='cuda'):
+                     use_vggt_camera=False, vggt_model = None, device ='cuda', custom_order = False, custom_ref_idx = []):
         # 1) ordering
-        if dataset_class == "re10k_wds":
-            '''re10k_wds: ordered frames'''
-            batch = uniform_push_batch(batch, cond_num)
-            # TODO: extrapolate idx
-        elif dataset_class == "co3d_wds":
-            '''co3d_wds: ordered frames'''
-            batch = uniform_push_batch(batch, cond_num)
-        elif dataset_class == "lvsm_dataset":
-            '''lvsm_dataset: cond + tgt ordered (modified from original code)'''
-            pass
+        if not custom_order:
+            if dataset_class == "re10k_wds":
+                '''re10k_wds: ordered frames'''
+                batch = uniform_push_batch(batch, cond_num)
+                # TODO: extrapolate idx
+            elif dataset_class == "co3d_wds":
+                '''co3d_wds: ordered frames'''
+                batch = uniform_push_batch(batch, cond_num)
+            elif dataset_class == "lvsm_dataset":
+                '''lvsm_dataset: cond + tgt ordered (modified from original code)'''
+                pass
+            else:
+                raise NotImplementedError
         else:
-            raise NotImplementedError
+            assert len(custom_ref_idx) == cond_num, f"custom_ref_idx length {len(custom_ref_idx)} must be equal to cond_num {cond_num}"
+            batch = custom_order_batch(batch, ref_idx=list(custom_ref_idx))
+
         
         # 2) use vggt scaled camera
         if use_vggt_camera:
@@ -298,9 +308,12 @@ def main():
             vggt_pred = vggt_model(image) # jiho TODO make image [0,1]
             batch['extrinsic'], batch['intrinsic'] = vggt_pred['extrinsic'], vggt_pred['intrinsic']
             del vggt_pred
+
         return batch
 
-    process_batch_fn_1 = partial(process_batch_fn, dataset_class =test_dataset_config.cls_name, cond_num = args.test_cond_num, use_vggt_camera = args.test_use_vggt_camera, vggt_model=vggt_model,
+    process_batch_fn_1 = partial(process_batch_fn, dataset_class =test_dataset_config.cls_name, cond_num = args.test_cond_num, 
+                                                    custom_order = args.test_custom_order_batch, custom_ref_idx = args.test_custom_ref_idx,
+                                                    use_vggt_camera = args.test_use_vggt_camera, vggt_model=vggt_model,
                                                     device=accelerator.device)
 
     # unset_attn_cache(unet)

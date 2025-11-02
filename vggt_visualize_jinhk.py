@@ -25,7 +25,7 @@ from datetime import datetime
 import json
 import torchvision.transforms as T
 from src.distill_utils.attn_visualize import mark_point_on_img, save_image_total, overlay_grid_and_save, save_image_jinhk
-
+import yaml
 
 # dataloader_workers: 16
 # dataset:
@@ -73,7 +73,7 @@ def seed_everything(seed):
     np.random.seed(seed % (2**32))
     random.seed(seed)
 
-def main(nframe, cond_num, inference_view_range, config, rank = 0):
+def main(nframe, cond_num, inference_view_range, config, config_file_path, rank = 0):
 
     seed_everything(0)
     device= f"cuda"
@@ -124,7 +124,6 @@ def main(nframe, cond_num, inference_view_range, config, rank = 0):
         return tok
 
     def get_costmap(sample_idx, query_idx, key_idx, gt_query, gt_key, x_coord, y_coord, mode, per_view: bool = False):
-        # jinhyeok: hard-coded for analysis qual. 
         '''
         gt_query: torch.Size([B, 1, VHW, C])
         gt_key  : torch.Size([B, 1, VHW, C])
@@ -183,9 +182,9 @@ def main(nframe, cond_num, inference_view_range, config, rank = 0):
                     # softmax within each view across that view's HW
                     # jinhyeok: for analysis qual. remove inconsistent keys
                     drop_key_idx = []
-                    if sample_idx == 73 and query_idx == 0 and key_idx == [0,1,2]: # hardcoding for analysis qual
+                    if sample_idx == 73 and query_idx == 0 and key_idx == [0,1,2]: # hard-coding for analysis qual
                         drop_key_idx = [1, 2]
-                    elif sample_idx == 73 and query_idx == 2 and key_idx == [0,1,2]: # hardcoding for analysis qual
+                    elif sample_idx == 73 and query_idx == 2 and key_idx == [0,1,2]: # hard-coding for analysis qual
                         drop_key_idx = [0]
                     else:
                         for i in range(V):
@@ -195,7 +194,7 @@ def main(nframe, cond_num, inference_view_range, config, rank = 0):
                                 drop_key_idx.append(i)
                     if len(drop_key_idx) > 0:
                         print(f"drop inconsistent keys: {drop_key_idx} at query idx {query_idx}, key idx {key_idx}")
-                        logits[:, :, drop_key_idx, :] = -100.0  # very low logit to ignore
+                        logits[:, query_token_idx_cost, drop_key_idx, :] = -100.0  # very low logit to ignore
                     probs = torch.softmax(logits, dim=-1)               # (B, HW, V, HW)
                     probs = probs.reshape(B, HW, V * HW)                # (B, HW, VHW)
                 else:
@@ -238,9 +237,10 @@ def main(nframe, cond_num, inference_view_range, config, rank = 0):
             # layout into a horizontal strip (H, V*W)
             tokens_per_img = H * W
             scores_split = all_scores.split(tokens_per_img)  # list of V tensors [HW]
-            # score = torch.cat([s.reshape(H, W) for s in scores_split], dim=-1)
-            score = torch.cat([F.interpolate(s.reshape(H, W).unsqueeze(0).unsqueeze(0), size=(16, 16), mode='nearest').squeeze(0).squeeze(0)
-                                for s in scores_split], dim=-1)
+            score = torch.cat([s.reshape(H, W) for s in scores_split], dim=-1)
+            # score = torch.cat([F.interpolate(s.reshape(H, W).unsqueeze(0).unsqueeze(0),
+            #                     size=(16, 16), mode='bilinear').squeeze(0).squeeze(0)
+            #                     for s in scores_split], dim=-1)
             return score
 
     
@@ -259,7 +259,15 @@ def main(nframe, cond_num, inference_view_range, config, rank = 0):
         vggt_model.eval()
     
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    
+    exp_name = config.vggt_visualize.exp_name
+    view = "per_view" if config.vggt_visualize.per_view else "full"
+    out_root = config.vggt_visualize.out_root
+    outdir_root = os.path.join(out_root, timestamp, exp_name, view)
+    os.makedirs(outdir_root, exist_ok=True)
+
+    with open(os.path.join(outdir_root, "config.yaml"), "w") as f:
+        config_file = OmegaConf.load(config_file_path)
+        yaml.dump(OmegaConf.to_container(config_file.vggt_visualize, resolve=True), f)
 
     if config.vggt_visualize.idx_set:
             end_idx = config.vggt_visualize.idx_set[-1]
@@ -269,9 +277,6 @@ def main(nframe, cond_num, inference_view_range, config, rank = 0):
             continue
         elif config.vggt_visualize.idx_set is None and idx < config.vggt_visualize.start_data_idx:
             continue
-
-        outdir_root = os.path.join("outputs_vggt_map", timestamp, f"sample{idx}")
-        os.makedirs(outdir_root, exist_ok=True)
 
         images = batch['image'].to(device)  # B V C H W  (V == nframe)
         Bv, V, C, H, W = images.shape
@@ -297,32 +302,74 @@ def main(nframe, cond_num, inference_view_range, config, rank = 0):
             if counter_out:
                 continue
         
-        if config.vggt_visualize.coord_select:
+        if config.vggt_visualize.reproduce_coords_dir is not None:
+            dirs = os.listdir(config.vggt_visualize.reproduce_coords_dir)
+            reproduce_idxs = [int(d.split("_")[-1]) for d in dirs if d.startswith("sample_")]
+        else:
+            reproduce_idxs = []
+        
+        x_coords, y_coords = {}, {}
+
+        if idx in reproduce_idxs:
+            with open(os.path.join(config.vggt_visualize.reproduce_coords_dir, f"sample_{idx}", "coords.json"), "r") as f:
+                coords = json.load(f)
+            for t in range(0, nframe):
+                x_coords[t] = coords["x"][str(t)]
+                y_coords[t] = coords["y"][str(t)]
+                
+                print(f"Reproducing coordinates from sample_{idx}, frame {t}: (x, y) = ({x_coords[t]}, {y_coords[t]})")
+
+        elif config.vggt_visualize.coord_select:
             if config.vggt_visualize.view_select is False:
-                for t in range(cond_num, nframe):  # <<< CHANGED >>>
+                for t in range(0, nframe):
                     tgt_image_t = images.squeeze()[t]
                     overlay_grid_and_save(tgt_image_t, spacing=64,
-                                          out_path=os.path.join(outdir_root, f"VIS_OVERLAY_t{t}.png"))
+                                          out_path=os.path.join(outdir_root, f"VIS_OVERLAY_{t}.png"))
                 save_image(images.squeeze()[:cond_num], os.path.join(outdir_root, "VIS_REFERENCE.png"))
-            while True: 
-                x_coord = int(input("Enter x coordinate (0–512): "))
-                y_coord = int(input("Enter y coordinate (0–512): "))
-                if 0 < x_coord < 512 and 0 < y_coord < 512: 
-                    break
-                else: 
-                    print("Invalid input. Please type valid values. ")
+            if config.vggt_visualize.coord_per_frame:
+                for t in range(0, nframe):
+                    while True: 
+                        try:
+                            x_coords[t] = int(input(f"Enter x coordinate for frame {t} (0–512): "))
+                            y_coords[t] = int(input(f"Enter y coordinate for frame {t} (0–512): "))
+                            if 0 < x_coords[t] < 512 and 0 < y_coords[t] < 512: 
+                                break
+                            else: 
+                                print("Invalid input. Please type valid values. ")
+                        except ValueError:
+                            print("Invalid input. Please type integer values. ")
+            else:
+                while True: 
+                    try:
+                        x_coord = int(input("Enter x coordinate (0–512): "))
+                        y_coord = int(input("Enter y coordinate (0–512): "))
+                        if 0 < x_coord < 512 and 0 < y_coord < 512: 
+                            break
+                        else: 
+                            print("Invalid input. Please type valid values. ")
+                    except ValueError:
+                        print("Invalid input. Please type integer values. ")
+                # set same coord for all targets
+                for t in range(0, nframe):
+                    x_coords[t] = x_coord
+                    y_coords[t] = y_coord
         else:
             x_coord = random.randint(0, 511)
             y_coord = random.randint(0, 511)
+            for t in range(0, nframe):
+                x_coords[t] = x_coord
+                y_coords[t] = y_coord
 
-        coords = {"x": x_coord, "y": y_coord}
-        with open(os.path.join(outdir_root, "coords.json"), "w") as f:
+        sample_root = os.path.join(outdir_root, f"sample_{idx}")
+        os.makedirs(sample_root, exist_ok=True)
+
+        coords = {"x": x_coords, "y": y_coords}    
+        with open(os.path.join(sample_root, "coords.json"), "w") as f:
             json.dump(coords, f, indent=4) 
-
-        # pred = vggt_model(images[:, -1])
 
         stacked_images = []
         for t in range(0, nframe):  # <<< CHANGED >>>
+            x_coord, y_coord = x_coords[t], y_coords[t]
             query_idx = [t]
             if config.vggt_visualize.cross_only:
                 key_idx = [i for i in range(nframe) if i not in query_idx]             # <<< CHANGED >>> refs only
@@ -337,14 +384,15 @@ def main(nframe, cond_num, inference_view_range, config, rank = 0):
                 score = get_costmap(idx, t, key_idx, gt_query, gt_key, x_coord, y_coord,
                                     config.vggt_visualize.mode, per_view = config.vggt_visualize.per_view)
                 
-                combined_img = save_image_jinhk(images, t, x_coord, y_coord, score)
+                combined_img = save_image_jinhk(tgt_gt_image=None, images=images,
+                                                target_idx=t, x_coord=x_coord, y_coord=y_coord, score=score)
                 stacked_images.append(combined_img)
         stacked_images = concat_vertical(stacked_images)
-        stacked_images.save(os.path.join(outdir_root, f"pointmap.png"))
+        stacked_images.save(os.path.join(sample_root, f"pointmap.png"))
 
         if config.vggt_visualize.save_stack:
             # Save stacked images (ref + tgt)
-            save_image(images.squeeze(), os.path.join(outdir_root, f"VIS_STACKED.png"))
+            save_image(images.squeeze(), os.path.join(sample_root, f"VIS_STACKED.png"))
 
         if config.vggt_visualize.idx_set:
             if idx >= end_idx:
@@ -365,4 +413,4 @@ if __name__ == "__main__":
     inference_view_range = config.vggt_visualize.inference_view_range # change if you want 
     #caching_unet_attn_layers = range(15)
 
-    main(nframe, cond_num, inference_view_range, config=config)
+    main(nframe, cond_num, inference_view_range, config=config, config_file_path=config_file_path)

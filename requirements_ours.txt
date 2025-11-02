@@ -6,7 +6,7 @@ matplotlib
 tensorboard
 scikit-image
 timm
-transformers==4.30.2
+transformers
 deepspeed
 open_clip_torch
 pandas
@@ -36,5 +36,9 @@ torchmetrics[image]
 webdataset
 xformers
 
+# val
+seaborn
+
 # pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1
 # pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# pip install git+https://github.com/facebookresearch/pytorch3d.git

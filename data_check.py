@@ -1,4 +1,5 @@
 from src.datasets.re10k_wds import build_re10k_wds
+from src.datasets import co3d_wds
 from torch.utils.data import DataLoader, DistributedSampler
 from accelerate import Accelerator
 import torch
@@ -11,30 +12,69 @@ from accelerate.utils import ProjectConfiguration, set_seed
 accelerator = Accelerator()
 set_seed(0)
 ho = build_re10k_wds(
-    url_paths = ["/mnt/data2/minseop/realestate_val_wds"], # "/mnt/data1/minseop/realestate_wds", # “/mnt/data2/minseop/realestate_val_wds”
-    dataset_length = 280,
+    url_paths = ["/mnt/data2/minseop/realestate_val_wds",  ], # "/mnt/data2/minseop/realestate_train_wds"  "/mnt/data1/minseop/realestate_wds", # “/mnt/data2/minseop/realestate_val_wds” "/mnt/data2/minseop/realestate_val_wds"
+    dataset_length = 10,
     # url_paths = ['/mnt/data1/minseop/realestate_wds'],
     num_viewpoints = 4,
-    resampled=False,
-    shardshuffle=False,
-    # min_view_range=6,
-    # max_view_range=6,
-    inference=True,
-    inference_view_range=10,
+    resampled=True,
+    shardshuffle=True,
+    min_view_range=6,
+    max_view_range=6,
+    # inference=True,
+    # inference_view_range=10,
     process_kwargs={}
 )
+ho2 = co3d_wds(
+    url_paths = ["/mnt/data1/minseop/co3d_wds1"],
+    dataset_length = 40,
+    num_viewpoints = 4,
+    resampled=True,
+    shardshuffle=True,
+    min_view_range=6,
+    max_view_range=6,
+    
+)
+# HO = ho + ho2
+import webdataset as wds
+# ho = ho.shuffle(len(ho))
+# ho2 = ho2.shuffle(len(ho2))
+# HO = wds.RandomMix([ho, ho2], probs=[0.5,0.5])
 
+# HO= ho.shuffle(len(ho))
+# print("hotype : ", type(ho), " ho2 type: ", type(ho2), " HO type: ", type(HO))
+# HO = (ho + ho2).shuffle(20)
+# HO = HO.shuffle(len(HO))
 dl = DataLoader(
     ho,
-    batch_size=4,
-    num_workers=0,
+    batch_size=1,
+    num_workers=1,
+    shuffle=False,
+    drop_last=True,
 )
+from itertools import cycle
+import pdb ; pdb.set_trace()
+# dl_iter = iter(dl)
+# dl_cycle = cycle(dl)
+for ep in range(3):
+    print(f"Epoch {ep} -----------------")
+    for i, batch in enumerate(dl):
+        # batch_iter = next(dl_cycle)
+        print(i)
+        print("key : ", batch['__key__'])
+        # print("pm size: ", batch['point_map'].shape)
+import pdb ; pdb.set_trace()
+        # print(i)
+        # print(batch_iter['idx'])
+        # print(batch['idx'])
+        
+
 
 # Create output directory
-os.makedirs('batch_viz', exist_ok=True)
+# os.makedirs('batch_viz', exist_ok=True)
 
 scenes=[]
 for batch_idx, batch in enumerate(dl):
+    import pdb ; pdb.set_trace() 
     print(batch_idx)
     scenes += batch['__key__']
     # image = batch['image'].cuda()  # B V C H W
