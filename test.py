@@ -280,26 +280,26 @@ def main():
     logger.info(f"  Num Test Dataset = {len(test_dataset)}")
     
     from src.datasets import custom_order_batch
-    @torch.no_grad()
     def process_batch_fn(batch, dataset_class, cond_num = None, 
                      use_vggt_camera=False, vggt_model = None, device ='cuda', custom_order = False, custom_ref_idx = []):
-        # 1) ordering
-        if not custom_order:
-            if dataset_class == "re10k_wds":
-                '''re10k_wds: ordered frames'''
-                batch = uniform_push_batch(batch, cond_num)
-                # TODO: extrapolate idx
-            elif dataset_class == "co3d_wds":
-                '''co3d_wds: ordered frames'''
-                batch = uniform_push_batch(batch, cond_num)
-            elif dataset_class == "lvsm_dataset":
-                '''lvsm_dataset: cond + tgt ordered (modified from original code)'''
-                pass
-            else:
-                raise NotImplementedError
-        else:
-            assert len(custom_ref_idx) == cond_num, f"custom_ref_idx length {len(custom_ref_idx)} must be equal to cond_num {cond_num}"
-            batch = custom_order_batch(batch, ref_idx=list(custom_ref_idx))
+        # 11/02 jiho: ordering done in data code (just for inference!)
+        # # 1) ordering
+        # if not custom_order:
+        #     if dataset_class == "re10k_wds":
+        #         '''re10k_wds: ordered frames'''
+        #         batch = uniform_push_batch(batch, cond_num)
+        #         # TODO: extrapolate idx
+        #     elif dataset_class == "co3d_wds":
+        #         '''co3d_wds: ordered frames'''
+        #         batch = uniform_push_batch(batch, cond_num)
+        #     elif dataset_class == "lvsm_dataset":
+        #         '''lvsm_dataset: cond + tgt ordered (modified from original code)'''
+        #         pass
+        #     else:
+        #         raise NotImplementedError
+        # else:
+        #     assert len(custom_ref_idx) == cond_num, f"custom_ref_idx length {len(custom_ref_idx)} must be equal to cond_num {cond_num}"
+        #     batch = custom_order_batch(batch, ref_idx=list(custom_ref_idx))
 
         
         # 2) use vggt scaled camera
@@ -311,7 +311,7 @@ def main():
 
         return batch
 
-    process_batch_fn_1 = partial(process_batch_fn, dataset_class =test_dataset_config.cls_name, cond_num = args.test_cond_num, 
+    process_batch_fn_test = partial(process_batch_fn, dataset_class =test_dataset_config.cls_name, cond_num = args.test_cond_num, 
                                                     custom_order = args.test_custom_order_batch, custom_ref_idx = args.test_custom_ref_idx,
                                                     use_vggt_camera = args.test_use_vggt_camera, vggt_model=vggt_model,
                                                     device=accelerator.device)
@@ -324,7 +324,7 @@ def main():
     cfg = args.test_cfg
     num_inference_steps = args.test_num_inference_steps
     res = log_test(accelerator=accelerator, config=config, args=args,
-                            pipeline=pipeline, dataloader=test_dataloader, process_batch_fn=process_batch_fn_1,
+                            pipeline=pipeline, dataloader=test_dataloader, process_batch_fn=process_batch_fn_test,
                             step=args.test_train_step, device=accelerator.device, vae=vae,
                             cond_num = cond_num, nframe = nframe, cfg = cfg, num_inference_steps = num_inference_steps,
                             compute_fid = args.test_compute_fid,

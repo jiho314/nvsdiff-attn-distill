@@ -1761,7 +1761,7 @@ def main():
                     pipeline = get_pipeline(accelerator, config, vae, unet, weight_dtype)
                     for data_name, val_dataloader in val_dataloaders_dict.items():
                         res = log_test(accelerator=accelerator, config=config, args=args,
-                                pipeline=pipeline, dataloader=val_dataloader, process_batch_fn=lambda x : uniform_push_batch(x, config.val_cond_num),
+                                pipeline=pipeline, dataloader=val_dataloader, process_batch_fn=lambda x: x, # 11/02 uniform push batch disabled, (done in code for inference setting)
                                 step=global_step, device=accelerator.device, vae=vae,
                                 cond_num = config.val_cond_num, nframe = config.val_nframe, cfg = args.val_cfg,
                                 compute_fid = False,
