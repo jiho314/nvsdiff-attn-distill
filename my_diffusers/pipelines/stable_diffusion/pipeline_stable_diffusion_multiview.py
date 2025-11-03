@@ -1088,9 +1088,10 @@ class StableDiffusionMultiViewPipeline(
         ### get domain switcher ###
         domain_dict = kwargs['config'].model_cfg.get("domain_dict", None)
         if domain_dict is not None:
-            tags = kwargs["tag"][::nframe]
-            tags = tags[::kwargs['config'].nframe]
-            class_labels = [domain_dict.get(tag, domain_dict['others']) for tag in tags]
+            # tags = kwargs["tag"][::nframe]
+            # tags = tags[::kwargs['config'].nframe]
+            tag = kwargs["tag"]
+            class_labels = [domain_dict.get(t, domain_dict['others']) for t in tag]
             class_labels = torch.tensor(class_labels, dtype=torch.long, device=device)
         else:
             class_labels = None
@@ -1507,9 +1508,10 @@ class StableDiffusionMultiViewPipeline(
         ### get domain switcher ###
         domain_dict = kwargs['config'].model_cfg.get("domain_dict", None)
         if domain_dict is not None:
-            tags = kwargs["tag"][::nframe]
-            tags = tags[::kwargs['config'].nframe]
-            class_labels = [domain_dict.get(tag, domain_dict['others']) for tag in tags]
+            # tags = kwargs["tag"][::nframe]
+            # tags = tags[::kwargs['config'].nframe]
+            tag = kwargs.get('tag', [])
+            class_labels = [domain_dict.get(t, domain_dict['others']) for t in tag]
             class_labels = torch.tensor(class_labels, dtype=torch.long, device=device)
         else:
             class_labels = None

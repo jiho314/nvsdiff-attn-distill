@@ -168,7 +168,9 @@ def postprocess_re10k_mvgen(sample, num_viewpoints=3, min_view_range=5, max_view
         
         images = torch.stack(images)
         pts = transform_numpy(points[idxs])
-        output = dict(image=images, point_map=pts, intrinsic=intri, extrinsic=extrinsic, idx=torch.tensor(idxs))
+        # tag = ["re10k"] * len(idxs)
+        tag = 're10k'
+        output = dict(image=images, point_map=pts, intrinsic=intri, extrinsic=extrinsic, idx=torch.tensor(idxs), tag=tag)
         #   intrinsic_original = intrinsic[
         # print(f"wds Inference: nothing occured , {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}, min_view_range: {min_view_range}, max_view_range: {max_view_range}")
         

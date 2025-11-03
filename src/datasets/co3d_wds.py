@@ -99,9 +99,11 @@ def postprocess_co3d_mvgen(sample, num_viewpoints=3, min_view_range=5, max_view_
             images.append(img)
         images = torch.stack(images)  # (V, 3, H, W), already normalized to [0, 1] by ToTensor()
         pts = torch.tensor(points[idxs]).permute(0,3,1,2)  # (V, 3, H, W)
+        # tag = ['co3d'] * len(idxs)
+        tag = 'co3d'
         # print("pts shape: ", pts.shape, " images shape: ", images.shape, " intri shape: ", intri.shape, " extrinsic shape: ", extrinsic.shape, " idxs: ", idxs)
         # print(f"wds: {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}, min_view_range: {min_view_range}, max_view_range: {max_view_range}")
-        output = dict(image=images, point_map=pts, intrinsic=intri, extrinsic=extrinsic, idx=torch.tensor(idxs))
+        output = dict(image=images, point_map=pts, intrinsic=intri, extrinsic=extrinsic, idx=torch.tensor(idxs), tag= tag)
         #   intrinsic_original = intrinsic[
         # print(f"wds Inference: nothing occured , {sample['__key__']}, num_frames: {num_frames}, num_viewpoints: {num_viewpoints}, min_view_range: {min_view_range}, max_view_range: {max_view_range}")
         return output

@@ -230,7 +230,8 @@ def log_test(accelerator, config, args, pipeline, dataloader, step, device,
             image_normalized = image * 2.0 - 1.0
 
             extrinsic, intrinsic = extri_, intri_
-            tag, sequence_name, depth = None, None , None
+            tag = batch.get("tag", ['others'] * b )
+            sequence_name, depth = None, None
             preds = pipeline.batch_call(images=image_normalized, nframe=nframe, cond_num=cond_num,
                              height=image_normalized.shape[-2], width=image_normalized.shape[-1],
                              intrinsics=intrinsic, extrinsics=extrinsic,
@@ -528,7 +529,8 @@ def log_train(accelerator, config, args, pipeline, weight_dtype, batch, step, **
         extri_ = new_extri_
 
     extrinsic, intrinsic = extri_, intri_
-    tag, sequence_name = None, None
+    tag = [ batch.get("tag", [None])[0] ]
+    sequence_name = None
 
     if config.model_cfg.get("enable_depth", False):
         depth = batch["depth"][:nframe].to(torch.float32)
@@ -903,7 +905,8 @@ def main():
         sampler=None,
         # batch_size=config.train_batch_size, # batch_size directly applied to webdataset 
         batch_size=None,
-        num_workers=accelerator.num_processes * args.num_workers_per_gpu, # keep num_workers_per_gpu = 1 to avoid memory error
+        num_workers= args.num_workers_per_gpu,
+        # num_workers=accelerator.num_processes * args.num_workers_per_gpu, # keep num_workers_per_gpu = 1 to avoid memory error
         # persistent_workers=True, # not activated to avoid memory error
         # pin_memory=True, # not activated to avoid memory error
         # prefetch_factor=2, # not activated to avoid memory error
@@ -1323,8 +1326,9 @@ def main():
                 # get class label (domain switcher)
                 domain_dict = config.model_cfg.get("domain_dict", None)
                 if domain_dict is not None:
-                    tags = batch["tag"][::f]
-                    class_labels = [domain_dict.get(tag, domain_dict['others']) for tag in tags]
+                    # tags = batch["tag"][::f]
+                    tag = batch['tag']
+                    class_labels = [domain_dict.get(t, domain_dict['others']) for t in tag]
                     class_labels = torch.tensor(class_labels, dtype=torch.long, device=device)
                 else:
                     class_labels = None
@@ -1580,10 +1584,10 @@ def main():
                             distill_loss_name_dict[idx] = f"train/distill_loss/unet{unet_layer}_vggt{vggt_layer}" # for log
                             distill_loss_dict[idx] = distill_loss
 
-                            weighted_distill_loss = []
-                            for idx in distill_pairs_idx:
-                                weighted_distill_loss += [distill_loss_dict[idx] * distill_loss_weight_list[idx]]
-                            weighted_distill_loss = sum(weighted_distill_loss) if len(weighted_distill_loss) > 0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
+                        weighted_distill_loss = 0
+                        for idx in distill_pairs_idx:
+                            weighted_distill_loss = weighted_distill_loss + distill_loss_dict[idx] * distill_loss_weight_list[idx]
+                        # weighted_distill_loss = sum(weighted_distill_loss_list) if len(weighted_distill_loss_list) > 0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
                         
                         if config.distill_config.get("distill_loss_weight_scheduling", None) is not None:
                             raise NotImplementedError("distill loss scheduling not supported")
