@@ -1380,6 +1380,7 @@ def main():
                     with torch.no_grad(), torch.autocast(device_type="cuda", dtype = weight_dtype):
                         image = batch["image"].to(device)  #  0 1 tensor [B,F,3,H,W]
                         B, F, _, H, W = image.shape
+                        dino_image = image.clone()
                         dino_image = torch.nn.functional.interpolate(dino_image.flatten(0,1), size=(518,518), mode='bilinear')
                         dino_feat = dino_model.forward_features(dino_image)['x_norm_patchtokens']
                         dino_feat = einops.rearrange(dino_feat, "(B F) (h w) C -> B 1 (F h w) C", B=B, F=F, h=37, w=37)
