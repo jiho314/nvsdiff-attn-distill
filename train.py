@@ -637,6 +637,8 @@ def parse_args():
     parser.add_argument("--checkpointing_last_steps", type=int, default=5000 )
     parser.add_argument("--resume_from_last", action="store_true")
 
+    parser.add_argument("--autocast_bf32_on_distill", action="store_true")
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -1037,6 +1039,8 @@ def main():
         weight_dtype = torch.bfloat16
         args.mixed_precision = accelerator.mixed_precision
         logger.info("MixedPrecision: BF16 training!")
+    
+    distill_weight_dtype = torch.float32 if args.autocast_bf32_on_distill else weight_dtype
 
 
 
@@ -1132,7 +1136,7 @@ def main():
     first_batch = True
     
     import time
-    
+    initial_step = global_step
     for epoch in range(first_epoch, config.num_train_epochs):
         # train_dataloader.sampler.set_epoch(epoch)
         end_time = time.time()
@@ -1390,7 +1394,7 @@ def main():
                 
                 # Distill Loss
                 if do_attn_distill:
-                    with torch.autocast(device_type="cuda", dtype = weight_dtype):
+                    with torch.autocast(device_type="cuda", dtype = distill_weight_dtype):
                         distill_loss_name_dict = {}
                         distill_loss_dict = {}
                         distill_gt_dict = {}
@@ -1522,7 +1526,7 @@ def main():
                                 if mask_per_view is not None:
                                     ref_mask_per_view, _, _ = slice_attnmap(mask_per_view, ref_query_idx, key_idx, exclude_selfattn="self" not in key_list)
                                 # 2) logit head
-                                logit_head_kwargs = {'num_view': f2, 'num_view_query': f1}
+                                logit_head_kwargs = {'num_view': f2, 'num_view_query': f1, "timesteps": timesteps.to(ref_pred_attn)}
                                 ref_pred, ref_gt = unet.unet_logit_head[str(unet_layer)](ref_pred_attn, **logit_head_kwargs), unet.vggt_logit_head[str(vggt_layer)](ref_gt_attn, **logit_head_kwargs) # [B head f1HW f2HW]
                                 ''' [B Head Q K] 
                                     - if softargmax: (always per_view == True)
@@ -1558,7 +1562,7 @@ def main():
                                 if mask_per_view is not None:
                                     tgt_mask_per_view, _, _ = slice_attnmap(mask_per_view, tgt_query_idx, key_idx, exclude_selfattn="self" not in key_list)
                                 # 2) logit head
-                                logit_head_kwargs = {'num_view': f2, 'num_view_query': f1}
+                                logit_head_kwargs = {'num_view': f2, 'num_view_query': f1, "timesteps": timesteps.to(tgt_pred_attn)}
                                 tgt_pred, tgt_gt = unet.unet_logit_head[str(unet_layer)](tgt_pred_attn, **logit_head_kwargs), unet.vggt_logit_head[str(vggt_layer)](tgt_gt_attn, **logit_head_kwargs) # [B head f1HW f2HW]
                                 ''' [B Head Q K] 
                                     - if softargmax: (always per_view == True)
@@ -1583,6 +1587,8 @@ def main():
                             distill_loss =  ref_query_distill_loss + tgt_query_distill_loss # TODO: weight?
                             if torch.isnan(distill_loss).any().item():
                                 accelerator.print("NaN in distill_loss, skip this layer distill...")
+                                del distill_loss, tgt_query_distill_loss
+                                torch.cuda.empty_cache()
                                 continue
                             distill_loss_name_dict[idx] = f"train/distill_loss/unet{unet_layer}_vggt{vggt_layer}" # for log
                             distill_loss_dict[idx] = distill_loss
@@ -1601,7 +1607,7 @@ def main():
                         loss = loss + weighted_distill_loss
                     
                 if do_repa:
-                    with torch.autocast(device_type="cuda", dtype = weight_dtype):
+                    with torch.autocast(device_type="cuda", dtype = distill_weight_dtype):
                         B, F, _, H, W = image.shape
                         unet_feat_cache = pop_cached_feat(unet)
                         gt_feat = batch['dino_feat'].to(device)  # B Head(1) N(FHW) C
@@ -1758,7 +1764,7 @@ def main():
                         f.write(str(global_step))
                     logger.info(f"Saved state to {save_path}")
 
-                if ((global_step == 1 and args.val_at_first) or global_step % args.val_interval == 0) and not args.no_val:
+                if ( ((initial_step + 1) == global_step and args.val_at_first) or global_step % args.val_interval == 0) and not args.no_val:
                     if args.use_ema:
                         # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                         ema_unet.store(unet.parameters())

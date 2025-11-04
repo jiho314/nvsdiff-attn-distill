@@ -92,6 +92,48 @@ class HeadMlp_Softmax(Softmax):
         x = super().forward(x, num_view, **kwargs)
         return x
 
+class TimeAdaTemp_HeadMlp_Softmax(Softmax):
+    def __init__(self, 
+            adamlp_mid_dim = 64,
+            adamlp_depth = 1, 
+            # mlp
+            in_head_num = 24, out_head_num = 1,
+            mlp_ratio = 4.0, mlp_depth = 1,
+            **kwargs
+        ):
+        super().__init__(**kwargs)
+        self.mlp = build_mlp(in_head_num, out_head_num, mlp_ratio, mlp_depth)
+        self.ada_scale = build_mlp(1, 1, mlp_ratio=None, mlp_depth=adamlp_depth, mid_dim=adamlp_mid_dim)
+        nn.init.zeros_(self.ada_scale[-1].weight)
+        nn.init.zeros_(self.ada_scale[-1].bias)
+    
+    def forward(self, x, num_view, timesteps, **kwargs):
+        # 1) logit head mlp
+        x = x.permute(0,2,3,1) # B Q K Head
+        x = self.mlp(x).permute(0,3,1,2) # B Out_head Q K
+        # 2) ada temp
+        scale = self.ada_scale(timesteps[:, None]) # B 1
+        scale = (scale + 1).view(-1,1,1,1) # B 1 1 1
+        x = x * scale
+        # softmax
+        x = super().forward(x, num_view, **kwargs)
+        return x
+
+class LinearTime2Temp_Softmax_HeadMean(Softmax_HeadMean):
+    def timesteps_to_temp(self, timesteps):
+        min_temp = 0.0001
+        max_temp = 0.1
+        # linear temp
+        temp = min_temp + (max_temp - min_temp) * (timesteps / 1000.0)
+        return temp
+    def forward(self, x, num_view, timesteps, **kwargs):
+        ''' x : B Head Q K(num_view HW)
+        '''
+        assert self.softmax_temp == 1.0, "LinearTime2Temp_Softmax_Headmean requires softmax_temp=1.0"
+        temp = self.timesteps_to_temp(timesteps)
+        x = x / temp[:, None, None, None]
+        return super().forward(x, num_view, **kwargs)
+
 # class HeadMlp(nn.Module):
 #     def __init__(self, 
 #                  in_head_num = 24, out_head_num = 1,
@@ -400,6 +442,8 @@ LOGIT_HEAD_CLS = {
     "headmlp_softargmax": HeadMlp_SoftArgmax,
     "headmean_softargmax": HeadMean_SoftArgmax,
     "interpolate4d_headconv4d_softmax": Interpolate4D_HeadConv4D_Softmax,
+    "lineartime2temp_softmax_headmean": LinearTime2Temp_Softmax_HeadMean,
+    "timeadatemp_headmlp_softmax": TimeAdaTemp_HeadMlp_Softmax
 }
 
 

@@ -273,10 +273,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
             # Resize to target H,W
             pts3d_res = F.interpolate(pts3d_resh, size=(H, W), mode='bilinear', align_corners=False)  # (B*S, C, H, W)
-            pts3d_res = pts3d_res.permute(0, 2, 3, 1)
+            pts3d_res = pts3d_res.permute(0, 2, 3, 1) # B S H W C
             attn_cache["point_head"] = {
-                'query': pts3d_res.reshape(B, 1, S * H * W, Cp),  # B 1 (S*H*W) C
-                'key': pts3d_res.reshape(B, 1, S * H * W, Cp)
+                'query': pts3d_res.reshape(B, S, H * W, Cp).unsqueeze(1).view(B, 1, S * H * W, Cp),  # B 1 (S*H*W) C
+                'key': pts3d_res.reshape(B, S, H * W, Cp).unsqueeze(1).view(B, 1, S * H * W, Cp)
             }
             
         # seonghu 1104
@@ -289,7 +289,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             world_points_from_depth = torch.tensor(world_points_from_depth).to(dtype=dtype, device=images.device).reshape(B, 1, S * H * W, 3)
             attn_cache["point_map_from_depth"] = {
                 'query': world_points_from_depth, # B 1 S*H*W 3
-                'key': world_points_from_depth # B 1 S*H*W 3
+                'key': world_points_from_depth, # B 1 S*H*W 3
+                'depth': depth # B S H W 1 for debug
             }
 
         # for jinhyeok
