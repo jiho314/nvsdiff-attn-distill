@@ -1588,7 +1588,7 @@ def main():
                             distill_loss_dict[idx] = distill_loss
 
                         weighted_distill_loss = 0
-                        for idx in distill_pairs_idx:
+                        for idx in distill_loss_dict.keys():
                             weighted_distill_loss = weighted_distill_loss + distill_loss_dict[idx] * distill_loss_weight_list[idx]
                         # weighted_distill_loss = sum(weighted_distill_loss_list) if len(weighted_distill_loss_list) > 0 else torch.tensor(0.0).to(device, dtype=weight_dtype)
                         
