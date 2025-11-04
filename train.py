@@ -174,7 +174,8 @@ def log_test(accelerator, config, args, pipeline, dataloader, step, device,
     from torchvision import transforms
     from filelock import FileLock
     import pandas  as pd
-    from warp import render_points_pytorch3d
+    if eval_w_mask:    
+        from warp import render_points_pytorch3d
 
 
     ''' Caution, batch=1 !
@@ -629,6 +630,7 @@ def parse_args():
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--val_at_first", action="store_true")
+    parser.add_argument("--val_w_mask", action="store_true")
 
     parser.add_argument("--num_workers_per_gpu", type=int, default=1, help="dataloader num_workers per GPU")
 
@@ -830,7 +832,7 @@ def main():
         repa_feat_head = nn.ModuleDict()
         for unet_layer in config.repa_config.distill_layers:
             unet_feat_dim = SDXL_ATTN_DIM[int(unet_layer)]
-            repa_feat_head[str(unet_layer)] = build_mlp(unet_feat_dim, 1024, mlp_ratio = None,mlp_depth=1,  mid_dim=2048) # following repa
+            repa_feat_head[str(unet_layer)] = build_mlp(unet_feat_dim, 768, mlp_ratio = None,mlp_depth=1,  mid_dim=2048) # following repa
         unet.repa_feat_head = repa_feat_head
         del repa_feat_head
         
@@ -1773,7 +1775,7 @@ def main():
                                 viz_len = config.val_viz_len,
                                 num_inference_steps = 50,
                                 eval_size = 512,
-                                eval_w_mask = True,
+                                eval_w_mask = args.val_w_mask,
                                 test_dataset_name = data_name
                                 )
                         # res = log_validation(accelerator=accelerator, config=config, args=args,

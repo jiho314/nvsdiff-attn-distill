@@ -264,7 +264,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             # costmap = torch.matmul(fmap_tgt.transpose(1, 2), fmaps) # B H*W S*H*W 
             # costmap =costmap.unsqueeze(1) # B 1 H*W S*H*W
             # costmap_dict["track_head"] = costmap
-        elif "point_map" in self.cache_costmap_types:
+        if "point_map" in self.cache_costmap_types:
             pts3d, pts3d_conf = self.point_head(aggregated_tokens_list, images=images_vggt, patch_start_idx=patch_start_idx)
 
             # Expect pts3d: (B, S, h, w, C)
@@ -278,9 +278,22 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 'query': pts3d_res.reshape(B, 1, S * H * W, Cp),  # B 1 (S*H*W) C
                 'key': pts3d_res.reshape(B, 1, S * H * W, Cp)
             }
+            
+        # seonghu 1104
+        if "point_map_from_depth" in self.cache_costmap_types:
+            depth, _ = self.depth_head(aggregated_tokens_list, images=images_vggt, patch_start_idx=patch_start_idx)
+            
+            depth, extrinsics, intrinsics = depth.reshape(B*S, *depth.shape[2:]).to(torch.float32), extrinsics.reshape(B*S, *extrinsics.shape[2:]).to(torch.float32), intrinsics.reshape(B*S, *intrinsics.shape[2:]).to(torch.float32)
+            world_points_from_depth = unproject_depth_map_to_point_map(depth, extrinsics, intrinsics) # S H W 3
+            world_points_from_depth = world_points_from_depth.reshape(B, S, *world_points_from_depth.shape[1:])  # B S H W 3
+            world_points_from_depth = torch.tensor(world_points_from_depth).to(dtype=dtype, device=images.device).reshape(B, 1, S * H * W, 3)
+            attn_cache["point_map_from_depth"] = {
+                'query': world_points_from_depth, # B 1 S*H*W 3
+                'key': world_points_from_depth # B 1 S*H*W 3
+            }
 
         # for jinhyeok
-        elif "refine_track_head" in self.cache_costmap_types:
+        if "refine_track_head" in self.cache_costmap_types:
             def make_query_points(batch_size, device="cpu"):
                 coords = torch.arange(0, 518, 16.5, device=device)  # (32,)
                 yy, xx = torch.meshgrid(coords, coords, indexing="ij")  # each (32,32)
