@@ -1,5 +1,5 @@
-from train import *
-
+from train_old_jinhk import *
+from attn_visualize_pipe import AttentionMapVisualizer
 
 from src.distill_utils.attn_processor_cache import set_attn_cache, unset_attn_cache, pop_cached_attn, clear_attn_cache
 import torch
@@ -26,26 +26,11 @@ import json
 import torchvision.transforms as T
 from src.distill_utils.attn_visualize import mark_point_on_img, save_image_total, overlay_grid_and_save, save_image_jinhk
 import yaml
+from torchvision.utils import make_grid, save_image
 
-# dataloader_workers: 16
-# dataset:
-#   dataset_path: /scratch2/ljeadec31/re10k_pixelsplat/re10k_lvsm/train/full_list.txt
-#   use_view_idx_file: false
-#   view_idx_file_path:  
-#   image_size : 512
-#   num_ref_views: 2
-#   num_tgt_views: 1
-#   min_frame_dist: 25 # 25
-#   max_frame_dist: 100 # 100 
-#   shuffle_prob: 0.5 # extrapolate
-  
-# eval_dataset:
-#   dataset_path: /scratch2/ljeadec31/re10k_pixelsplat/re10k_lvsm/test/full_list.txt
-#   use_view_idx_file: true
-#   view_idx_file_path: dataset/evaluation_index_re10k_0.json 
-#   image_size : 512
-#   num_ref_views: 2
-#   num_tgt_views: 1
+    
+from src.distill_utils.attn_logit_head import cycle_consistency_checker
+
 
 def concat_vertical(pil_images):
     """Concatenate a list of PIL Images vertically (row direction)."""
@@ -73,6 +58,99 @@ def seed_everything(seed):
     np.random.seed(seed % (2**32))
     random.seed(seed)
 
+def get_consistency_mask(logit):
+    # assert config.distill_config.distill_query == "target", "consistency check only support distill_query to target"
+    B, F1HW, F2HW = logit.shape  
+    assert F1HW == F2HW, "first process full(square) consistency mask"
+    # assert Head == 1, "costmap should have only one head, while consistency checking?"
+    F = 1
+    HW = F1HW // F
+    # logit = einops.rearrange(logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1 F2) HW1 HW2', B=B,Head=Head, F1=F, F2=F, HW1=HW, HW2=HW)
+    mask_per_view = cycle_consistency_checker(logit, pixel_threshold=3) # (B Head F1 F2) HW 1
+    # mask_per_view = einops.rearrange(mask_per_view, '(B Head F1 F2) HW 1 -> B Head (F1 HW) (F2 1)', B=B, Head=Head, F1=F, F2=F, HW=HW)
+    # mask = mask.any(dim=-1) # B Head Q(F1HW) 
+    return mask_per_view # B Head Q(F1HW) F2
+
+def resize_tok(tok, target_size):
+    B, Head, FHW, C = tok.shape
+    F = config.vggt_visualize.nframe
+    HW = FHW // F
+    H = W = int(math.sqrt(HW))
+    tok = einops.rearrange(tok, 'B Head (F H W) C -> (B Head F) C H W', B=B, Head=Head, F=F, H=H, W=W, C=C)
+    tok = torch.nn.functional.interpolate(tok, size=(target_size, target_size), mode='bilinear')
+    tok = einops.rearrange(tok, '(B Head F) C H W -> B Head (F H W) C',  B=B, Head=Head, F=F, H=target_size, W=target_size, C=C)
+    return tok
+
+def distance_softmax_(query_points, ref_points, temperature=1.0, cross_only=True, per_view=False):
+    """
+    query_points: (B, 3, H, W)
+    ref_points  : (B, V, 3, H, W)
+    returns     : (B, HW, VHW) probability maps
+                if per_view=True, softmax is per-view over the last HW of each view.
+    """
+    B, _, H, W = query_points.shape
+    V = ref_points.shape[1]
+    HW = H * W
+
+    # Flatten
+    # query -> (B, HW, 3)
+    query_flat = query_points.reshape(B, 3, -1).permute(0, 2, 1).contiguous()
+    # refs  -> (B, V, HW, 3)
+    refs_flat = ref_points.reshape(B, V, 3, -1).permute(0, 1, 3, 2).contiguous()
+
+    # Compute pairwise distances
+    # We want (B, HW, V, HW): every query token to every token in each key view
+    # Expand query to (B, 1, HW, 1, 3) then broadcast vs (B, V, 1, HW, 3)
+    q_exp = query_flat.unsqueeze(1).unsqueeze(3)           # (B, 1,   HW, 1, 3)
+    k_exp = refs_flat.unsqueeze(2)                          # (B, V,   1,  HW, 3)
+    diff  = q_exp - k_exp                                   # (B, V, HW, HW, 3) but with dims permutable
+    # put as (B, HW, V, HW, 3) for norm over last axis
+    diff  = diff.permute(0, 2, 1, 3, 4).contiguous()        # (B, HW, V, HW, 3)
+    dist  = torch.norm(diff, dim=-1)                        # (B, HW, V, HW)
+
+    # Map distance to logits (smaller dist → higher logit)
+    logits = -dist / max(temperature, 1e-8)                 # (B, HW, V, HW)
+
+    if per_view:
+        probs = torch.softmax(logits, dim=-1)               # (B, HW, V, HW)
+        probs = probs.reshape(B, HW, V * HW)                # (B, HW, VHW)
+    else:
+        # softmax across all concatenated keys (V*HW)
+        logits_cat = logits.reshape(B, HW, V * HW)          # (B, HW, VHW)
+        probs = torch.softmax(logits_cat, dim=-1)           # (B, HW, VHW)
+
+    return probs  # (B, HW, VHW)
+
+def costmap_cosine_sim(query, key, temperature=1.0, per_view=False):
+    """
+    query: (B, V, HW, C)
+    key  : (B, V, HW, C)
+    return: (B, VHW, VHW) probability of cosine similarity costmap
+    """
+    B, V, HW, C = query.shape
+
+    # Normalize
+    query_norm = query / (query.norm(dim=-1, keepdim=True) + 1e-8)  # (B, V, HW, C)
+    key_norm   = key / (key.norm(dim=-1, keepdim=True) + 1e-8)      # (B, V, HW, C)
+
+    # Compute cosine similarity
+    # We want (B, VHW, VHW): every query token to every token in each key view
+    query_flat = query_norm.reshape(B, V * HW, C)  # (B, VHW, C)
+    key_flat   = key_norm.reshape(B, V * HW, C)    # (B, VHW, C)
+
+    # Compute similarity
+    sim = torch.matmul(query_flat, key_flat.transpose(-1, -2))  # (B, VHW, VHW)
+    sim = sim / max(temperature, 1e-8)
+
+    if per_view:
+        sim = einops.rearrange(sim, 'B N (V HW) -> B N V HW', B=B, N=V*HW, V=V, HW=HW)
+        probs = torch.softmax(sim, dim=-1)              # (B, VHW, V, HW)
+        probs = einops.rearrange(probs, 'B N V HW -> B N (V HW)', B=B, N=V*HW, V=V, HW=HW)
+    else:
+        probs = torch.softmax(sim, dim=-1)           # (B, VHW, VHW)
+
+    return probs  # (B, VHW, VHW)
+
 def main(nframe, cond_num, inference_view_range, config, config_file_path, rank = 0):
 
     seed_everything(0)
@@ -98,31 +176,6 @@ def main(nframe, cond_num, inference_view_range, config, config_file_path, rank 
         num_workers=0,
         drop_last=True,
     )
-    
-    from src.distill_utils.attn_logit_head import cycle_consistency_checker
-    def get_consistency_mask(logit):
-        # assert config.distill_config.distill_query == "target", "consistency check only support distill_query to target"
-        B, F1HW, F2HW = logit.shape  
-        assert F1HW == F2HW, "first process full(square) consistency mask"
-        # assert Head == 1, "costmap should have only one head, while consistency checking?"
-        F = 1
-        HW = F1HW // F
-        # logit = einops.rearrange(logit, 'B Head (F1 HW1) (F2 HW2) -> (B Head F1 F2) HW1 HW2', B=B,Head=Head, F1=F, F2=F, HW1=HW, HW2=HW)
-        mask_per_view = cycle_consistency_checker(logit, pixel_threshold=3) # (B Head F1 F2) HW 1
-        # mask_per_view = einops.rearrange(mask_per_view, '(B Head F1 F2) HW 1 -> B Head (F1 HW) (F2 1)', B=B, Head=Head, F1=F, F2=F, HW=HW)
-        # mask = mask.any(dim=-1) # B Head Q(F1HW) 
-        return mask_per_view # B Head Q(F1HW) F2
-    
-    def resize_tok(tok, target_size):
-        B, Head, FHW, C = tok.shape
-        F = config.vggt_visualize.nframe
-        HW = FHW // F
-        H = W = int(math.sqrt(HW))
-        tok = einops.rearrange(tok, 'B Head (F H W) C -> (B Head F) C H W', B=B, Head=Head, F=F, H=H, W=W, C=C)
-        tok = torch.nn.functional.interpolate(tok, size=(target_size, target_size), mode='bilinear')
-        tok = einops.rearrange(tok, '(B Head F) C H W -> B Head (F H W) C',  B=B, Head=Head, F=F, H=target_size, W=target_size, C=C)
-        return tok
-
     def get_costmap(sample_idx, query_idx, key_idx, gt_query, gt_key, x_coord, y_coord, mode, per_view: bool = False):
         '''
         gt_query: torch.Size([B, 1, VHW, C])
@@ -245,7 +298,6 @@ def main(nframe, cond_num, inference_view_range, config, config_file_path, rank 
 
     
     if config.vggt_visualize.mode != "pointmap":
-        raise NotImplementedError("Only pointmap mode is implemented in this version.")
         vggt_distill_config = {
             "cache_attn_layer_ids": [],
             "cache_costmap_types": config.vggt_visualize.mode,
@@ -270,7 +322,7 @@ def main(nframe, cond_num, inference_view_range, config, config_file_path, rank 
         yaml.dump(OmegaConf.to_container(config_file.vggt_visualize, resolve=True), f)
 
     if config.vggt_visualize.idx_set:
-            end_idx = config.vggt_visualize.idx_set[-1]
+        end_idx = config.vggt_visualize.idx_set[-1]
 
     for idx, batch in enumerate(val_dataloader):
         if config.vggt_visualize.idx_set and idx not in config.vggt_visualize.idx_set:
@@ -368,6 +420,42 @@ def main(nframe, cond_num, inference_view_range, config, config_file_path, rank 
             json.dump(coords, f, indent=4) 
 
         stacked_images = []
+        if config.vggt_visualize.mode == "track_head":
+            with torch.no_grad():
+                tracking_feat = vggt_model(images)['attn_cache']['track_head']
+            query = tracking_feat['query']    # B Head FHW C (H=W=518/2=259)
+            key = tracking_feat['key']      # B Head FHW C
+            query = resize_tok(query, target_size=config.vggt_visualize.grid_size)
+            key = resize_tok(key, target_size=config.vggt_visualize.grid_size)
+            B, _, FHW, C = query.shape
+            F = nframe
+            HW = FHW // F
+            query = einops.rearrange(query.squeeze(1), 'B (F HW) C -> B F HW C', B=B, F=F, HW=HW, C=C)
+            key = einops.rearrange(key.squeeze(1), 'B (F HW) C -> B F HW C', B=B, F=F, HW=HW, C=C)
+            cost_map = costmap_cosine_sim(query, key,
+                                            temperature=config.vggt_visualize.temperature,
+                                            per_view=config.vggt_visualize.per_view)  # B VHW VHW
+            cost_map = einops.rearrange(cost_map, 'B (F HW) N -> B F HW N', B=B, F=F, HW=HW, N=FHW)
+            
+        elif config.vggt_visualize.mode == "pointmap":
+            pointmap = batch['point_map'].to(device)  # B V 3 H W
+            pointmap = pointmap.reshape(-1, 3, 512, 512) # [V, 3, 512, 512]
+            pointmap = torch.nn.functional.interpolate(pointmap, size=(config.vggt_visualize.grid_size, config.vggt_visualize.grid_size), mode='bilinear')
+            query = key = einops.rearrange(pointmap, 'F C H W -> 1 F (H W) C')  # B V HW C
+            B, F, HW, C = query.shape
+            cost_map = costmap_cosine_sim(query, key,
+                                          temperature=config.vggt_visualize.temperature,
+                                          per_view=config.vggt_visualize.per_view)  # B VHW VHW
+            cost_map = einops.rearrange(cost_map, 'B (F HW) N -> B F HW N', B=B, F=F, HW=HW, N=F*HW)
+            # pointmap = batch['point_map'] # [1, V, 3, 512, 512]
+            # pointmap = pointmap.reshape(-1, 3, 512, 512) # [V, 3, 512, 512]
+            # pointmap = torch.nn.functional.interpolate(pointmap, size=(config.vggt_visualize.grid_size, config.vggt_visualize.grid_size), mode='bilinear')
+
+            # query = pointmap[t].unsqueeze(0)  # [1, 3, size, size]
+            # key = pointmap
+
+            # cost_map = distance_softmax_(query, key, temperature=0.0001, per_view=config.vggt_visualize.per_view)  # [B, HW, VHW]
+
         for t in range(0, nframe):  # <<< CHANGED >>>
             x_coord, y_coord = x_coords[t], y_coords[t]
             query_idx = [t]
@@ -376,19 +464,71 @@ def main(nframe, cond_num, inference_view_range, config, config_file_path, rank 
             else:
                 key_idx = list(range(nframe))               # refs + all frames
 
-            if "pointmap" in config.vggt_visualize.mode:
-                pointmap = batch['point_map'] # [1, V, 3, 512, 512]
-                gt_query = pointmap.permute(0,1,3,4,2).reshape(1, 1, -1, 3) # [1, 4, 512, 512, 3]
-                gt_key = gt_query
-                # hard-coding for analysis qual
-                score = get_costmap(idx, t, key_idx, gt_query, gt_key, x_coord, y_coord,
-                                    config.vggt_visualize.mode, per_view = config.vggt_visualize.per_view)
-                
-                combined_img = save_image_jinhk(tgt_gt_image=None, images=images,
-                                                target_idx=t, x_coord=x_coord, y_coord=y_coord, score=score)
-                stacked_images.append(combined_img)
-        stacked_images = concat_vertical(stacked_images)
-        stacked_images.save(os.path.join(sample_root, f"pointmap.png"))
+            if config.vggt_visualize.mode == "pointmap":
+
+                if config.vggt_visualize.grid_query:
+                    visualizer = AttentionMapVisualizer(
+                        v=config.vggt_visualize.nframe,
+                        h_attn=config.vggt_visualize.grid_size,
+                        w_attn=config.vggt_visualize.grid_size,
+                        h_img=512,
+                        w_img=512,
+                    )
+                    query_canvas, key_canvas = visualizer.visualize(
+                        cost_map.squeeze(0)[t].cpu(),  # [HW, VHW]
+                        images.squeeze(0).permute(0, 2, 3, 1).cpu().numpy() * 255,
+                        grid_size=config.vggt_visualize.grid_size,
+                        query_view=t,
+                        per_view=config.vggt_visualize.per_view,
+                    )
+                    # query_canvas: [V, H, W, C] numpy
+                    # key_canvas: [V, H, W, C] numpy
+                    
+                    tgt_image_grid = torch.tensor(query_canvas[t]).permute(2, 0, 1) / 255.0  # [C, H, W]
+                    gen_image_grid = torch.tensor(key_canvas).permute(0, 3, 1, 2) / 255.0  # [V, C, H, W]
+                    combined_img_grid = torch.cat([tgt_image_grid.unsqueeze(0), gen_image_grid], dim=0) # [V+1, C, H, W]
+                    combined_img_grid = make_grid(combined_img_grid, nrow=4, padding=10, pad_value=1.0)
+                    combined_img_grid_pil = T.ToPILImage()(combined_img_grid.cpu())
+                    combined_img_grid_pil.save(os.path.join(sample_root, f"point_grid_query_frame{t}.png"))
+                else:
+                    # hard-coding for analysis qual
+                    pointmap = batch['point_map'] # [1, V, 3, 512, 512]
+                    gt_query = pointmap.permute(0,1,3,4,2).reshape(1, 1, -1, 3)  # [1, VHW, 3]
+                    gt_key = gt_query
+                    score = get_costmap(idx, t, key_idx, gt_query, gt_key, x_coord, y_coord,
+                                        config.vggt_visualize.mode, per_view = config.vggt_visualize.per_view)
+                    
+                    combined_img = save_image_jinhk(tgt_gt_image=None, images=images,
+                                                    target_idx=t, x_coord=x_coord, y_coord=y_coord, score=score)
+                    stacked_images.append(combined_img)
+
+            elif config.vggt_visualize.mode == "track_head":
+                if config.vggt_visualize.grid_query:
+                    visualizer = AttentionMapVisualizer(
+                        v=config.vggt_visualize.nframe,
+                        h_attn=config.vggt_visualize.grid_size,
+                        w_attn=config.vggt_visualize.grid_size,
+                        h_img=512,
+                        w_img=512,
+                    )
+                    query_canvas, key_canvas = visualizer.visualize(
+                        cost_map.squeeze(0)[t].cpu(), # [HW, VHW]
+                        images.squeeze(0).permute(0, 2, 3, 1).cpu().numpy() * 255,
+                        grid_size=config.vggt_visualize.grid_size,
+                        query_view=t,
+                        per_view=config.vggt_visualize.per_view,
+                    )
+
+                    tgt_image_grid = torch.tensor(query_canvas[t]).permute(2, 0, 1) / 255.0  # [C, H, W]
+                    gen_image_grid = torch.tensor(key_canvas).permute(0, 3, 1, 2) / 255.0  # [V, C, H, W]
+                    combined_img_grid = torch.cat([tgt_image_grid.unsqueeze(0), gen_image_grid], dim=0) # [V+1, C, H, W]
+                    combined_img_grid = make_grid(combined_img_grid, nrow=4, padding=10, pad_value=1.0)
+                    combined_img_grid_pil = T.ToPILImage()(combined_img_grid.cpu())
+                    combined_img_grid_pil.save(os.path.join(sample_root, f"tracking_grid_query_frame{t}.png"))
+
+        if not config.vggt_visualize.grid_query:
+            stacked_images = concat_vertical(stacked_images)
+            stacked_images.save(os.path.join(sample_root, f"pointmap.png"))
 
         if config.vggt_visualize.save_stack:
             # Save stacked images (ref + tgt)

@@ -1,0 +1,90 @@
+# Caution 
+# - test.py : dataset name's last should be {num_viewpoint}_{inference_view_range}
+# inference_ref_idx: currently not logged to csv 
+co3d_wds_val_subset_unseen_scene_refidx03_4_8: # unseen scene 
+  cls_name: co3d_wds
+  config:
+    url_paths: 
+    - /mnt/data4/minseop/co3d_wds_val_subset/unseen_scene # /mnt/data2/minseop/co3d_wds_val/unseen_category: 54 scenes
+    dataset_length: 100 # not sure how many
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 8
+    inference_ref_idx: [0,3]
+    process_kwargs:
+      get_square_extrinsic: true
+
+co3d_wds_val_subset_unseen_scene_refidx03_4_6: # unseen scene 
+  cls_name: co3d_wds
+  config:
+    url_paths: 
+    - /mnt/data4/minseop/co3d_wds_val_subset/unseen_scene # /mnt/data2/minseop/co3d_wds_val/unseen_category: 54 scenes
+    dataset_length: 100 # not sure how many
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 6
+    inference_ref_idx: [0,3]
+    process_kwargs:
+      get_square_extrinsic: true
+
+re10k_wds_val_refidx03_4_12:
+  cls_name: re10k_wds
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 100
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 12
+    inference_ref_idx: [0,3]
+    process_kwargs:
+      get_square_extrinsic: true
+
+re10k_wds_val_refidx03_4_10:
+  cls_name: re10k_wds
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 100
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 10
+    inference_ref_idx: [0,3]
+    process_kwargs:
+      get_square_extrinsic: true
+
+
+co3d_wds_val_subset_unseen_scene_refidx01_4_8:
+  cls_name: co3d_wds
+  config:
+    url_paths: 
+    - /mnt/data4/minseop/co3d_wds_val_subset/unseen_scene # /mnt/data2/minseop/co3d_wds_val/unseen_category: 54 scenes
+    dataset_length: 100 # not sure how many
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 8
+    inference_ref_idx: [0,1]
+    process_kwargs:
+      get_square_extrinsic: true
+
+re10k_wds_val_refidx01_4_12:
+  cls_name: re10k_wds
+  config:
+    url_paths: ["/mnt/data2/minseop/realestate_val_wds"  ] 
+    dataset_length: 100
+    resampled: False
+    shardshuffle: False
+    inference: true
+    num_viewpoints: 4
+    inference_view_range: 12
+    inference_ref_idx: [0,1]
+    process_kwargs:
+      get_square_extrinsic: true

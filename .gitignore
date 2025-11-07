@@ -1,5 +1,6 @@
 check_points/
 check_points_re10k/
+check_points_gist/
 wandb/
 
 **/__pycache__/
@@ -44,3 +45,8 @@ vis_vggt_re10k/
 visualization/
 hpatches/
 final_qual_jinhk/
+
+attn_visualize_jinhk.py
+attn_visualize_pipe.py
+attn_visualize_pipe_jin.py
+vggt_visualize_jinhk.py

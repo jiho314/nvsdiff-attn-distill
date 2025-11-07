@@ -91,8 +91,9 @@ def parse_args():
 
 
     # test idx setting
-    parser.add_argument("--test_custom_order_batch", type=bool, action='store_true')
-    parser.add_argument("--test_custom_ref_idx", type=int, nargs='+', default=[])
+    # 11/05 jiho not used: ref idx fixed in config
+    # parser.add_argument("--test_custom_order_batch", type=bool, action='store_true') 
+    # parser.add_argument("--test_custom_ref_idx", type=int, nargs='+', default=[])
     
     
 
@@ -129,7 +130,7 @@ def main():
                 import paramiko
                 ssh = paramiko.SSHClient()
                 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                ssh.connect("210.125.69.5", username="kaist-cvlab", password="Cvlab@123!", port=51015)
+                ssh.connect("210.125.69.5", username="kaist-cvlab", password="!CvLab@@22", port=51015)
                 sftp = ssh.open_sftp()
                 sftp.get(remote_config_path, config_path)
                 sftp.get(remote_ckpt_path, ckpt_path)
@@ -279,9 +280,9 @@ def main():
     logger.info("***** Running Test *****")
     logger.info(f"  Num Test Dataset = {len(test_dataset)}")
     
-    from src.datasets import custom_order_batch
+    # from src.datasets import custom_order_batch
     def process_batch_fn(batch, dataset_class, cond_num = None, 
-                     use_vggt_camera=False, vggt_model = None, device ='cuda', custom_order = False, custom_ref_idx = []):
+                     use_vggt_camera=False, vggt_model = None, device ='cuda'):
         # 11/02 jiho: ordering done in data code (just for inference!)
         # # 1) ordering
         # if not custom_order:
@@ -312,7 +313,6 @@ def main():
         return batch
 
     process_batch_fn_test = partial(process_batch_fn, dataset_class =test_dataset_config.cls_name, cond_num = args.test_cond_num, 
-                                                    custom_order = args.test_custom_order_batch, custom_ref_idx = args.test_custom_ref_idx,
                                                     use_vggt_camera = args.test_use_vggt_camera, vggt_model=vggt_model,
                                                     device=accelerator.device)
 

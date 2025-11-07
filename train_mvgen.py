@@ -32,7 +32,7 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import ToPILImage
 from tqdm.auto import tqdm
 from transformers.utils import ContextManagers
-
+from src.modules.position_encoding import depth_from_pointmap
 from my_diffusers.models import UNet2DConditionModel
 from my_diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_multiview import StableDiffusionMultiViewPipeline
 from my_diffusers.training_utils import EMAModel
@@ -233,6 +233,18 @@ def log_test(accelerator, config, args, pipeline, dataloader, step, device,
             extrinsic, intrinsic = extri_, intri_
             tag = batch.get("tag", ['others'] * b )
             sequence_name, depth = None, None
+            if config.model_cfg.get("enable_depth", False):
+                assert batch['point_map'].shape[2] == 3, f"point_map should be (B F 3 H W), but got {batch['point_map'].shape}"
+                point_map = batch['point_map'].to(device)
+                depth = depth_from_pointmap(point_map.flatten(0,1), extrinsic.flatten(0,1))
+                batch['depth'] = depth
+                depth_freq = config.model_cfg.get("depth_freq", None)
+                if depth_freq is not None:
+                    depth = depth_freq_encoding(batch["depth"], device=device, embed_dim=depth_freq)
+                else:
+                    depth = batch["depth"].to(torch.float32)
+            else:
+                depth = None
             preds = pipeline.batch_call(images=image_normalized, nframe=nframe, cond_num=cond_num,
                              height=image_normalized.shape[-2], width=image_normalized.shape[-1],
                              intrinsics=intrinsic, extrinsics=extrinsic,
@@ -246,14 +258,14 @@ def log_test(accelerator, config, args, pipeline, dataloader, step, device,
             if val_iter < viz_len:
                 image_viz = einops.rearrange(image, 'b f c h w -> (b f) c h w').clone()
                 preds_viz = preds.clone()
-                if depth is not None:
-                    show_image = get_show_images(image_viz, preds_viz, cond_num, batch["depth"])
-                else:
-                    show_image = get_show_images(image_viz, preds_viz, cond_num)
+                # if depth is not None:
+                #     show_image = get_show_images(image_viz, preds_viz, cond_num, batch["depth"])
+                # else:
+                show_image = get_show_images(image_viz, preds_viz, cond_num)
 
-                if color_warps is not None:
-                    h, w = image.shape[-2], image.shape[-1]
-                    show_image[h:h * 2, cond_num * w:] = color_warps[0][:, cond_num * w:]
+                # if color_warps is not None:
+                #     h, w = image.shape[-2], image.shape[-1]
+                #     show_image[h:h * 2, cond_num * w:] = color_warps[0][:, cond_num * w:]
                 show_images.append(show_image)
 
             # Extract target views
@@ -534,6 +546,10 @@ def log_train(accelerator, config, args, pipeline, weight_dtype, batch, step, **
     sequence_name = None
 
     if config.model_cfg.get("enable_depth", False):
+        assert batch['point_map'].shape[2] == 3, f"point_map should be (B F 3 H W), but got {batch['point_map'].shape}"
+        point_map = batch['point_map'][0].to(extrinsic)
+        batch['depth'] = depth_from_pointmap(point_map, extrinsic)
+
         depth = batch["depth"][:nframe].to(torch.float32)
         depth_freq = config.model_cfg.get("depth_freq", None)
         if depth_freq is not None:
@@ -559,14 +575,14 @@ def log_train(accelerator, config, args, pipeline, weight_dtype, batch, step, **
         else:
             color_warps = None
 
-    if depth is not None:
-        show_image = get_show_images(image, torch.tensor(preds).permute(0,3,1,2), kwargs.get("random_cond_num", 1), batch["depth"][:nframe])
-    else:
-        show_image = get_show_images(image, torch.tensor(preds).permute(0,3,1,2), kwargs.get("random_cond_num", 1))
+    # if depth is not None:
+    #     show_image = get_show_images(image, torch.tensor(preds).permute(0,3,1,2), kwargs.get("random_cond_num", 1), batch["depth"][:nframe])
+    # else:
+    show_image = get_show_images(image, torch.tensor(preds).permute(0,3,1,2), kwargs.get("random_cond_num", 1))
 
-    if color_warps is not None:
-        h, w = image.shape[2], image.shape[3]
-        show_image[h:h * 2, kwargs.get("random_cond_num", 1) * w:] = color_warps[0][:, kwargs.get("random_cond_num", 1) * w:]
+    # if color_warps is not None:
+    #     h, w = image.shape[2], image.shape[3]
+    #     show_image[h:h * 2, kwargs.get("random_cond_num", 1) * w:] = color_warps[0][:, kwargs.get("random_cond_num", 1) * w:]
 
     # tracker = accelerator.get_tracker("wandb", unwrap=True)
     # tracker.add_images("train/gt_masked_pred_images", show_image, step, dataformats="HWC")
@@ -1210,15 +1226,15 @@ def main():
                 # CFG (cond/uncond) train
                 if random.random() < config.model_cfg.cfg_training_rate:
                     add_channel = np.sum(config.model_cfg.additional_in_channels) - 1  # 减去mask channel
-                    # if config.model_cfg.get("enable_depth", False) and not config.model_cfg.get("priors3d", False):  # TODO: temp code
-                    #     ex_depth_ch = config.model_cfg.get("depth_freq", None)
-                    #     if ex_depth_ch is None:
-                    #         ex_depth_ch = 1
-                    #     add_channel -= ex_depth_ch
-                    # if "pixel" in config.model_cfg.get("prior_type", "3dpe"):
-                    #     add_channel -= 4
-                    # if "h3dpe" in config.model_cfg.get("prior_type", "3dpe"):
-                    #     add_channel -= 48
+                    if config.model_cfg.get("enable_depth", False) and not config.model_cfg.get("priors3d", False):  # TODO: temp code
+                        ex_depth_ch = config.model_cfg.get("depth_freq", None)
+                        if ex_depth_ch is None:
+                            ex_depth_ch = 1
+                        add_channel -= ex_depth_ch
+                    if "pixel" in config.model_cfg.get("prior_type", "3dpe"):
+                        add_channel -= 4
+                    if "h3dpe" in config.model_cfg.get("prior_type", "3dpe"):
+                        add_channel -= 48
                     camera_embedding = torch.zeros((b, f, add_channel, h, w), device=device, dtype=latents.dtype)
                 else:
                     extri_, intri_ = batch["extrinsic"], batch["intrinsic"]
@@ -1277,60 +1293,64 @@ def main():
                 add_inputs = torch.cat([random_masks, camera_embedding], dim=2) # [B,F,1+6,H,W]
                 coords = None
                 # cat3d: no 3d priors
-                # if config.model_cfg.get("enable_depth", False):
-                #     if config.model_cfg.get("priors3d", False):
-                #         if random.random() < config.model_cfg.cfg_training_rate:  # cfg coords
-                #             if config.model_cfg.get("prior_type", "3dpe") == "3dpe+pixel":
-                #                 coords = [torch.zeros((b * f, 192 + 1, latent_h, latent_w),
-                #                                       device=device, dtype=latents.dtype),
-                #                           torch.zeros((b * f, 4, h, w), device=device, dtype=latents.dtype)]
-                #             elif config.model_cfg.get("prior_type", "3dpe") == "h3dpe+pixel":
-                #                 coords = [torch.zeros((b * f, 48 + 1, h, w), device=device, dtype=latents.dtype),
-                #                           torch.zeros((b * f, 4, h, w), device=device, dtype=latents.dtype)]
-                #             elif config.model_cfg.get("prior_type", "3dpe") in ("3dpe+latent", "3dpe+warp_latent"):
-                #                 coords = [torch.zeros((b * f, 192 + 1, latent_h, latent_w),
-                #                                       device=device, dtype=latents.dtype),
-                #                           torch.zeros((b * f, 5, latent_h, latent_w), device=device, dtype=latents.dtype)]
-                #             elif config.model_cfg.get("prior_type", "3dpe") == "pixel":
-                #                 coords = torch.zeros((b * f, 4, h, w), device=device, dtype=latents.dtype)
-                #             else:
-                #                 coords = torch.zeros((b * f, config.model_cfg.get("coord_dim", 192) + 1, latent_h, latent_w),
-                #                                      device=device, dtype=latents.dtype)
-                #         else:
-                #             coords = get_3d_priors(config, batch['depth'], batch['intrinsic'], batch['extrinsic'],
-                #                                    random_cond_num, nframe=f, device=device, colors=batch['image'],
-                #                                    latents=latents, vae=vae, prior_type=config.model_cfg.get("prior_type", "3dpe"))
+                if config.model_cfg.get("enable_depth", False):
+                    assert batch['point_map'].shape[2] == 3, f"point_map should be (B F 3 H W), but got {batch['point_map'].shape}"
+                    point_map = batch['point_map'].to(device)
+                    extrinsic = batch['extrinsic'].to(device)
+                    batch['depth'] = depth_from_pointmap(point_map.flatten(0,1), extrinsic.flatten(0,1))
+                    if config.model_cfg.get("priors3d", False):
+                        if random.random() < config.model_cfg.cfg_training_rate:  # cfg coords
+                            if config.model_cfg.get("prior_type", "3dpe") == "3dpe+pixel":
+                                coords = [torch.zeros((b * f, 192 + 1, latent_h, latent_w),
+                                                      device=device, dtype=latents.dtype),
+                                          torch.zeros((b * f, 4, h, w), device=device, dtype=latents.dtype)]
+                            elif config.model_cfg.get("prior_type", "3dpe") == "h3dpe+pixel":
+                                coords = [torch.zeros((b * f, 48 + 1, h, w), device=device, dtype=latents.dtype),
+                                          torch.zeros((b * f, 4, h, w), device=device, dtype=latents.dtype)]
+                            elif config.model_cfg.get("prior_type", "3dpe") in ("3dpe+latent", "3dpe+warp_latent"):
+                                coords = [torch.zeros((b * f, 192 + 1, latent_h, latent_w),
+                                                      device=device, dtype=latents.dtype),
+                                          torch.zeros((b * f, 5, latent_h, latent_w), device=device, dtype=latents.dtype)]
+                            elif config.model_cfg.get("prior_type", "3dpe") == "pixel":
+                                coords = torch.zeros((b * f, 4, h, w), device=device, dtype=latents.dtype)
+                            else:
+                                coords = torch.zeros((b * f, config.model_cfg.get("coord_dim", 192) + 1, latent_h, latent_w),
+                                                     device=device, dtype=latents.dtype)
+                        else:
+                            coords = get_3d_priors(config, batch['depth'], batch['intrinsic'], batch['extrinsic'],
+                                                   random_cond_num, nframe=f, device=device, colors=batch['image'],
+                                                   latents=latents, vae=vae, prior_type=config.model_cfg.get("prior_type", "3dpe"))
 
-                #             # mask掉特定view的coords为全0 [(b f) c h w]
-                #             coords_cfg = config.model_cfg.get("coords_cfg", 0.0)
-                #             if coords_cfg > 0:
-                #                 cmask = np.ones((b * f))
-                #                 cmask[:int(b * f * coords_cfg)] = 0
-                #                 np.random.shuffle(cmask)
-                #                 cmask = cmask.reshape(b, f, 1, 1, 1)
-                #                 cmask[:, :random_cond_num] = 1  # 确保condition不为0
-                #                 cmask = torch.tensor(cmask, device=device, dtype=torch.float32)
+                            # mask掉特定view的coords为全0 [(b f) c h w]
+                            coords_cfg = config.model_cfg.get("coords_cfg", 0.0)
+                            if coords_cfg > 0:
+                                cmask = np.ones((b * f))
+                                cmask[:int(b * f * coords_cfg)] = 0
+                                np.random.shuffle(cmask)
+                                cmask = cmask.reshape(b, f, 1, 1, 1)
+                                cmask[:, :random_cond_num] = 1  # 确保condition不为0
+                                cmask = torch.tensor(cmask, device=device, dtype=torch.float32)
 
-                #                 if type(coords) == list:
-                #                     for j in range(len(coords)):
-                #                         coords[j] = einops.rearrange(coords[j], '(b f) c h w -> b f c h w', f=f)
-                #                         coords[j] = coords[j] * cmask
-                #                         coords[j] = einops.rearrange(coords[j], 'b f c h w -> (b f) c h w')
-                #                 else:
-                #                     coords = einops.rearrange(coords, '(b f) c h w -> b f c h w', f=f)
-                #                     coords = coords * cmask
-                #                     coords = einops.rearrange(coords, 'b f c h w -> (b f) c h w')
+                                if type(coords) == list:
+                                    for j in range(len(coords)):
+                                        coords[j] = einops.rearrange(coords[j], '(b f) c h w -> b f c h w', f=f)
+                                        coords[j] = coords[j] * cmask
+                                        coords[j] = einops.rearrange(coords[j], 'b f c h w -> (b f) c h w')
+                                else:
+                                    coords = einops.rearrange(coords, '(b f) c h w -> b f c h w', f=f)
+                                    coords = coords * cmask
+                                    coords = einops.rearrange(coords, 'b f c h w -> (b f) c h w')
 
-                #     else:
-                #         depth_freq = config.model_cfg.get("depth_freq", None)
-                #         if depth_freq is not None:
-                #             depth = depth_freq_encoding(batch["depth"], device=device, embed_dim=depth_freq)
-                #         else:
-                #             depth = batch["depth"].to(torch.float32)
-                #         depth = einops.rearrange(depth, "(b f) c h w -> b f c h w", b=bsz, f=f).to(device=device)
-                #         depth[:, random_cond_num:] = 0
-                #         add_inputs = torch.cat([add_inputs, depth], dim=2)
-                #         coords = None
+                    else:
+                        depth_freq = config.model_cfg.get("depth_freq", None)
+                        if depth_freq is not None:
+                            depth = depth_freq_encoding(batch["depth"], device=device, embed_dim=depth_freq)
+                        else:
+                            depth = batch["depth"].to(torch.float32)
+                        depth = einops.rearrange(depth, "(b f) c h w -> b f c h w", b=bsz, f=f).to(device=device)
+                        depth[:, random_cond_num:] = 0
+                        add_inputs = torch.cat([add_inputs, depth], dim=2)
+                        coords = None
 
                 # get class label (domain switcher)
                 domain_dict = config.model_cfg.get("domain_dict", None)
@@ -1361,6 +1381,12 @@ def main():
                 # with torch.autocast(device_type="cuda", dtype = weight_dtype):
                 with torch.cuda.amp.autocast(enabled=True, dtype = weight_dtype):
                     inputs, add_inputs = inputs.to(weight_dtype), add_inputs.to(weight_dtype)
+                    if coords is not None:
+                        if isinstance(coords, list):
+                            for j in range(len(coords)):
+                                coords[j] = coords[j].to(weight_dtype)
+                        elif torch.is_tensor(coords):
+                            coords = coords.to(weight_dtype)
                     model_pred = unet(inputs, timesteps, encoder_hidden_states, add_inputs=add_inputs,
                                         class_labels=class_labels, coords=coords, return_dict=False)[0]  # [BF,C,H,W]
                 model_pred = einops.rearrange(model_pred, "(b f) c h w -> b f c h w", f=f)
@@ -1590,7 +1616,7 @@ def main():
                             distill_loss =  ref_query_distill_loss + tgt_query_distill_loss # TODO: weight?
                             if torch.isnan(distill_loss).any().item():
                                 accelerator.print("NaN in distill_loss, skip this layer distill...")
-                                # del distill_loss, tgt_query_distill_loss # don't remove, error while logging
+                                del distill_loss, tgt_query_distill_loss
                                 torch.cuda.empty_cache()
                                 continue
                             distill_loss_name_dict[idx] = f"train/distill_loss/unet{unet_layer}_vggt{vggt_layer}" # for log

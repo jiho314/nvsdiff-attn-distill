@@ -52,21 +52,21 @@ def uniform_push_batch(batch, cond_num=0):
                 batch[k] = batch[k][:, new_idx]
     return batch
 
-
-def custom_order_batch(batch, ref_idx=[]):
-    B,F,_,H,W = batch["image"].shape
-    idx = torch.arange(F)
-    ref_idx = torch.tensor(ref_idx, dtype=torch.long)
-    tgt_idx = idx[~torch.isin(idx, ref_idx)]
-    new_idx = torch.cat([ref_idx, tgt_idx], dim=0)[:F]  # in case target_num +2 > F
+# not used
+# def custom_order_batch(batch, ref_idx=[]):
+#     B,F,_,H,W = batch["image"].shape
+#     idx = torch.arange(F)
+#     ref_idx = torch.tensor(ref_idx, dtype=torch.long)
+#     tgt_idx = idx[~torch.isin(idx, ref_idx)]
+#     new_idx = torch.cat([ref_idx, tgt_idx], dim=0)[:F]  # in case target_num +2 > F
     
-    # shuffle idx
-    for k in batch.keys():
-        data = batch[k]
-        if torch.is_tensor(data):
-            if data.ndim >= 2:
-                batch[k] = batch[k][:, new_idx]
-    return batch
+#     # shuffle idx
+#     for k in batch.keys():
+#         data = batch[k]
+#         if torch.is_tensor(data):
+#             if data.ndim >= 2:
+#                 batch[k] = batch[k][:, new_idx]
+#     return batch
 
 # # TODO: remove, not good 
 # def uniform_push_batch_reverse(batch, cond_num):

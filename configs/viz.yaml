@@ -163,17 +163,17 @@ unet_visualize:
   coord_per_frame: true
   nframe: 3
   cross_only: false
-  noise_timestep: 999 #(0, 999)
+  noise_timestep: 100 #(0, 999)
   cfg_scale: 2.0
   cfg_rescale: 0.0
   inference_view_range: 25
   cond_num: 1 # reference num
-  # resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points_re10k/0919_naive_b3_lr2.5/checkpoint-100000'
-  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points_re10k/0922_distill_perview_lr25_mlp1_L10_lw02/checkpoint-100000'
+  resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points_re10k/0919_naive_b3_lr2.5/checkpoint-100000'
+  # resume_checkpoint: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/check_points_re10k/0922_distill_perview_lr25_mlp1_L10_lw02/checkpoint-100000'
   # reproduce_coords_dir: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/vis_attn_re10k/2025-10-24_11-15-13/naive_100k_inpainting/per_view/999'
   reproduce_coords_dir: '/mnt/data1/jiho/vggt-nvs/nvsdiff-attn-distill/vis_attn_re10k/2025-10-27_11-22-51/naive_100k_recon/per_view/999'
   
-  grid_query: true
+  grid_query: false
   per_view: true
   ref_tgt_split_softmax: false
   save_stack: true

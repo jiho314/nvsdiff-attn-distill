@@ -55,6 +55,8 @@ from itertools import cycle
 import pdb ; pdb.set_trace()
 # dl_iter = iter(dl)
 # dl_cycle = cycle(dl)
+from src.modules.position_encoding import depth_from_pointmap
+
 for ep in range(3):
     print(f"Epoch {ep} -----------------")
     for i, batch in enumerate(dl):

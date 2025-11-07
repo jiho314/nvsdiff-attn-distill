@@ -4,11 +4,11 @@ export WANDB_API_KEY='3177b4c2c8cf009d18dc8cfc41cfa1d2fc813f67'
 
 # Data
 # DATASETS=(co3d_wds_test_4_6 co3d_wds_test_4_8)
-DATASETS=(co3d_wds_val_subset_unseen_scene_3_3 co3d_wds_val_subset_unseen_category_3_3 )
+DATASETS=(co3d_wds_val_subset_unseen_scene_refidx03_4_4 co3d_wds_val_subset_unseen_scene_refidx01_4_6 co3d_wds_val_subset_unseen_scene_refidx05_4_6)
 COND_NUM=1
-RUN_NAME=1030_distill_b10_crossperview_mlp1_L10_lw02_sharp_mix # 0919_naive_b3_lr2.5
-SAVE_CSV=check_points/1031_mix_1.csv
-STEPS=(55000 ) # (280000 320000 240000 200000 160000 120000 ) # (120000 10000 80000 20000 40000)  100000 60000
+RUN_NAME=1105_naive_b8 # 0919_naive_b3_lr2.5
+SAVE_CSV=check_points/1105_mix.csv
+STEPS=(10000 20000 30000 40000) # (280000 320000 240000 200000 160000 120000 ) # (120000 10000 80000 20000 40000)  100000 60000
 BASE_PORT=21424
 for STEP in "${STEPS[@]}"; do
     i=0
@@ -22,7 +22,7 @@ for STEP in "${STEPS[@]}"; do
                         --config_file configs/deepspeed/acc_zero2.yaml test.py \
                         --tracker_project_name "nvs-unet-feasibility-test" \
                         --seed 0 \
-                        --test_dataset_config configs/datasets/test.yaml \
+                        --test_dataset_config configs/datasets/test_1105.yaml \
                         --run_base_path check_points \
                         --run_name "${RUN_NAME}" \
                         --test_train_step "${STEP}" \
@@ -33,12 +33,13 @@ for STEP in "${STEPS[@]}"; do
                         --test_cond_num ${COND_NUM} \
                         --test_save_csv_path ${SAVE_CSV} \
                         --test_batch_size 1 \
-                        --test_eval_w_mask 
-        #                 #   --test_use_vggt_camera \
-        #                 #   --test_compute_fid \
-                        # --test_remote \
-                        # --test_remote_base_path /scratch/kaist-cvlab/jiho/nvsdiff-attn-distill/check_points \
-                        # --test_remote_remove_ckpt \
+                        --test_eval_w_mask \
+                        --test_remote \
+                        --test_remote_base_path /scratch/kaist-cvlab/jiho/nvsdiff-attn-distill/check_points_gist/ \
+                        --test_remote_remove_ckpt \
+                        #   --test_use_vggt_camera \
+                        #   --test_compute_fid \
+
         ((i++))
     done
 done

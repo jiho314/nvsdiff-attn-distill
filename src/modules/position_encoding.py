@@ -129,6 +129,20 @@ def get_3d_priors(config, depth, K, w2c, cond_num, nframe, device, contract=True
 
     return coords
 
+def depth_from_pointmap(point_map_world: torch.Tensor, w2c: torch.Tensor) -> torch.Tensor:
+    """
+    point_map_world: (B,3,H,W) world coordinates
+    w2c: (B,3,4) world-to-camera extrinsic [R|t] (OpenCV: cam = R*X + t)
+    returns: (B,1,H,W) Z-depth in camera coords
+    """
+    B, _, H, W = point_map_world.shape
+    R = w2c[:, :3, :3]                    # (B,3,3)
+    t = w2c[:, :3, 3]                     # (B,3)
+
+    point_map_world_permute = point_map_world.permute(0, 2, 3, 1)  # (B,H,W,3)
+    # z = (R[2,:] @ X_world) + t[2]
+    z = (point_map_world_permute * R[:, None, None, 2, :]).sum(dim=-1) + t[:, None, None, 2]
+    return z.unsqueeze(1)  # (B,1,H,W)
 
 def global_position_encoding_3d(config, depth, K, w2c, cond_num, nframe, device,
                                 pe_scale=1 / 8, embed_dim=192, contract=True, colors=None, latents=None,
@@ -140,6 +154,16 @@ def global_position_encoding_3d(config, depth, K, w2c, cond_num, nframe, device,
     :param K: [b*nframe,3,3]
     :param w2c: [b*nframe,4,4]
     '''
+    if depth.ndim == 5 and depth.shape[1] == nframe:
+        depth = einops.rearrange(depth, "b f c h w -> (b f) c h w")
+    if K.ndim == 4 and K.shape[1] == nframe:
+        K = einops.rearrange(K, "b f c1 c2 -> (b f) c1 c2")
+    if w2c.ndim == 4 and w2c.shape[1] == nframe:
+        w2c = einops.rearrange(w2c, "b f c1 c2 -> (b f) c1 c2")
+    if colors is not None:
+        if colors.ndim == 5 and colors.shape[1] == nframe:
+            colors = einops.rearrange(colors, "b f c h w -> (b f) c h w")
+            
     b = depth.shape[0] // nframe
     depth = depth.to(device).float()
     depth = einops.rearrange(depth, "(b f) c h w -> b f c h w", f=nframe)[:, :cond_num]
@@ -172,7 +196,7 @@ def global_position_encoding_3d(config, depth, K, w2c, cond_num, nframe, device,
 
     bc, _, h, w = depth.shape
     points2d = torch.stack(torch.meshgrid(torch.arange(w, dtype=torch.float32),
-                                          torch.arange(h, dtype=torch.float32), indexing="xy"), -1).to(device)  # [h,w,2]
+                                        torch.arange(h, dtype=torch.float32), indexing="xy"), -1).to(device)  # [h,w,2]
     points3d = einops.repeat(points_padding(points2d), "h w c -> bc c (h w)", bc=bc)
 
     K_inv_ = einops.rearrange(K_inv, "(b f) c1 c2 -> b f c1 c2", f=nframe)[:, :cond_num].reshape(-1, 3, 3)
@@ -182,7 +206,7 @@ def global_position_encoding_3d(config, depth, K, w2c, cond_num, nframe, device,
     known_points3d = c2w_ @ points_padding(points3d.permute(0, 2, 1)).permute(0, 2, 1)  # [bc, 4, hw]
     cond_points3d = einops.rearrange(known_points3d, "(b cond) c hw -> b cond c hw", cond=cond_num)[:, :, :3]
     known_points3d = einops.repeat(known_points3d, "(b cond) c hw -> (b tar) cond c hw", cond=cond_num, tar=nframe - cond_num)  # [b*tar,cond,4,hw]
-
+    
     # warp known points3d to target views
     K_target = einops.rearrange(K, "(b f) c1 c2 -> b f c1 c2", f=nframe)[:, cond_num:].reshape(-1, 1, 3, 3)  # [b*tar,1,3,3]
     w2c_target = einops.rearrange(w2c, "(b f) c1 c2 -> b f c1 c2", f=nframe)[:, cond_num:].reshape(-1, 1, 4, 4)  # [b*tar,1,4,4]
